@@ -8,3 +8,5 @@ license.workspace = true
 [dependencies]
 newskite-types.workspace = true
 thiserror.workspace = true
+quick-xml = "0.42"
+crc32fast = "1.5"

@@ -4,7 +4,13 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "SQLite persistence for Newskite: jobs, bookmarks, throughput history, settings"
 
 [dependencies]
 newskite-types.workspace = true
 thiserror.workspace = true
+serde_json.workspace = true
+rusqlite = { version = "0.41.1", features = ["bundled"] }
+
+[dev-dependencies]
+tempfile = "3.27"

@@ -4,7 +4,24 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "Async NNTP client (plain/TLS) and an in-process mock NNTP server for tests"
+
+[features]
+default = []
+## Exposes `newskite_nntp::testkit::MockServer` for other crates' tests.
+testkit = []
 
 [dependencies]
 newskite-types.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
+tokio = { workspace = true }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-native-certs = "0.8.5"
+webpki-roots = "1.0.11"
+
+[dev-dependencies]
+# Self dev-dependency so integration tests in `tests/` can use the `testkit` module.
+newskite-nntp = { path = ".", features = ["testkit"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

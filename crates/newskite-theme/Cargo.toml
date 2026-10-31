@@ -1,10 +1,22 @@
 [package]
 name = "newskite-theme"
+description = "Desktop color-token resolution (KDE kdeglobals, XDG portal, fallback palette) for Newskite"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+default = ["portal"]
+## Query the XDG desktop portal (org.freedesktop.appearance) on Linux when kdeglobals
+## gives no usable colors. Has no effect on other platforms.
+portal = ["dep:zbus"]
+
 [dependencies]
-newskite-types.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
+directories.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = { version = "5.19", optional = true, default-features = false, features = ["async-io", "blocking-api"] }
+

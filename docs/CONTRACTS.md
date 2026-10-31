@@ -89,6 +89,22 @@ pub async fn test_server(server:&ServerConfig, timeout:Duration) -> Result<Strin
 Message ids are sent as `<id>`; accept ids given with or without brackets. TLS via
 tokio-rustls/rustls 0.23 with `ring`, roots = rustls-native-certs plus webpki-roots.
 
+Implemented additions (additive): `NntpConnection::{address, is_tls, is_broken, read_timeout,
+set_read_timeout}`; `pub fn normalize_message_id(&str) -> Result<String,NntpError>` (returns
+`<id>`); consts `MAX_ARTICLE_BYTES` (64 MiB cap per body → `Protocol`) and
+`DEFAULT_READ_TIMEOUT` (60 s per-read inactivity timeout → `Timeout`); `Response: Display`
+(`"211 text"`); `testkit::MockConfig: Default + Clone`; `testkit::dot_stuff(&[u8]) -> Vec<u8>`.
+Semantics: `body()` terminates **every** line with `\r\n` (so a CRLF body round-trips exactly;
+bare-LF lines are normalized). After an I/O error, timeout or malformed reply the connection
+is `is_broken()` and further commands fail with `Protocol` — drop it and reconnect. `connect`'s
+timeout covers TCP + TLS + greeting + auth; refused/DNS → `Connect`. `command()` with CR/LF/NUL
+→ `Protocol`. `group()` returns 211/411 replies as-is. `test_server` transcript lines are
+`<- reply` / `-> command` with AUTHINFO arguments shown as `***` (username and password also
+redacted if the server echoes them); a non-111 DATE reply is reported, not an error.
+MockServer: `fail_first_n_connections` still counts toward `connections_accepted`;
+`body_requests` counts every BODY (including ones answered 480); AUTHINFO USER when no
+credentials are configured answers 281; also answers `MODE READER` (200).
+
 ## newskite-engine — job download
 ```rust
 pub struct EngineOptions { pub connections: usize, pub retries: u32, pub speed_limit_bps: u64 /*0=unlimited*/,
@@ -114,6 +130,22 @@ in order; auth failure on every server → `AuthFailed` (job doesn't proceed); s
 shared token bucket; SegmentDone emitted per segment (UI coalesces); files in `skip_files`
 whose final path exists are skipped (resume). Acceptance test: 2 MiB random file, 8 yEnc
 parts, testkit server with auth, real TCP, SHA-256 equal.
+
+Implemented additions (additive): `pub const PART_EXTENSION = "nkpart"`, `BACKOFF_BASE` (200 ms),
+`BACKOFF_MAX` (5 s), `pub fn backoff_delay(attempt:u32)->Duration`; `EngineOptions: Default + Clone +
+Debug + PartialEq` (8 connections, 2 retries, unlimited, 30 s connect timeout); `DownloadRequest: Clone`
+with a hand-written `Debug` that omits passwords; `FileReport`/`JobReport: Clone + Debug + PartialEq`;
+`Progress: Default` plus `new()`, `bytes_down()`, `segments_done()` getters. Semantics: event `name`s are
+the resolved output name; `FileStarted` is emitted when the name is decided (first decoded part), before
+any `SegmentDone` of that file; `SegmentDone.done` counts every processed segment of the file (missing
+ones included) so it reaches `total`; files skipped for resume emit only a `Log` line and appear in
+`JobReport` with their on-disk size; `Progress::bytes_down` counts decoded bytes stored this run,
+`segments_done` counts processed segments. Missing/undecodable articles are tried once on every other
+usable server. A segment that exhausts `retries` on transient errors stops the job with `Connect`
+(`.nkpart` files kept). Name collisions within a job or with an existing file not in `skip_files` get
+`"<stem> (2).<ext>"`, compared case-insensitively. A yEnc name in `skip_files` that already exists is
+detected after the first decoded part even when the NZB subject name differs. Final length = yEnc
+`size=` (never less than the highest byte written); gaps are logged.
 
 ## newskite-store — SQLite persistence
 ```rust
@@ -155,6 +187,15 @@ impl Store {
   pub fn totals(&self)->Result<Totals,_>;
 }
 ```
+Implementation additions (additive): `pub const DB_FILE_NAME = "newskite.sqlite3"`, `pub const SCHEMA_VERSION:i64`,
+`Store::path()->Option<&Path>`, `Store::insert_job_at(&NewJob, created_at:i64)` (explicit timestamp),
+`JobState::{ALL, is_pending()}` + `Display`, `FromStr<Err=ParseJobStateError>`. Semantics: methods addressing a
+row by id (`set_job_*`, `remove_job`, `update_bookmark`, `remove_bookmark`, `upsert_job_file` for a missing job)
+return `NotFound` when it doesn't exist; `add_bookmark`/`update_bookmark` return `Invalid` for a missing parent or a
+parent cycle; `job_by_source` returns the newest matching job; `samples_since` is inclusive, `prune_samples_before`
+strict; counters/throughput saturate at `i64::MAX`; settings JSON that is syntactically corrupt yields `Json`
+(missing/unknown fields load fine). `Job`/`NewJob` `Debug` redact the password. A DB with a newer
+`user_version` is refused with `Invalid`.
 
 ## newskite-theme — desktop color tokens
 ```rust
@@ -173,6 +214,17 @@ KDE keys: `[General] ColorScheme, AccentColor`, `[Colors:Window] BackgroundNorma
 `[Colors:View] BackgroundNormal, ForegroundPositive/ForegroundNeutral/ForegroundNegative`, `[Colors:Selection] BackgroundNormal/ForegroundNormal`.
 Dark iff background luminance < 0.5. accent_text chosen for contrast ≥ 4.5 against accent.
 
+Implemented additions (additive): `Rgb: Display + FromStr` (hex or `r,g,b`, `ParseColorError`),
+`Tokens::iter() -> impl Iterator<Item=(&'static str, Rgb)>` (diagnostics),
+`resolve_with_hint(prefers_dark: Option<bool>) -> Theme` (GUI passes the toolkit's detected
+system theme; used when the portal has no preference and for the fallback palette),
+`from_kdeglobals_path(&Path) -> Result<Option<Theme>, ThemeError>`,
+`ThemeWatcher::{with_hint, with_path, current, set_min_interval, set_prefers_dark_hint}` and
+`impl Default for ThemeWatcher`. Cargo feature `portal` (default on; Linux only, zbus 5 blocking,
+300 ms cap on a helper thread). Dark detection refinement: dark iff background is darker than
+foreground (luminance differs by > 0.05); only for near-equal pairs does it use luminance < 0.5.
+Status colors (positive/warning/negative) are nudged toward black/white until ≥ 3:1 on surface.
+
 ## newskite-postproc — PAR2 / extraction / cleanup (blocking API)
 ```rust
 pub struct Tools { pub par2:Option<PathBuf>, pub sevenz:Option<PathBuf>, pub unrar:Option<PathBuf>, pub unzip:Option<PathBuf> }
@@ -190,6 +242,18 @@ password passed to the tool as an argument (documented); never extract outside t
 (tools invoked with explicit output dir, reject archive entries with `..`/absolute paths
 where the tool allows listing). Cleanup only after a successful extraction. Commands are
 spawned with argument vectors, never through a shell.
+
+Implementation notes (additive API, see crate docs in `src/lib.rs`): extraction always goes
+to `dir/<extraction_dir_name(job_name)>/` (`<name>.extracted` if a file has that name).
+PAR2 verify always runs when `.par2` files and `par2` exist; `repair:false` turns a damaged
+set into `Failed`; a failed PAR2 step skips extraction. Cleanup runs only when the extract
+verdict is `Ok` (archive volumes; plus `.par2` files and par2 `name.1` backups when no set
+was skipped). Extra public items: `Tools::{none, can_extract, summary}`, `detect_tools_in`,
+`find_tool`, `PostOptions::from_settings(&PostProcessSettings, Option<String>)` + `Default`
++ password-redacting `Debug`, `Verdict::{is_failed, is_success}` + `Display`,
+`extraction_dir_name`, `is_unsafe_entry`, `parse_7z_listing`, `parse_bare_listing`,
+`sniff_bytes`, `sniff_file`, `ArchiveKind`, `Magic`. Run post-processing jobs one at a
+time (par2 uses every core).
 
 ## newskite-service — queue engine shared by GUI and CLI
 ```rust
@@ -238,6 +302,39 @@ Windows `shutdown /s /t 0`, macOS `osascript -e 'tell app "System Events" to shu
 Throughput sampler stores one sample per second only while bytes moved or a run is active,
 prunes >7 days. No server → job does not start, single message "no enabled server configured".
 
+Implemented additions (additive): consts `LOG_CAPACITY` (50), `EVENT_CAPACITY` (1024),
+`SAMPLE_RETENTION_SECS` (7 days), `TEST_SERVER_TIMEOUT` (10 s), `CONNECT_TIMEOUT` (30 s),
+`NO_SERVER_MESSAGE`; `ServiceOptions::new(data_dir)` (allow_shutdown=false) + `Clone/Debug/PartialEq`;
+`pub type ShutdownHook = Arc<dyn Fn()->Result<(),String>+Send+Sync>` and
+`Service::set_shutdown_hook(&self, ShutdownHook)` (replaces the power-off command; still only used
+when `allow_shutdown`); `pub fn shutdown_command()->Option<(&str,&[&str])>`; `Service::job_files(id)`,
+`Service::options()`; `LogLevel::as_str` + `Display`; `ServiceEvent: Clone+Debug+PartialEq+Eq`,
+`Status: Default`; re-exports `Store, StoreError, Job, JobFile, JobState, NewBookmark, Bookmark,
+ThroughputSample, Totals`. Semantics: `with_store` also resets interrupted jobs and starts the timers;
+every log line is broadcast as `JobLog` (errors additionally as `Error`) and mirrored to `tracing`;
+`QueueIdle` is emitted whenever a run ends (drained, paused, stopped), after `running` is false;
+`Paused` is emitted by `pause()` itself (acknowledgment); `start()` clears a pending pause (emits
+`Resumed`), clears `last_error` and cancels a running shutdown countdown; `start()` after
+`shutdown()` returns false. Destination folder is fixed at import: `<download_dir>/<job name>`,
+`"<name> (N)"` if a pending job already uses it; `add_nzb` stores the canonical path and dedupes on
+it (pending states only). Watch folder: non-recursive, `*.nzb` case-insensitive, dedupe against
+any job state; manual scans work whenever a folder is set; the timer scans immediately and then
+every `watch_interval_secs` while `watch_enabled`, re-reading settings each second. Outcomes:
+success → post-process if enabled; a `Failed` PAR2 or extract verdict (or `PostError`) marks the
+job `failed` with the reason (set a password and `retry_job`; done files are skipped on retry);
+`MissingArticles` → failed `"N missing articles: id1, ..., id5, ... (+K more)"`, run continues;
+`AuthFailed`/`Connect` → failed and the run stops; `Io` → failed, run continues; shutdown →
+job back to `queued`. Auto-shutdown countdown only after a run that processed ≥1 job drains the
+queue. Settings saved mid-job apply to the next job. Load failure of settings → defaults + one
+logged error.
+
+Runtime settings override (additive, for the headless CLI):
+`Service::set_runtime_settings_override(&self, Option<Settings>)` and
+`Service::has_runtime_settings_override(&self) -> bool`. While set (normalized on set), imports
+(destination folder), runs, the watch timer and auto-shutdown use the override instead of the
+stored document; it is never written to the database nor logged. `Service::settings()` keeps
+returning the **stored** document, so saving what it returns never persists override values.
+
 ## newskite-cli
 ```rust
 #[derive(clap::Parser)] pub struct HeadlessArgs { --nzb FILE (repeatable), --dest DIR, --server HOST:PORT, --tls,
@@ -247,8 +344,56 @@ pub fn run_headless(args: HeadlessArgs) -> std::process::ExitCode; // own tokio 
 `--server` given → overrides settings for this run without persisting the password (store
 settings untouched); absent → uses stored settings. Exit 0 only if every job is done.
 
+Implemented additions (additive): `HeadlessArgs` also has a hidden `--headless` flag (accepted
+harmlessly), `--pass` falls back to env `NEWSKITE_PASS` (value hidden in help), `--server` is
+`Option<ServerAddr>` (`host`, `host:port`, `[v6]`, `[v6]:port`, bare v6; default port 563 with
+`--tls`, 119 without), `--connections` 1-500, `--retries` 0-100; `Debug` redacts the password.
+```rust
+pub const EXIT_OK:i32=0; EXIT_FAILURE:i32=1; EXIT_USAGE:i32=2; EXIT_INTERRUPTED:i32=130;
+pub const DEFAULT_PORT:u16=119; DEFAULT_TLS_PORT:u16=563; PASSWORD_ENV:&str="NEWSKITE_PASS";
+pub struct ServerAddr { pub host:String, pub port:Option<u16> } // FromStr, Display, port_or_default(tls)
+pub enum ServerAddrError { Empty, InvalidHost(String), InvalidPort(String), InvalidIpv6(String), Ambiguous(String) }
+pub enum CliError { Usage(String), Service(ServiceError), Io(io::Error) } // exit_code()
+pub fn parse_args<I,T>(args:I) -> Result<HeadlessArgs, clap::Error>;   // argv incl. program name
+pub fn run_headless_from_args<I,T>(args:I) -> ExitCode;                 // parse + run; clap errors exit 2 (help 0)
+pub async fn run_headless_with(args:HeadlessArgs, out:&mut impl Write) -> i32; // current runtime, Ctrl-C, stderr progress if TTY
+pub async fn run_headless_until<W:Write+?Sized,F:Future<Output=()>>(args, out:&mut W, stop:F, progress:Option<&mut dyn Write>) -> i32;
+pub fn override_settings(stored:Settings, args:&HeadlessArgs) -> Result<Settings,CliError>;
+pub fn progress_text(done:u64, total:u64, bytes_per_sec:u64) -> String;
+```
+Semantics: the run always sets a runtime settings override (stored settings + flags; watch
+folder, watch auto-start and auto-shutdown off). No usable server after overrides → exit 2
+before anything is queued. `--user`/`--tls` without `--server` → exit 2. Each `--nzb` prints
+`queued <name>` or `failed <path>: <reason>` (a file already pending in the database, e.g. after
+Ctrl-C, is picked up again and printed as `queued`; the same file twice is one job). Then
+`complete <name>` / `failed <name>: <reason>` per job; if the queue stops (auth/connect failure,
+no server) while jobs are still pending they are printed `failed <name>: not downloaded, the
+queue stopped: <last error>` (they stay queued in the database). When every job of this
+invocation has an outcome the service is shut down (any other active job goes back to queued).
+Ctrl-C → service shutdown (active job left resumable), exit 130.
+
 ## newskite (app binary)
 `main.rs`: `newskite --headless ...` → `newskite_cli::run_headless`; otherwise GUI, with any
 positional `*.nzb` paths/`file://`/`nzb://` URIs added to the queue on launch. GUI per
 outline §5–§7 in `src/gui/`. Theme tokens → egui `Visuals`; **no literal colors** outside
 `newskite-theme`.
+
+Implemented (additive): the crate is a library `newskite_app` plus the thin `newskite` binary,
+so the GUI can be driven headlessly in tests. **egui/eframe/egui_extras/egui_kittest 0.33.3**
+(not 0.37: 0.34+ need rustc 1.92/1.95, above the workspace MSRV 1.89 and the installed 1.93);
+eframe uses the `glow` renderer, kittest snapshots use `wgpu`. Public items:
+`launch::{parse_args, parse_item, percent_decode, Mode, LaunchItem, USAGE}` (`--headless`
+anywhere → CLI with argv0 `"newskite --headless"`; `file://` (local only), `nzb:///path` and
+`nzb://file://…` are imported; `nzb://http…`, `nzblnk:` and web links are logged as
+unsupported — no HTTP fetching yet); `gui::{NewskiteApp, AppConfig{theme, notifications,
+forward_events}, ThemeMode::{Desktop, Fixed(Theme)}, Action, UiMsg, Tab}` with
+`NewskiteApp::{new(ctx, service, rt_handle, config), ui(ctx), push_action, sender, service,
+reload_all, reload_jobs, drain_messages, apply_actions}` and pub fields `theme`, `palette`,
+`data`, `view`. `gui::theme::{to_color32, parse_user_color, visuals, apply, Palette}` is the
+only place colors are converted (token `Rgb` → `Color32`; shadow = token color with alpha);
+a unit test greps every other GUI source for color constructors. The GUI opens the service
+with `allow_shutdown: true`. Behavior notes: the queue connection pill says `Connected` only
+while a run is active (`Ready` when idle — no persistent connection exists); the graph draws
+the last 24 h of stored samples (downsampled, dashed) and the live 10 min series (accent);
+NZB files dropped on the window are imported; desktop notification on `QueueIdle` (Linux/BSD,
+notify-rust) only when jobs finished since the last one.

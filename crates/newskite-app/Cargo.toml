@@ -10,5 +10,70 @@ description = "Desktop Usenet (NZB) download client"
 name = "newskite"
 path = "src/main.rs"
 
+[lib]
+# The GUI lives in a library target so integration tests (snapshot rendering) can
+# drive it without opening a window.
+name = "newskite_app"
+path = "src/lib.rs"
+
 [dependencies]
 newskite-types.workspace = true
+newskite-service.workspace = true
+newskite-theme.workspace = true
+newskite-cli.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time"] }
+tracing.workspace = true
+thiserror.workspace = true
+# egui 0.33 is the newest release whose MSRV (1.88) fits the workspace MSRV (1.89);
+# 0.34+ need rustc 1.92/1.95.
+eframe = { version = "0.33.3", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland", "x11"] }
+egui_extras = { version = "0.33.3", default-features = false }
+clap = { version = "4.6", features = ["derive"] }
+rfd = "0.17"
+open = "5.3"
+chrono = { version = "0.4.41", default-features = false, features = ["clock", "std"] }
+tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
+
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+notify-rust = { version = "4.11", default-features = false, features = ["z"] }
+
+[dev-dependencies]
+egui_kittest = { version = "0.33.3", features = ["wgpu", "snapshot"] }
+tempfile = "3.27"
+newskite-store.workspace = true
+
+# Debian package metadata for cargo-deb (`cargo deb -p newskite`). Asset sources are relative
+# to this crate; `target/release/...` is rewritten by cargo-deb to the real target dir.
+[package.metadata.deb]
+name = "newskite"
+maintainer = "Pat"
+copyright = "2026, Pat"
+section = "net"
+priority = "optional"
+# $auto finds the libraries linked at build time (libc, libgcc). winit/glutin load the
+# windowing libraries with dlopen, so those are listed explicitly.
+depends = "$auto, libgl1, libegl1, libxkbcommon0, libwayland-client0, libwayland-cursor0, libwayland-egl1, libx11-6, libxcursor1, libxrandr2, libxi6, libxkbcommon-x11-0"
+recommends = "par2, 7zip | p7zip-full, unzip"
+suggests = "unrar"
+extended-description = """\
+Newskite is a desktop Usenet (NZB) download client. It downloads the binary articles \
+listed in an NZB file from an NNTP server over TLS, decodes them, writes the original \
+files to disk and verifies, repairs and extracts them using the external par2, 7z, unrar \
+and unzip tools when they are installed. It keeps a resumable queue, bookmarks and live \
+throughput statistics, follows the desktop light or dark color scheme, and includes a \
+headless command-line mode (newskite --headless) that drives the same queue engine. \
+Server passwords are stored unencrypted in the local database."""
+assets = [
+    ["target/release/newskite", "usr/bin/", "755"],
+    ["../../packaging/net.innerpulse.Newskite.desktop", "usr/share/applications/", "644"],
+    ["../../packaging/net.innerpulse.Newskite.metainfo.xml", "usr/share/metainfo/", "644"],
+    ["../../packaging/mime/newskite-nzb.xml", "usr/share/mime/packages/", "644"],
+    ["../../packaging/icons/net.innerpulse.Newskite.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
+    ["../../packaging/icons/hicolor/16x16/apps/net.innerpulse.Newskite.png", "usr/share/icons/hicolor/16x16/apps/", "644"],
+    ["../../packaging/icons/hicolor/32x32/apps/net.innerpulse.Newskite.png", "usr/share/icons/hicolor/32x32/apps/", "644"],
+    ["../../packaging/icons/hicolor/48x48/apps/net.innerpulse.Newskite.png", "usr/share/icons/hicolor/48x48/apps/", "644"],
+    ["../../packaging/icons/hicolor/64x64/apps/net.innerpulse.Newskite.png", "usr/share/icons/hicolor/64x64/apps/", "644"],
+    ["../../packaging/icons/hicolor/128x128/apps/net.innerpulse.Newskite.png", "usr/share/icons/hicolor/128x128/apps/", "644"],
+    ["../../packaging/icons/hicolor/256x256/apps/net.innerpulse.Newskite.png", "usr/share/icons/hicolor/256x256/apps/", "644"],
+    ["../../README.md", "usr/share/doc/newskite/", "644"],
+]

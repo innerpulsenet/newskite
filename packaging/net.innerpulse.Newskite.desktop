@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=Newskite
+GenericName=Usenet Downloader
+Comment=Download files from Usenet using NZB files
+Exec=newskite %U
+TryExec=newskite
+Icon=net.innerpulse.Newskite
+Terminal=false
+StartupNotify=true
+StartupWMClass=net.innerpulse.Newskite
+Categories=Network;FileTransfer;
+Keywords=usenet;nzb;nntp;newsgroup;download;binary;
+MimeType=application/x-nzb;x-scheme-handler/nzb;x-scheme-handler/nzblnk;
