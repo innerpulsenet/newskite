@@ -222,6 +222,12 @@ impl NntpConnection {
     /// terminated by `\r\n` (bare `\n` is normalized). 430/423 → [`NntpError::ArticleMissing`]
     /// (with the id without brackets); 480 → re-authenticates once if credentials are
     /// configured, otherwise [`NntpError::AuthRequired`].
+    ///
+    /// Other refusals are classified so callers never retry a permanent answer forever:
+    /// 400 or a connection/rate-limit reply → [`NntpError::Connect`] (transient, session
+    /// considered broken); 481/482/483/502 → [`NntpError::AuthFailed`] (this server refuses
+    /// the account); any other 4xx/5xx (451 takedown, 500/501/503, ...) →
+    /// [`NntpError::ArticleMissing`] for this server. Error texts are credential-redacted.
     pub async fn body(&mut self, message_id: &str) -> Result<Vec<u8>, NntpError> {
         let id = normalize_message_id(message_id)?;
         let r = self.command_with_reauth(&format!("BODY {id}")).await?;
@@ -229,6 +235,7 @@ impl NntpConnection {
             222 => self.read_multiline().await,
             430 | 423 => Err(NntpError::ArticleMissing(bare(&id).to_owned())),
             480 => Err(NntpError::AuthRequired),
+            400..=599 => Err(self.refusal("BODY", &r, &id)),
             _ => Err(self.unexpected("BODY", &r)),
         }
     }
@@ -310,13 +317,53 @@ impl NntpConnection {
         match r.code {
             281 => return Ok(()),
             381 => {}
-            _ => return Err(auth_error(&r)),
+            _ => return Err(self.auth_error(&r)),
         }
         let r = self.command(&pass_line).await?;
         drop(pass_line);
         match r.code {
             281 => Ok(()),
-            _ => Err(auth_error(&r)),
+            _ => Err(self.auth_error(&r)),
+        }
+    }
+
+    /// Classifies a non-success reply to AUTHINFO. 400 and replies that only enforce a
+    /// connection or rate limit (`502 Too many connections`, `481 connection limit
+    /// reached`) are transient [`NntpError::Connect`], so the caller backs off instead of
+    /// treating the account as permanently rejected; other 4xx/5xx → `AuthFailed`.
+    /// The reply text is credential-redacted.
+    fn auth_error(&mut self, r: &Response) -> NntpError {
+        let shown = self.redact(&r.to_string());
+        if r.code == 400 || (matches!(r.code, 481 | 482 | 502) && mentions_limit(&r.text)) {
+            self.broken = true;
+            return NntpError::Connect(format!("server refused authentication for now: {shown}"));
+        }
+        match r.code {
+            400..=599 => NntpError::AuthFailed(shown),
+            _ => {
+                self.broken = true;
+                NntpError::Protocol(format!("unexpected reply during authentication: {shown}"))
+            }
+        }
+    }
+
+    /// Classifies a 4xx/5xx reply to an article command (see [`body`](Self::body)).
+    fn refusal(&mut self, what: &str, r: &Response, id: &str) -> NntpError {
+        let shown = self.redact(&r.to_string());
+        match r.code {
+            400 => {
+                self.broken = true;
+                NntpError::Connect(format!("server ended the session during {what}: {shown}"))
+            }
+            481 | 482 | 502 if mentions_limit(&r.text) => {
+                self.broken = true;
+                NntpError::Connect(format!("server refused {what} for now: {shown}"))
+            }
+            481..=483 | 502 => NntpError::AuthFailed(shown),
+            _ => {
+                tracing::debug!(address = %self.address, reply = %shown, "{what} refused; treating the article as missing here");
+                NntpError::ArticleMissing(bare(id).to_owned())
+            }
         }
     }
 
@@ -455,7 +502,7 @@ impl NntpConnection {
         self.line_buf = line;
     }
 
-    /// Hides credentials a server might echo back in a reply (transcript only).
+    /// Hides credentials a server might echo back in a reply (transcripts and error texts).
     fn redact(&self, text: &str) -> String {
         let mut shown = text.to_owned();
         if let Some(c) = &self.credentials {
@@ -497,11 +544,13 @@ pub async fn test_server(server: &ServerConfig, timeout: Duration) -> Result<Str
     Ok(transcript)
 }
 
-fn auth_error(r: &Response) -> NntpError {
-    match r.code {
-        400..=599 => NntpError::AuthFailed(r.to_string()),
-        _ => NntpError::Protocol(format!("unexpected reply during authentication: {r}")),
-    }
+/// True when a refusal is about a connection or rate limit rather than the account
+/// itself, e.g. `502 Too many connections` or `481 connection limit reached`.
+fn mentions_limit(text: &str) -> bool {
+    let t = text.to_ascii_lowercase();
+    ["too many", "connections", "limit", "temporar", "try again", "overload", "busy"]
+        .iter()
+        .any(|k| t.contains(k))
 }
 
 /// Replaces AUTHINFO arguments with a mask so credentials never reach logs/transcripts.
@@ -565,11 +614,13 @@ mod tests {
     }
 
     #[test]
-    fn auth_error_mapping() {
-        let r = |code| Response { code, text: "nope".into() };
-        assert!(matches!(auth_error(&r(481)), NntpError::AuthFailed(t) if t == "481 nope"));
-        assert!(matches!(auth_error(&r(482)), NntpError::AuthFailed(_)));
-        assert!(matches!(auth_error(&r(502)), NntpError::AuthFailed(_)));
-        assert!(matches!(auth_error(&r(211)), NntpError::Protocol(_)));
+    fn limit_replies_are_recognized() {
+        assert!(mentions_limit("Too many connections"));
+        assert!(mentions_limit("connection limit reached"));
+        assert!(mentions_limit("Max connections exceeded for user"));
+        assert!(mentions_limit("Service temporarily unavailable"));
+        assert!(!mentions_limit("Authentication failed"));
+        assert!(!mentions_limit("Access denied, account expired"));
+        assert!(!mentions_limit("nope"));
     }
 }

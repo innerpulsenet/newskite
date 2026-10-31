@@ -14,7 +14,7 @@ set -euo pipefail
 
 readonly APP_ID="net.innerpulse.Newskite"
 readonly BIN_NAME="newskite"
-readonly ICON_SIZES=(16x16 32x32 48x48 64x64 128x128 256x256)
+readonly ICON_SIZES=(16x16 24x24 32x32 48x48 64x64 128x128 256x256 512x512)
 
 bin_dir="${HOME}/.local/bin"
 data_dir="${XDG_DATA_HOME:-${HOME}/.local/share}"

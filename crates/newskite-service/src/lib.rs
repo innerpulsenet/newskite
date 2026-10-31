@@ -5,9 +5,13 @@
 //! * **Import (F1).** [`Service::add_nzb`] parses the NZB first; a malformed or unreadable
 //!   file produces [`ServiceError::Nzb`] and no job row. The job is persisted `queued` with
 //!   its byte total, its canonical source path and its destination folder
-//!   (`<download_dir>/<job name>`, made unique among pending jobs) before anything downloads.
+//!   (`<download_dir>/<job name>`, made unique among every job in the store, compared
+//!   case-insensitively, and among folders already on disk) before anything downloads.
+//!   Imports are serialized, so concurrent adds and scans never insert one NZB twice.
 //! * **Watch folder (F2).** [`Service::scan_watch_folder`] enqueues every `*.nzb` (case
-//!   insensitive, not recursive) whose canonical path has never been imported, in any state.
+//!   insensitive, not recursive) whose canonical path has no job in any state and was not
+//!   imported (or its job removed) before with the same size and mtime, so removing a job
+//!   does not bring it back.
 //!   A background timer scans every `watch_interval_secs` while `watch_enabled` (settings are
 //!   re-read every second, so changes apply without a restart). Manual scans work whenever a
 //!   watch folder is configured. Timer scans log only imports and new problems.
@@ -20,7 +24,9 @@
 //! * **Per job.** Usable servers come from [`Settings::usable_servers`]; with none, the job is
 //!   left `queued`, a single error "no enabled server configured" is logged and the run stops.
 //!   Files recorded as `done` in earlier runs are passed to the engine as `skip_files`, so an
-//!   interrupted job resumes instead of restarting. Progress (`bytes_done`) is persisted at
+//!   interrupted job resumes instead of restarting. A `done` file that is missing or whose
+//!   on-disk length differs from the recorded one is not skipped (one that is shorter, as
+//!   lost writes leave it, is removed first so it is downloaded again under its own name). Progress (`bytes_done`) is persisted at
 //!   most once per second, at every file end and when the job ends. Engine events are
 //!   rebroadcast as [`ServiceEvent::Engine`]; file-level events and engine log lines become
 //!   human log lines (never one per segment).
@@ -32,7 +38,8 @@
 //!   through the queue. A job interrupted by [`Service::shutdown`] goes back to `queued`.
 //! * **Throughput (F6).** A 1 Hz sampler emits [`ServiceEvent::Throughput`], stores one sample
 //!   per second while bytes moved or a run is active, adds to the lifetime download counter
-//!   and prunes samples older than seven days once an hour.
+//!   and prunes samples older than seven days once an hour. Bytes not yet sampled are
+//!   flushed when a run ends and at shutdown.
 //! * **Auto-shutdown (F8).** When a run that processed at least one job drains the queue and
 //!   `auto_shutdown` is set, a cancellable countdown ([`ServiceEvent::ShutdownCountdown`]) ends
 //!   in the platform power-off command. It only ever happens when
@@ -275,6 +282,10 @@ pub(crate) struct Inner {
     /// Watch-folder files that failed to import, with their mtime, so timer scans do not
     /// log the same problem every interval.
     pub(crate) watch_rejected: Mutex<HashSet<(PathBuf, Option<SystemTime>)>>,
+    /// Held across the duplicate checks and the insert of an import.
+    import_lock: Mutex<()>,
+    /// `progress.bytes_down` already written to the throughput history and lifetime total.
+    pub(crate) sampled_down: Mutex<u64>,
     settings_error_logged: AtomicBool,
     pub(crate) sampler_error_logged: AtomicBool,
     /// In-memory settings used instead of the stored document (never persisted); set by
@@ -338,7 +349,13 @@ impl Inner {
             Ok(s) => s,
             Err(e) => {
                 if !self.settings_error_logged.swap(true, Ordering::Relaxed) {
-                    self.log(LogLevel::Error, format!("settings could not be loaded ({e}); using defaults"));
+                    self.log(
+                        LogLevel::Error,
+                        format!(
+                            "settings could not be loaded ({e}); using defaults (saving settings keeps \
+                             the unreadable document as a backup)"
+                        ),
+                    );
                 }
                 Settings::default().normalized()
             }
@@ -352,24 +369,47 @@ impl Inner {
 
     /// Parse and persist a new job (no logging of failures; callers do that).
     pub(crate) fn add_nzb_inner(&self, path: &Path) -> Result<Job, ServiceError> {
+        let job = self.import_nzb(path, None)?;
+        // Without a watch fingerprint every outcome is a job or an error.
+        job.ok_or_else(|| ServiceError::Other("import skipped".into()))
+    }
+
+    /// Parse and persist a new job. The duplicate checks and the insert run under
+    /// `import_lock`, so concurrent imports (watch timer, GUI, launch arguments) can never
+    /// both insert the same NZB. With `watch = Some(fingerprint)` (a watch-folder import),
+    /// a file that already has a job in any state or was seen with that fingerprint is
+    /// skipped (`Ok(None)`), and a successful import records the fingerprint.
+    pub(crate) fn import_nzb(&self, path: &Path, watch: Option<Fingerprint>) -> Result<Option<Job>, ServiceError> {
         let path = std::fs::canonicalize(path)?;
         let nzb = newskite_nzb::nzb::parse_file(&path)?;
-        if let Some(existing) = self.store.job_by_source(&path)? {
-            if existing.state.is_pending() {
-                return Err(ServiceError::Duplicate(existing.name));
-            }
-        }
         let name = nzb.job_name(&path);
         let settings = self.settings();
-        let jobs = self.store.list_jobs()?;
-        let dest_dir = unique_dest(&settings.download_dir, &name, &jobs);
-        let job = self.store.insert_job(&newskite_store::NewJob {
-            name: name.clone(),
-            bytes_total: nzb.total_bytes(),
-            dest_dir,
-            source_path: path,
-            password: None,
-        })?;
+        let job = {
+            let _import = lock(&self.import_lock);
+            if let Some(fp) = watch {
+                if self.watch_source_known(&path, fp)? {
+                    return Ok(None);
+                }
+            }
+            if let Some(existing) = self.store.pending_job_by_source(&path)? {
+                return Err(ServiceError::Duplicate(existing.name));
+            }
+            let jobs = self.store.list_jobs()?;
+            let dest_dir = unique_dest(&settings.download_dir, &name, &jobs);
+            let job = self.store.insert_job(&newskite_store::NewJob {
+                name: name.clone(),
+                bytes_total: nzb.total_bytes(),
+                dest_dir,
+                source_path: path.clone(),
+                password: None,
+            })?;
+            if let Some(fp) = watch {
+                if let Err(e) = self.store.mark_source_seen(&path, fp.size, fp.mtime) {
+                    self.log(LogLevel::Warn, format!("could not record {} as imported: {e}", path.display()));
+                }
+            }
+            job
+        };
         self.log(
             LogLevel::Info,
             format!(
@@ -380,13 +420,45 @@ impl Inner {
             ),
         );
         self.emit(ServiceEvent::JobsChanged);
-        Ok(job)
+        Ok(Some(job))
+    }
+
+    /// Watch-folder dedupe: `path` has a job in any state, or was imported (or its job
+    /// removed) while it had this fingerprint.
+    pub(crate) fn watch_source_known(&self, path: &Path, fp: Fingerprint) -> Result<bool, StoreError> {
+        Ok(self.store.job_by_source(path)?.is_some() || self.store.source_seen(path, fp.size, fp.mtime)?)
     }
 }
 
-/// `<base>/<name>`, or `<base>/<name> (N)` when a pending job already uses that folder.
+/// Size and modification time (unix nanoseconds) of an NZB file; a file replaced under
+/// the same name gets a new fingerprint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Fingerprint {
+    pub(crate) size: u64,
+    pub(crate) mtime: i64,
+}
+
+impl Fingerprint {
+    /// The fingerprint of the file at `path`, or `None` if it cannot be read.
+    pub(crate) fn of(path: &Path) -> Option<Self> {
+        let meta = std::fs::metadata(path).ok()?;
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX));
+        Some(Self { size: meta.len(), mtime })
+    }
+}
+
+/// `<base>/<name>`, or `<base>/<name> (N)` when that folder is taken: used by any job in
+/// the store (whatever its state, compared case-insensitively, since Windows and macOS
+/// treat `Foo` and `foo` as one folder) or already present on disk. So two jobs never
+/// share a folder and post-processing never sees another job's files.
 fn unique_dest(base: &Path, name: &str, jobs: &[Job]) -> PathBuf {
-    let taken = |p: &Path| jobs.iter().any(|j| j.state.is_pending() && j.dest_dir == p);
+    let key = |p: &Path| p.to_string_lossy().to_lowercase();
+    let used: HashSet<String> = jobs.iter().map(|j| key(&j.dest_dir)).collect();
+    let taken = |p: &Path| used.contains(&key(p)) || std::fs::symlink_metadata(p).is_ok();
     let mut candidate = base.join(name);
     let mut n = 2u32;
     while taken(&candidate) {
@@ -412,6 +484,11 @@ impl Service {
     /// Opens (or creates) the database in `opts.data_dir`, resets jobs left `downloading`
     /// by an earlier process to `queued`, and starts the throughput sampler and the
     /// watch-folder timer on `rt`.
+    ///
+    /// Single instance: [`Store::open`] locks the data directory, so while another service
+    /// (GUI or headless, in any process) has it open this fails with a
+    /// [`ServiceError::Store`] saying another Newskite instance is using it, and nothing
+    /// in the database is touched.
     pub fn open(opts: ServiceOptions, rt: Handle) -> Result<Self, ServiceError> {
         let store = Store::open(&opts.data_dir)?;
         Ok(Self::with_store(store, opts, rt))
@@ -436,6 +513,8 @@ impl Service {
             tools: OnceLock::new(),
             shutdown_hook: Mutex::new(None),
             watch_rejected: Mutex::new(HashSet::new()),
+            import_lock: Mutex::new(()),
+            sampled_down: Mutex::new(0),
             settings_error_logged: AtomicBool::new(false),
             sampler_error_logged: AtomicBool::new(false),
             settings_override: Mutex::new(None),
@@ -482,6 +561,15 @@ impl Service {
         runner::start(&self.inner)
     }
 
+    /// Like [`Service::start`], but the run processes only the jobs whose id is in `ids`
+    /// (oldest first, as usual); every other queued or paused job stays untouched and the
+    /// run ends once none of the listed jobs is runnable. Returns `false` (and does
+    /// nothing) when a run is already active or the service is shut down. Used by headless
+    /// mode so it never works through the stored backlog with its own server override.
+    pub fn start_jobs(&self, ids: &[i64]) -> bool {
+        runner::start_with(&self.inner, Some(ids.to_vec()))
+    }
+
     /// Requests a cooperative pause: the current job finishes, the next one does not start.
     /// Emits [`ServiceEvent::Paused`] immediately.
     pub fn pause(&self) {
@@ -523,11 +611,21 @@ impl Service {
     }
 
     /// Deletes a job (and its file rows). If it is downloading, the download is canceled;
-    /// files already written stay on disk.
+    /// files already written stay on disk. The source NZB is recorded as seen (with its
+    /// size and mtime), so a watch folder that still holds it does not import it again.
     pub fn remove_job(&self, id: i64) -> Result<(), ServiceError> {
         let result = (|| {
             let job = self.inner.store.get_job(id)?.ok_or(ServiceError::NotFound(id))?;
             self.inner.store.remove_job(id).map_err(|e| store_err(id, e))?;
+            // Remember the NZB, so a watch folder holding it does not import it again.
+            if let Some(fp) = Fingerprint::of(&job.source_path) {
+                if let Err(e) = self.inner.store.mark_source_seen(&job.source_path, fp.size, fp.mtime) {
+                    self.inner.log(
+                        LogLevel::Warn,
+                        format!("could not record {} as removed: {e}", job.source_path.display()),
+                    );
+                }
+            }
             let cancel = {
                 let mut st = self.inner.lock_state();
                 if st.active_job == Some(id) {
@@ -556,7 +654,8 @@ impl Service {
     }
 
     /// Puts a `failed` job back to `queued` (error cleared). Other states are refused with
-    /// [`ServiceError::Other`]. Does not start the queue.
+    /// [`ServiceError::Other`]; a retry while another job for the same source NZB is pending
+    /// is refused with [`ServiceError::Duplicate`]. Does not start the queue.
     pub fn retry_job(&self, id: i64) -> Result<(), ServiceError> {
         let result = (|| {
             let job = self.inner.store.get_job(id)?.ok_or(ServiceError::NotFound(id))?;
@@ -565,6 +664,10 @@ impl Service {
                     "only failed jobs can be retried ({} is {})",
                     job.name, job.state
                 )));
+            }
+            // Retrying must not put a second pending job for the same NZB in the queue.
+            if let Some(other) = self.inner.store.pending_job_by_source(&job.source_path)? {
+                return Err(ServiceError::Duplicate(other.name));
             }
             self.inner.store.set_job_state(id, JobState::Queued, None).map_err(|e| store_err(id, e))?;
             Ok(job)
@@ -634,6 +737,13 @@ impl Service {
         self.inner.stored_settings()
     }
 
+    /// Why the stored settings document cannot be loaded, or `None` when it loads. While
+    /// this is `Some`, [`Service::settings`] returns defaults; saving keeps the unreadable
+    /// document as a backup in the database (see [`Store::settings_backups`]).
+    pub fn settings_load_error(&self) -> Option<String> {
+        self.inner.store.load_settings().err().map(|e| e.to_string())
+    }
+
     /// Replaces (with `Some`) or clears (with `None`) an in-memory settings override.
     /// While set, imports (destination folder), queue runs (servers, connections,
     /// retries, speed limit, post-processing), the watch timer and auto-shutdown use the
@@ -652,11 +762,24 @@ impl Service {
 
     /// Normalizes and persists the settings. They apply to the next job (a running job
     /// keeps its servers, connections and speed limit).
+    /// When the stored document cannot be loaded, it is kept as a backup row first (see
+    /// [`Store::save_settings`]) and a warning names the backup key.
     pub fn save_settings(&self, s: Settings) -> Result<(), ServiceError> {
+        let was_unreadable = self.inner.store.load_settings().is_err();
         match self.inner.store.save_settings(&s.normalized()) {
             Ok(()) => {
                 self.inner.settings_error_logged.store(false, Ordering::Relaxed);
                 self.inner.log(LogLevel::Info, "settings saved");
+                if was_unreadable {
+                    let key = self.inner.store.settings_backups().ok().and_then(|b| b.last().map(|(k, _)| k.clone()));
+                    self.inner.log(
+                        LogLevel::Warn,
+                        format!(
+                            "the unreadable settings document was kept in the database as {}",
+                            key.as_deref().unwrap_or("a backup")
+                        ),
+                    );
+                }
                 Ok(())
             }
             Err(e) => {
@@ -774,6 +897,8 @@ impl Service {
             st.countdown = None;
             self.inner.shutdown.cancel();
         }
+        // Bytes since the last sampler tick would otherwise never be recorded.
+        timers::flush_throughput(&self.inner);
         self.inner.log(LogLevel::Info, "service stopping");
     }
 

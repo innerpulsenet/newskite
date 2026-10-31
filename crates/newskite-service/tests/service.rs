@@ -154,6 +154,34 @@ async fn start_is_idempotent() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn start_jobs_runs_only_the_listed_jobs() {
+    let tmp = TempDir::new().unwrap();
+    let f1 = TestFile::random("o1", "old.bin", 16 * 1024, 2, 31);
+    let f2 = TestFile::random("o2", "mine.bin", 16 * 1024, 3, 32);
+    let mock = mock_for(&[&f1, &f2], &[], 0).await;
+    let svc = open_service(tmp.path(), test_settings(tmp.path(), vec![server_for(&mock, 1)]));
+    let dir = tmp.path().join("n");
+    let older = svc.add_nzb(&write_nzb(&dir, "old.nzb", None, &[&f1])).unwrap();
+    let mine = svc.add_nzb(&write_nzb(&dir, "mine.nzb", None, &[&f2])).unwrap();
+
+    assert!(svc.start_jobs(&[mine.id]));
+    assert!(!svc.start_jobs(&[mine.id]), "a run is already active");
+    wait_idle(&svc, 20).await;
+    let state = |id| svc.jobs().into_iter().find(|j| j.id == id).unwrap().state;
+    assert_eq!(state(mine.id), JobState::Done);
+    assert_eq!(state(older.id), JobState::Queued, "an unlisted job is left alone");
+    assert_eq!(mock.body_requests(), 3);
+
+    // An empty or already finished list ends the run at once; a plain start runs the rest.
+    assert!(svc.start_jobs(&[]));
+    wait_idle(&svc, 5).await;
+    assert_eq!(state(older.id), JobState::Queued);
+    assert!(svc.start());
+    wait_idle(&svc, 20).await;
+    assert_eq!(state(older.id), JobState::Done);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pause_stops_before_next_job_and_resume_finishes() {
     let tmp = TempDir::new().unwrap();
     let f1 = TestFile::random("p1", "one.bin", 40 * 1024, 4, 11);
@@ -353,6 +381,61 @@ async fn restart_resumes_an_interrupted_job_and_skips_done_files() {
     assert!(files.iter().all(|f| f.state == "done"));
 }
 
+/// A file recorded as `done` whose data did not survive (shorter on disk than recorded, as
+/// after a power loss) must be downloaded again, not skipped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_redownloads_a_done_file_that_is_truncated_on_disk() {
+    let tmp = TempDir::new().unwrap();
+    let f1 = TestFile::random("tr1", "first.bin", 50 * 1024, 4, 63);
+    let f2 = TestFile::random("tr2", "second.bin", 50 * 1024, 5, 64);
+    let mock = mock_for(&[&f1, &f2], &[], 0).await;
+    let settings = test_settings(tmp.path(), vec![server_for(&mock, 2)]);
+    let nzb = std::fs::canonicalize(write_nzb(&tmp.path().join("n"), "tr.nzb", None, &[&f1, &f2])).unwrap();
+    let dest = tmp.path().join("downloads").join("tr");
+
+    let job_id = {
+        let store = Store::open(&tmp.path().join("db")).unwrap();
+        store.save_settings(&settings).unwrap();
+        let total: u64 = f1.articles.iter().chain(&f2.articles).map(|(_, b)| b.len() as u64).sum();
+        let job = store
+            .insert_job(&newskite_store::NewJob {
+                name: "tr".into(),
+                bytes_total: total,
+                dest_dir: dest.clone(),
+                source_path: nzb.clone(),
+                password: None,
+            })
+            .unwrap();
+        store.set_job_state(job.id, JobState::Downloading, None).unwrap();
+        store
+            .upsert_job_file(&JobFile {
+                job_id: job.id,
+                name: "first.bin".into(),
+                bytes_total: f1.data.len() as u64,
+                bytes_done: f1.data.len() as u64,
+                state: "done".into(),
+            })
+            .unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dest.join("first.bin"), &f1.data[..1000]).unwrap();
+        job.id
+    };
+
+    let svc = open_service(tmp.path(), settings);
+    assert!(svc.start());
+    wait_idle(&svc, 20).await;
+    let job = svc.jobs().remove(0);
+    assert_eq!(job.state, JobState::Done, "{:?}", job.error);
+    assert_eq!(mock.body_requests(), f1.articles.len() + f2.articles.len(), "the truncated file is fetched again");
+    assert_eq!(sha256(&read(&dest.join("first.bin"))), sha256(&f1.data));
+    assert_eq!(sha256(&read(&dest.join("second.bin"))), sha256(&f2.data));
+    let mut names: Vec<String> = std::fs::read_dir(&dest).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+    names.sort();
+    assert_eq!(names, vec!["first.bin", "second.bin"], "no numbered duplicate");
+    assert!(svc.logs().iter().any(|l| l.text.contains("first.bin") && l.text.contains("again")));
+    assert!(svc.job_files(job_id).iter().all(|f| f.state == "done"));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_interrupts_the_active_job_and_leaves_it_resumable() {
     let tmp = TempDir::new().unwrap();
@@ -376,12 +459,30 @@ async fn shutdown_interrupts_the_active_job_and_leaves_it_resumable() {
 async fn watch_folder_scan_imports_once() {
     let tmp = TempDir::new().unwrap();
     let file = TestFile::random("w", "w.bin", 1024, 1, 81);
+    let watch = tmp.path().join("watch");
+    // An NZB imported earlier by hand (now finished) is not imported again. It is recorded
+    // before the service opens, because the service holds the data directory's lock.
+    // (The watch folder must not exist yet, so the canonical path is built by hand; the
+    // file itself is written below.)
+    let manual = std::fs::canonicalize(tmp.path()).unwrap().join("watch").join("gamma.nzb");
+    {
+        let store = Store::open(&tmp.path().join("db")).unwrap();
+        let g = store
+            .insert_job(&newskite_store::NewJob {
+                name: "gamma".into(),
+                bytes_total: 1024,
+                dest_dir: tmp.path().join("downloads").join("gamma"),
+                source_path: manual,
+                password: None,
+            })
+            .unwrap();
+        store.set_job_state(g.id, JobState::Done, None).unwrap();
+    }
     let svc = open_service(tmp.path(), test_settings(tmp.path(), vec![]));
 
     // Not configured, then missing: no error, a log line, nothing imported.
     assert!(svc.scan_watch_folder().unwrap().is_empty());
     assert_eq!(svc.logs()[0].text, "watch folder is not configured");
-    let watch = tmp.path().join("watch");
     let mut s = svc.settings();
     s.watch_folder = watch.clone();
     svc.save_settings(s).unwrap();
@@ -393,13 +494,7 @@ async fn watch_folder_scan_imports_once() {
     write_nzb(&watch.join("sub"), "nested.nzb", None, &[&file]);
     std::fs::write(watch.join("notes.txt"), "not an nzb").unwrap();
     std::fs::write(watch.join("broken.nzb"), "<nzb><file").unwrap();
-    // An NZB imported earlier by hand (now finished) is not imported again.
-    let manual = write_nzb(&watch, "gamma.nzb", None, &[&file]);
-    let g = svc.add_nzb(&manual).unwrap();
-    {
-        let store = Store::open(&tmp.path().join("db")).unwrap();
-        store.set_job_state(g.id, JobState::Done, None).unwrap();
-    }
+    write_nzb(&watch, "gamma.nzb", None, &[&file]);
 
     let mut rx = svc.subscribe();
     let names = svc.scan_watch_folder().unwrap();

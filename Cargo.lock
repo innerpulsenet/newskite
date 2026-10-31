@@ -2367,6 +2367,7 @@ dependencies = [
  "newskite-postproc",
  "newskite-store",
  "newskite-types",
+ "rusqlite",
  "sha2",
  "tempfile",
  "thiserror 2.0.21",

@@ -7,6 +7,9 @@
 //! The parser is tolerant of the things real-world NZBs get wrong: namespace prefixes, entities
 //! in subjects and message-ids, whitespace around message-ids, angle brackets around ids,
 //! segments listed out of order and duplicate segment numbers (the first occurrence wins).
+//! Unknown entities (such as the HTML `&eacute;` some indexers emit) are kept verbatim in both
+//! attributes and element text, while predefined entities and character references around them
+//! are still resolved.
 //! Files without any usable segment are dropped; a document without any usable file is
 //! reported as [`NzbError::Empty`].
 
@@ -16,7 +19,7 @@ use std::path::Path;
 
 use quick_xml::escape::resolve_predefined_entity;
 use quick_xml::events::{BytesRef, BytesStart, Event};
-use quick_xml::{Reader, XmlVersion};
+use quick_xml::Reader;
 
 /// Maximum length, in bytes, of a sanitized filename.
 pub const MAX_FILENAME_BYTES: usize = 200;
@@ -300,17 +303,78 @@ impl State {
 }
 
 /// Returns the unescaped value of attribute `key` (matched on its local name, ASCII
-/// case-insensitively). Unknown entities fall back to the raw attribute text.
+/// case-insensitively), normalized as per XML 1.0 (see [`normalize_attr_value`]).
 fn attr(e: &BytesStart<'_>, key: &str) -> Option<String> {
     for a in e.attributes().with_checks(false).flatten() {
         if a.key.local_name().into_inner().eq_ignore_ascii_case(key) {
-            return Some(match a.normalized_value(XmlVersion::Implicit1_0) {
-                Ok(v) => v.into_owned(),
-                Err(_) => a.value.into_owned(),
-            });
+            return Some(normalize_attr_value(&a.value));
         }
     }
     None
+}
+
+/// Tolerant XML 1.0 attribute-value normalization.
+///
+/// `\r\n`, `\r`, `\n` and `\t` each become one space; character references and the five
+/// predefined entities are resolved. Anything that cannot be resolved (unknown entities such as
+/// the HTML `&eacute;`, a bare `&`, an invalid character reference) is kept verbatim, the same
+/// policy element text follows, so one bad reference never disables decoding of the rest.
+fn normalize_attr_value(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(i) = rest.find(['&', '\t', '\r', '\n']) {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i..];
+        match tail.as_bytes()[0] {
+            b'&' => {
+                // Entity names and character references never contain these characters.
+                let resolved = tail[1..]
+                    .find(|c: char| c == ';' || c == '&' || c.is_whitespace())
+                    .filter(|&j| tail.as_bytes()[1 + j] == b';')
+                    .and_then(|j| {
+                        let name = &tail[1..1 + j];
+                        resolve_attr_ref(name).map(|v| (v, j + 2))
+                    });
+                match resolved {
+                    Some((v, len)) => {
+                        out.push_str(&v);
+                        rest = &tail[len..];
+                    }
+                    None => {
+                        out.push('&');
+                        rest = &tail[1..];
+                    }
+                }
+            }
+            b'\r' => {
+                out.push(' ');
+                rest = tail[1..].strip_prefix('\n').unwrap_or(&tail[1..]);
+            }
+            _ => {
+                out.push(' ');
+                rest = &tail[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Resolves the reference `name` (the text between `&` and `;`) to its replacement text, or
+/// `None` when it is unknown or invalid.
+fn resolve_attr_ref(name: &str) -> Option<Cow<'static, str>> {
+    if let Some(num) = name.strip_prefix('#') {
+        let code = match num.strip_prefix('x') {
+            Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+            None => num.parse::<u32>().ok()?,
+        };
+        // `from_str_radix`/`parse` accept a leading '+', which XML does not.
+        if num.contains('+') || code == 0 {
+            return None;
+        }
+        return char::from_u32(code).map(|c| Cow::Owned(c.to_string()));
+    }
+    resolve_predefined_entity(name).map(Cow::Borrowed)
 }
 
 /// Strips whitespace anywhere and a surrounding `<…>` from a message-id.
@@ -546,6 +610,21 @@ mod tests {
         assert_eq!(extract_filename("[1/2] (movie.mkv) yEnc"), "movie.mkv");
         assert_eq!(extract_filename(r#""" "real.bin" yEnc"#), "real.bin");
         assert_eq!(extract_filename("just words here"), "just words here");
+    }
+
+    #[test]
+    fn attribute_normalization_is_tolerant() {
+        assert_eq!(normalize_attr_value("plain"), "plain");
+        assert_eq!(normalize_attr_value("a&amp;b&lt;&gt;&apos;&quot;"), "a&b<>'\"");
+        assert_eq!(normalize_attr_value("&#65;&#x42;&#x1F600;"), "AB\u{1F600}");
+        // Resolved references are not normalized or rescanned.
+        assert_eq!(normalize_attr_value("&#9;&amp;amp;"), "\t&amp;");
+        // Unresolvable references stay verbatim; their neighbors still resolve.
+        assert_eq!(normalize_attr_value("&eacute;&amp;"), "&eacute;&");
+        assert_eq!(normalize_attr_value("&#0;&#xZZ;&#x+41;&#;&;"), "&#0;&#xZZ;&#x+41;&#;&;");
+        assert_eq!(normalize_attr_value("a & b &amp c &amp;"), "a & b &amp c &");
+        assert_eq!(normalize_attr_value("trailing &"), "trailing &");
+        assert_eq!(normalize_attr_value("\t\r\n\r\n é"), "    é");
     }
 
     #[test]

@@ -15,21 +15,31 @@
 //!   sanitized, falling back to [`newskite_nzb::NzbFile::filename`]. It is always a single
 //!   path component inside `dest_dir`. Two files of one job that resolve to the same name
 //!   get `"<stem> (2).<ext>"`, `(3)`, ... (case-insensitively). A name that already exists
-//!   on disk is treated the same way unless it is listed in `skip_files`, in which case the
-//!   file counts as complete from an earlier run and is skipped.
+//!   on disk is treated the same way unless the file counts as complete from an earlier run
+//!   (see **Resume**).
+//! * **Part checks.** A decoded part is accepted only when its yEnc `size=` is at most the
+//!   bytes the NZB declares for the file plus a quarter and 1 MiB (16 MiB per segment
+//!   without declared `bytes`), and when its `size=` and `name=` equal those of the file's
+//!   first accepted part. A refused part (another post's article under a reused message id,
+//!   or a hostile header) is never written; it is handled like an undecodable article.
 //! * **In-progress files** are written as `<name>.nkpart` and renamed to `<name>` only when
 //!   every segment arrived. A file with missing articles keeps its `.nkpart` and is reported
 //!   with [`EngineEvent::FileFailed`]; the job then returns
 //!   [`EngineError::MissingArticles`] with every missing message id.
-//! * **Final size** is the yEnc header `size=` of the first decoded part (never less than the
-//!   highest byte written). If the decoded data does not cover it, a warning is logged.
-//! * **Missing articles** (`430`/`423`) and undecodable articles are tried on every other
-//!   usable server, never twice on the same one. Missing everywhere means missing.
+//! * **Final size** is the yEnc header `size=` of the first accepted part (never less than the
+//!   highest byte written). If the decoded data does not cover it, a warning is logged. The
+//!   data and the rename are flushed to disk before `FileDone` is emitted.
+//! * **Missing articles** (`430`/`423`), undecodable and refused articles are tried on every
+//!   other usable server, never twice on the same one. Missing everywhere means missing. A
+//!   fallback server that keeps failing transiently while it is asked for such an article
+//!   (for example an expired backup account) is given up on for that article after
+//!   `options.retries` retries, so the article is reported missing instead of the job
+//!   aborting with [`EngineError::Connect`].
 //! * **Transient errors** (I/O, timeout, connect, TLS, protocol) drop the connection and are
 //!   retried up to `options.retries` more times per segment with exponential backoff
 //!   (200 ms, 400 ms, ... capped at 5 s), walking the servers in order. When a segment
-//!   exhausts its retries the whole job stops with [`EngineError::Connect`]; the `.nkpart`
-//!   files stay so a later run can resume.
+//!   exhausts its retries (outside the fail-over case above) the whole job stops with
+//!   [`EngineError::Connect`]; the `.nkpart` files stay so a later run can resume.
 //! * **Authentication failure** on a server excludes it for the rest of the job; when every
 //!   server has failed authentication the job stops with [`EngineError::AuthFailed`].
 //! * **CRC mismatches** are counted per file ([`FileReport::crc_errors`]) but the data is
@@ -37,10 +47,15 @@
 //! * **Speed limit**: a token bucket shared by all workers (bursts of one segment).
 //! * **Cancellation** stops all workers promptly and returns [`EngineError::Cancelled`];
 //!   partial `.nkpart` files are left in place.
-//! * **Resume**: a file whose name is in `skip_files` and whose final path already exists is
-//!   skipped without fetching anything when its NZB-derived name matches, or after the first
-//!   decoded part reveals a matching yEnc name. Skipped files emit only a `Log` line and are
-//!   included in the [`JobReport`] with their on-disk size.
+//! * **Resume**: `skip_files` lists output names completed by earlier runs. A file is skipped
+//!   without fetching anything when its NZB-derived name is in `skip_files`, exists in
+//!   `dest_dir` and no other file of the job derives the same name. Otherwise its first
+//!   decoded part decides: the file is skipped when a `skip_files` entry equal to its
+//!   sanitized yEnc name, or a numbered `"<stem> (n).<ext>"` variant of it, exists with the
+//!   part's `size=` as its length and the part's bytes at the part's offset. Matching by
+//!   content keeps files whose names collide from being taken for each other and finds
+//!   outputs an earlier run saved under a numbered name. Skipped files emit only a `Log`
+//!   line and are included in the [`JobReport`] with their on-disk size.
 //!
 //! # Events
 //!
@@ -94,7 +109,8 @@ pub struct EngineOptions {
     pub speed_limit_bps: u64,
     /// Bound for TCP connect + TLS + greeting + authentication.
     pub connect_timeout: Duration,
-    /// Output file names already completed by an earlier run (resume).
+    /// Output file names already completed by an earlier run (resume), as reported in
+    /// `FileDone`/[`FileReport::name`]. See the crate docs for how files are matched.
     pub skip_files: HashSet<String>,
 }
 

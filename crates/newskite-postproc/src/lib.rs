@@ -26,8 +26,15 @@
 //!    [`extraction_dir_name`]); if a *file* of that name already exists,
 //!    `dir/<name>.extracted/` is used instead. Before extracting, the archive is listed
 //!    (`7z l -slt`, `unrar lb`, `unzip -Z1`) and refused if any entry is absolute or has
-//!    a `..` component; after extracting, symbolic links pointing outside the folder are
-//!    deleted and the set is reported as failed.
+//!    a `..` component. Each set is then extracted into a fresh private staging folder
+//!    (`.newskite-staging-*`) inside the extraction folder. Whether the tool succeeds or
+//!    fails, symbolic links in the staging folder that point outside it (or use an
+//!    absolute destination) are deleted, the remaining output is moved into the
+//!    extraction folder without following any link already there (an existing file or
+//!    link of the same name is replaced; a file never replaces a real folder), the
+//!    staging folder is removed and the whole extraction folder is checked again for
+//!    links pointing outside it. Any deleted link reports the set as failed. Links are
+//!    judged by their fully resolved destination when it exists, else lexically.
 //!
 //!    **Passwords** are passed on the tool's command line (`-p<pw>` for 7-Zip/unrar,
 //!    `-P <pw>` for unzip), which other local users can see in the process list while the

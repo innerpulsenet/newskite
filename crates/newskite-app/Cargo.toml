@@ -70,10 +70,12 @@ assets = [
     ["../../packaging/mime/newskite-nzb.xml", "usr/share/mime/packages/", "644"],
     ["../../packaging/icons/net.innerpulse.Newskite.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
     ["../../packaging/icons/hicolor/16x16/apps/net.innerpulse.Newskite.png", "usr/share/icons/hicolor/16x16/apps/", "644"],
+    ["../../packaging/icons/hicolor/24x24/apps/net.innerpulse.Newskite.png", "usr/share/icons/hicolor/24x24/apps/", "644"],
     ["../../packaging/icons/hicolor/32x32/apps/net.innerpulse.Newskite.png", "usr/share/icons/hicolor/32x32/apps/", "644"],
     ["../../packaging/icons/hicolor/48x48/apps/net.innerpulse.Newskite.png", "usr/share/icons/hicolor/48x48/apps/", "644"],
     ["../../packaging/icons/hicolor/64x64/apps/net.innerpulse.Newskite.png", "usr/share/icons/hicolor/64x64/apps/", "644"],
     ["../../packaging/icons/hicolor/128x128/apps/net.innerpulse.Newskite.png", "usr/share/icons/hicolor/128x128/apps/", "644"],
     ["../../packaging/icons/hicolor/256x256/apps/net.innerpulse.Newskite.png", "usr/share/icons/hicolor/256x256/apps/", "644"],
+    ["../../packaging/icons/hicolor/512x512/apps/net.innerpulse.Newskite.png", "usr/share/icons/hicolor/512x512/apps/", "644"],
     ["../../README.md", "usr/share/doc/newskite/", "644"],
 ]

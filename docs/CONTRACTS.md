@@ -51,6 +51,10 @@ pub mod yenc {
   pub fn encode_article(name:&str, file_size:u64, part:u32, total:u32, begin_1based:u64, data:&[u8], line_len:usize) -> Vec<u8>;
 }
 ```
+Attribute values (`subject`, `poster`, `date`, …) are XML 1.0-normalized (`\t`/`\r\n`/`\r`/`\n` → space) and
+resolve character references and the five predefined entities; unknown entities (e.g. HTML `&eacute;`),
+bare `&` and invalid references are kept verbatim without disabling the rest — same policy as element text.
+
 Single-part articles without `=ypart`: begin=1, end=size. `end-begin+1` must equal `data.len()`
 (else SizeMismatch). Tests: all-256-byte round trip, multipart, CRC, junk before header.
 
@@ -104,6 +108,14 @@ redacted if the server echoes them); a non-111 DATE reply is reported, not an er
 MockServer: `fail_first_n_connections` still counts toward `connections_accepted`;
 `body_requests` counts every BODY (including ones answered 480); AUTHINFO USER when no
 credentials are configured answers 281; also answers `MODE READER` (200).
+Reply classification: AUTHINFO 400, or 481/482/502 whose text mentions a connection or rate
+limit ("too many", "connections", "limit", "temporar", "try again", "overload", "busy"), →
+transient `Connect` (an account connection cap must not disable the server); other AUTHINFO
+4xx/5xx → `AuthFailed`. `body()` beyond 222/430/423/480: 400 or a limit reply → `Connect`
+(session broken); 481/482/483/502 → `AuthFailed`; any other 4xx/5xx (451 takedown, 500/501/503)
+→ `ArticleMissing` for that server, so the engine fails over instead of retrying until the job
+aborts. `AuthFailed`/`Connect`/`Protocol` texts built from server replies are redacted the same
+way as transcripts (password, and usernames of 3+ characters, shown as `***`).
 
 ## newskite-engine — job download
 ```rust
@@ -128,8 +140,8 @@ written as `<name>.nkpart` and renamed on success; missing articles collected, f
 presented complete); transient errors retried `retries` times with backoff, walking servers
 in order; auth failure on every server → `AuthFailed` (job doesn't proceed); speed limit is a
 shared token bucket; SegmentDone emitted per segment (UI coalesces); files in `skip_files`
-whose final path exists are skipped (resume). Acceptance test: 2 MiB random file, 8 yEnc
-parts, testkit server with auth, real TCP, SHA-256 equal.
+whose final path exists are skipped (resume; see "Resume matching" below). Acceptance test:
+2 MiB random file, 8 yEnc parts, testkit server with auth, real TCP, SHA-256 equal.
 
 Implemented additions (additive): `pub const PART_EXTENSION = "nkpart"`, `BACKOFF_BASE` (200 ms),
 `BACKOFF_MAX` (5 s), `pub fn backoff_delay(attempt:u32)->Duration`; `EngineOptions: Default + Clone +
@@ -142,10 +154,27 @@ ones included) so it reaches `total`; files skipped for resume emit only a `Log`
 `JobReport` with their on-disk size; `Progress::bytes_down` counts decoded bytes stored this run,
 `segments_done` counts processed segments. Missing/undecodable articles are tried once on every other
 usable server. A segment that exhausts `retries` on transient errors stops the job with `Connect`
-(`.nkpart` files kept). Name collisions within a job or with an existing file not in `skip_files` get
-`"<stem> (2).<ext>"`, compared case-insensitively. A yEnc name in `skip_files` that already exists is
-detected after the first decoded part even when the NZB subject name differs. Final length = yEnc
-`size=` (never less than the highest byte written); gaps are logged.
+(`.nkpart` files kept), except during fail-over: once a server answered missing/undecodable/refused
+for the article, a fallback that exhausts `retries` is treated as not having it, so the article is
+reported in `MissingArticles` instead of the job aborting. Name collisions within a job or with an
+existing file that is not a completed earlier output get `"<stem> (2).<ext>"`, compared
+case-insensitively. Final length = yEnc `size=` of the first accepted part (never less than the
+highest byte written); gaps are logged. The file data and the rename are flushed to disk
+(`sync_data`, then a directory fsync on Unix) before `FileDone`.
+
+Part checks (hostile or inconsistent articles): a decoded part is accepted only when its `size=` is
+at most the NZB's declared bytes for the file × 1.25 + 1 MiB (16 MiB per segment without `bytes`),
+and its `size=`/`name=` equal those of the file's first accepted part (so `begin`/`end` are bounded
+too). A refused part is never written and is handled like an undecodable article (next server,
+then missing). Part numbers are not compared with segment numbers.
+
+Resume matching: a file is skipped without any fetch when its NZB-derived label is in `skip_files`,
+exists in `dest_dir`, and no other file of the job derives the same label. Otherwise the first
+decoded part decides: skipped when a `skip_files` entry equal to the sanitized yEnc name, or a
+numbered `"<stem> (n).<ext>"` variant of it, is unclaimed, has the part's `size=` as its length
+and holds the part's bytes at its offset. Known limit: the label shortcut trusts the name, so a
+file whose subject names a file that another NZB entry's yEnc name produced in an earlier run can
+still be taken for it.
 
 ## newskite-store — SQLite persistence
 ```rust
@@ -163,17 +192,23 @@ pub struct Totals { pub downloaded_bytes:u64, pub jobs_done:u64, pub jobs_pendin
 #[derive(thiserror::Error)] pub enum StoreError { Sqlite(rusqlite::Error), Json(serde_json::Error), Io(std::io::Error), NotFound, Invalid(String) }
 pub struct Store { /* Mutex<Connection>; Send + Sync */ }
 impl Store {
-  pub fn open(dir:&Path)->Result<Self,StoreError>;     // creates dir, newskite.sqlite3, WAL, migrations (user_version)
+  pub fn open(dir:&Path)->Result<Self,StoreError>;     // creates dir, newskite.sqlite3, WAL, migrations (user_version);
+                                                       // single instance: exclusive advisory lock on dir/newskite.lock
+                                                       // (LOCK_FILE_NAME) held until drop, a second open of the same dir
+                                                       // -> Invalid("another Newskite instance is already using ...");
+                                                       // Unix: dirs it creates 0700, db/-wal/-shm/lock files 0600
   pub fn open_in_memory()->Result<Self,StoreError>;
   // jobs
   pub fn insert_job(&self,j:&NewJob)->Result<Job,_>; pub fn get_job(&self,id:i64)->Result<Option<Job>,_>;
-  pub fn list_jobs(&self)->Result<Vec<Job>,_> /* id ascending */; pub fn job_by_source(&self,p:&Path)->Result<Option<Job>,_>;
+  pub fn list_jobs(&self)->Result<Vec<Job>,_> /* id ascending */; pub fn job_by_source(&self,p:&Path)->Result<Option<Job>,_> /* newest, any state */;
+  pub fn pending_job_by_source(&self,p:&Path)->Result<Option<Job>,_> /* oldest queued|downloading|paused job for p */;
   pub fn set_job_state(&self,id:i64,s:JobState,error:Option<&str>)->Result<(),_>;
   pub fn set_job_progress(&self,id:i64,bytes_done:u64)->Result<(),_>;
   pub fn set_job_password(&self,id:i64,pw:Option<&str>)->Result<(),_>;
   pub fn remove_job(&self,id:i64)->Result<(),_> /* also its job_files */;
   pub fn next_runnable_job(&self)->Result<Option<Job>,_> /* queued|paused, oldest created_at then id */;
-  pub fn reset_interrupted(&self)->Result<usize,_> /* downloading -> queued, at startup */;
+  pub fn next_runnable_job_among(&self,ids:&[i64])->Result<Option<Job>,_> /* additive: same, restricted to ids; empty ids -> None */;
+  pub fn reset_interrupted(&self)->Result<usize,_> /* downloading -> queued, at startup (the lock makes the opener the only owner) */;
   pub fn upsert_job_file(&self,f:&JobFile)->Result<(),_>; pub fn job_files(&self,job_id:i64)->Result<Vec<JobFile>,_>;
   // bookmarks
   pub fn list_bookmarks(&self)->Result<Vec<Bookmark>,_> /* tree order: parents before children, by order */;
@@ -184,6 +219,10 @@ impl Store {
   pub fn prune_samples_before(&self,ts:i64)->Result<usize,_>; pub fn add_downloaded_bytes(&self,n:u64)->Result<(),_> /* lifetime counter */;
   // settings
   pub fn load_settings(&self)->Result<Settings,_> /* default().normalized() when absent */; pub fn save_settings(&self,s:&Settings)->Result<(),_>;
+  pub fn settings_backups(&self)->Result<Vec<(String,String)>,_> /* unreadable documents kept by save_settings, oldest first */;
+  // watch-folder dedupe (schema v2 table seen_sources; rows survive remove_job)
+  pub fn mark_source_seen(&self,p:&Path,size:u64,mtime_unix_nanos:i64)->Result<(),_> /* upsert per path */;
+  pub fn source_seen(&self,p:&Path,size:u64,mtime_unix_nanos:i64)->Result<bool,_> /* exact path + fingerprint */;
   pub fn totals(&self)->Result<Totals,_>;
 }
 ```
@@ -193,8 +232,10 @@ Implementation additions (additive): `pub const DB_FILE_NAME = "newskite.sqlite3
 row by id (`set_job_*`, `remove_job`, `update_bookmark`, `remove_bookmark`, `upsert_job_file` for a missing job)
 return `NotFound` when it doesn't exist; `add_bookmark`/`update_bookmark` return `Invalid` for a missing parent or a
 parent cycle; `job_by_source` returns the newest matching job; `samples_since` is inclusive, `prune_samples_before`
-strict; counters/throughput saturate at `i64::MAX`; settings JSON that is syntactically corrupt yields `Json`
-(missing/unknown fields load fine). `Job`/`NewJob` `Debug` redact the password. A DB with a newer
+strict; counters/throughput saturate at `i64::MAX`; settings JSON that is syntactically corrupt (or has a
+wrong-typed field) yields `Json` (missing/unknown fields load fine). `save_settings` over such an unreadable
+document first keeps it verbatim under `settings.unreadable-<unix secs>` (same transaction, once per distinct
+text), so saving defaults after a load failure never loses the server list. `Job`/`NewJob` `Debug` redact the password. A DB with a newer
 `user_version` is refused with `Invalid`.
 
 ## newskite-theme — desktop color tokens
@@ -245,6 +286,13 @@ spawned with argument vectors, never through a shell.
 
 Implementation notes (additive API, see crate docs in `src/lib.rs`): extraction always goes
 to `dir/<extraction_dir_name(job_name)>/` (`<name>.extracted` if a file has that name).
+Each set is extracted into a fresh private `.newskite-staging-*` folder inside it; on
+success *and* failure, links leaving the staging folder (or with absolute destinations) are
+deleted, the output is merged into the extraction folder without following existing links
+(same-name files/links are replaced), the staging folder is removed, and the extraction
+folder is rescanned for escaping links. A deleted link makes the set `Failed`. So a link
+planted by a failed set or an earlier attempt can never be written through by a later set
+or a retry.
 PAR2 verify always runs when `.par2` files and `par2` exist; `repair:false` turns a damaged
 set into `Failed`; a failed PAR2 step skips extraction. Cleanup runs only when the extract
 verdict is `Ok` (archive volumes; plus `.par2` files and par2 `name.1` backups when no set
@@ -268,18 +316,20 @@ pub struct ServiceOptions { pub data_dir:PathBuf, pub allow_shutdown:bool /* fal
 #[derive(thiserror::Error)] pub enum ServiceError { Store(StoreError), Nzb(NzbError), NoServer, Duplicate(String), NotFound(i64), Io(std::io::Error), Other(String) }
 #[derive(Clone)] pub struct Service { /* Arc<Inner> */ }
 impl Service {
-  pub fn open(opts:ServiceOptions, rt:tokio::runtime::Handle) -> Result<Self,ServiceError>; // opens store, reset_interrupted, starts 1 Hz sampler + watch timer
+  pub fn open(opts:ServiceOptions, rt:tokio::runtime::Handle) -> Result<Self,ServiceError>; // opens store (fails while another instance holds the data dir), reset_interrupted, starts 1 Hz sampler + watch timer
   pub fn with_store(store:Store, opts:ServiceOptions, rt:Handle) -> Self;
   pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<ServiceEvent>;
   pub fn add_nzb(&self, path:&Path) -> Result<Job,ServiceError>;   // parse first; no row on parse error; Duplicate if same source already queued/active
   pub fn scan_watch_folder(&self) -> Result<Vec<String>,ServiceError>;
   pub fn start(&self) -> bool;          // idempotent: false if a run is already active
+  pub fn start_jobs(&self, ids:&[i64]) -> bool; // additive: like start(), but the run processes only these job ids (oldest first) and leaves every other queued job untouched
   pub fn pause(&self); pub fn resume(&self); pub fn status(&self) -> Status;
-  pub fn remove_job(&self, id:i64) -> Result<(),ServiceError>;     // cancels if active
-  pub fn retry_job(&self, id:i64) -> Result<(),ServiceError>;      // failed -> queued
+  pub fn remove_job(&self, id:i64) -> Result<(),ServiceError>;     // cancels if active; records the source NZB as seen (watch folder)
+  pub fn retry_job(&self, id:i64) -> Result<(),ServiceError>;      // failed -> queued; Duplicate if another job for the same source is pending
   pub fn set_job_password(&self, id:i64, pw:Option<String>) -> Result<(),ServiceError>;
   pub fn jobs(&self) -> Vec<Job>; pub fn totals(&self) -> Totals;
   pub fn settings(&self) -> Settings; pub fn save_settings(&self, s:Settings) -> Result<(),ServiceError>;
+  pub fn settings_load_error(&self) -> Option<String>; // additive: why the stored document is unreadable (settings() then returns defaults)
   pub fn bookmarks(&self) -> Vec<Bookmark>; pub fn add_bookmark(&self,b:NewBookmark)->Result<Bookmark,ServiceError>;
   pub fn update_bookmark(&self,b:&Bookmark)->Result<(),ServiceError>; pub fn remove_bookmark(&self,id:i64)->Result<(),ServiceError>;
   pub fn throughput_history(&self, secs:u64) -> Vec<ThroughputSample>;
@@ -296,11 +346,15 @@ current job finishes (cooperative) — set state of the next jobs untouched; `re
 pause and starts a run if none active. Pausing mid-job is NOT done (outline allows the
 simplification); `remove_job` on the active job cancels it. Progress persisted at most every
 second and at file end. Restart resume: `reset_interrupted` + JobFile rows with state "done"
-become `skip_files`. Post-process after a successful job if enabled. Idle event + optional
+become `skip_files`, except a row whose file is missing or whose on-disk length differs from
+`bytes_total` (a shorter one, as lost writes leave it, is deleted so it is fetched again under its
+own name; any other mismatch is left alone and the engine picks a free name). Post-process after a successful job if enabled. Idle event + optional
 auto-shutdown countdown (cancellable; only when `allow_shutdown`; Linux `systemctl poweroff`,
 Windows `shutdown /s /t 0`, macOS `osascript -e 'tell app "System Events" to shut down'`).
 Throughput sampler stores one sample per second only while bytes moved or a run is active,
-prunes >7 days. No server → job does not start, single message "no enabled server configured".
+prunes >7 days. Bytes not yet sampled are flushed (added to the current second's sample and the
+lifetime total, no `Throughput` event) when a run ends (before `QueueIdle`), in `shutdown()` and
+when the sampler stops, so a run shorter than one tick is still counted. No server → job does not start, single message "no enabled server configured".
 
 Implemented additions (additive): consts `LOG_CAPACITY` (50), `EVENT_CAPACITY` (1024),
 `SAMPLE_RETENTION_SECS` (7 days), `TEST_SERVER_TIMEOUT` (10 s), `CONNECT_TIMEOUT` (30 s),
@@ -316,9 +370,19 @@ every log line is broadcast as `JobLog` (errors additionally as `Error`) and mir
 `Paused` is emitted by `pause()` itself (acknowledgment); `start()` clears a pending pause (emits
 `Resumed`), clears `last_error` and cancels a running shutdown countdown; `start()` after
 `shutdown()` returns false. Destination folder is fixed at import: `<download_dir>/<job name>`,
-`"<name> (N)"` if a pending job already uses it; `add_nzb` stores the canonical path and dedupes on
-it (pending states only). Watch folder: non-recursive, `*.nzb` case-insensitive, dedupe against
-any job state; manual scans work whenever a folder is set; the timer scans immediately and then
+`"<name> (N)"` (lowest free N ≥ 2) if any job in the store, whatever its state, already uses that
+folder (compared case-insensitively, for Windows/macOS) or the path already exists on disk, so two
+jobs never share a folder (post-processing works on the whole folder). Imports are serialized: the
+duplicate checks, destination choice and insert run under one lock, so concurrent `add_nzb` /
+watch scans never insert the same NZB twice. `add_nzb` stores the canonical path and dedupes on
+it (pending states only, checked across every job for that path via `pending_job_by_source`);
+`retry_job` refuses with `Duplicate` while another job for the same source is pending, so at most
+one pending job exists per source NZB. Only one process (GUI or headless) may open a data
+directory at a time; the headless CLI on the default data directory fails while the GUI runs
+(use `--db DIR`). Watch folder: non-recursive, `*.nzb` case-insensitive, dedupe against
+any job state and against `seen_sources` (path + size + mtime, recorded on every watch import and by
+`remove_job`), so a removed job is not imported again while the same file stays in the folder; a
+file replaced under the same name (new size or mtime) is a new NZB; manual scans work whenever a folder is set; the timer scans immediately and then
 every `watch_interval_secs` while `watch_enabled`, re-reading settings each second. Outcomes:
 success → post-process if enabled; a `Failed` PAR2 or extract verdict (or `PostError`) marks the
 job `failed` with the reason (set a password and `retry_job`; done files are skipped on retry);
@@ -326,7 +390,8 @@ job `failed` with the reason (set a password and `retry_job`; done files are ski
 `AuthFailed`/`Connect` → failed and the run stops; `Io` → failed, run continues; shutdown →
 job back to `queued`. Auto-shutdown countdown only after a run that processed ≥1 job drains the
 queue. Settings saved mid-job apply to the next job. Load failure of settings → defaults + one
-logged error.
+logged error; `save_settings` then keeps the unreadable document as a backup row and logs a warning
+naming its key.
 
 Runtime settings override (additive, for the headless CLI):
 `Service::set_runtime_settings_override(&self, Option<Settings>)` and
@@ -365,7 +430,10 @@ Semantics: the run always sets a runtime settings override (stored settings + fl
 folder, watch auto-start and auto-shutdown off). No usable server after overrides → exit 2
 before anything is queued. `--user`/`--tls` without `--server` → exit 2. Each `--nzb` prints
 `queued <name>` or `failed <path>: <reason>` (a file already pending in the database, e.g. after
-Ctrl-C, is picked up again and printed as `queued`; the same file twice is one job). Then
+Ctrl-C, is picked up again and printed as `queued`; the same file twice is one job). The run is
+started with `Service::start_jobs` for exactly those jobs, so any other queued job in the database
+(the app's backlog on the default data directory) is neither downloaded nor sent to the
+`--server` override; it stays queued. Then
 `complete <name>` / `failed <name>: <reason>` per job; if the queue stops (auth/connect failure,
 no server) while jobs are still pending they are printed `failed <name>: not downloaded, the
 queue stopped: <last error>` (they stay queued in the database). When every job of this

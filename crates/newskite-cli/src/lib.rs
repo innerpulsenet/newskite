@@ -13,6 +13,9 @@
 //!   password does not have to appear in the process list.
 //! * `--dest` replaces the download folder for jobs added by this invocation.
 //! * The watch folder and auto-shutdown are disabled for the run.
+//! * Only the jobs added (or picked up again) by this invocation are run
+//!   ([`Service::start_jobs`]); any other queued job in the database, such as the app's
+//!   backlog, is left queued and untouched.
 //!
 //! Output: exactly one line on stdout per event of interest — `queued <name>`,
 //! `complete <name>` and `failed <name>: <reason>` — and, only when stderr is a terminal, a
@@ -581,7 +584,10 @@ where
         return EXIT_FAILURE;
     }
 
-    service.start();
+    // Only this invocation's jobs: an older backlog in the same database (the app's queue)
+    // must not be downloaded first, nor sent to the --server override.
+    let ids: Vec<i64> = tracked.iter().map(|t| t.id).collect();
+    service.start_jobs(&ids);
     let finish = watch_run(service, &mut tracked, ui, &mut rx, stop).await;
     if let Some(p) = &mut ui.progress {
         p.clear();

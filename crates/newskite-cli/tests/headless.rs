@@ -397,3 +397,93 @@ async fn stored_server_is_used_without_server_flag() {
         sha256(&file.data)
     );
 }
+
+/// A headless run on a data directory another instance (here: the GUI's store) has open is
+/// refused before it touches the database, so the other instance's live job stays put.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn headless_run_is_refused_while_another_instance_holds_the_db() {
+    let tmp = TempDir::new().unwrap();
+    let file = TestFile::random("si", "si.bin", 16 * 1024, 2, 9);
+    let mock = mock_for(&[&file], &[], 0).await;
+    let gui_nzb = write_nzb(
+        &tmp.path().join("nzbs"),
+        "gui.nzb",
+        Some("gui-job"),
+        &[&file],
+    );
+    let cli_nzb = write_nzb(
+        &tmp.path().join("nzbs"),
+        "cli.nzb",
+        Some("cli-job"),
+        &[&file],
+    );
+
+    let gui = Store::open(&tmp.path().join("db")).unwrap();
+    let live = gui
+        .insert_job(&newskite_store::NewJob {
+            name: "gui-job".into(),
+            bytes_total: 16 * 1024,
+            dest_dir: tmp.path().join("dl").join("gui-job"),
+            source_path: std::fs::canonicalize(&gui_nzb).unwrap(),
+            password: None,
+        })
+        .unwrap();
+    gui.set_job_state(live.id, JobState::Downloading, None)
+        .unwrap();
+
+    let (code, stdout) = run(argv(tmp.path(), &mock, &[&cli_nzb], &[])).await;
+    assert_eq!(code, EXIT_FAILURE, "stdout: {stdout}");
+    assert_eq!(mock.body_requests(), 0);
+    let jobs = gui.list_jobs().unwrap();
+    assert_eq!(jobs.len(), 1, "the refused run must not add its job");
+    assert_eq!(jobs[0].state, JobState::Downloading);
+}
+
+/// A headless run on a database with an older queued job (the GUI's backlog) downloads only
+/// its own `--nzb` job: the backlog job is not sent to the `--server` override and stays
+/// queued for the app.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stored_backlog_is_not_run_with_the_server_override() {
+    let tmp = TempDir::new().unwrap();
+    let gui_file = TestFile::random("bl", "backlog.bin", 32 * 1024, 2, 21);
+    let cli_file = TestFile::random("me", "mine.bin", 48 * 1024, 3, 22);
+    let mock = mock_for(&[&gui_file, &cli_file], &[], 0).await;
+    let gui_nzb = write_nzb(
+        &tmp.path().join("gui-nzbs"),
+        "backlog.nzb",
+        Some("backlog-job"),
+        &[&gui_file],
+    );
+    let backlog_id = {
+        let store = Store::open(&tmp.path().join("db")).unwrap();
+        store
+            .insert_job_at(
+                &newskite_store::NewJob {
+                    name: "backlog-job".into(),
+                    bytes_total: gui_file.data.len() as u64,
+                    dest_dir: tmp.path().join("gui-dl").join("backlog-job"),
+                    source_path: std::fs::canonicalize(&gui_nzb).unwrap(),
+                    password: None,
+                },
+                1_000,
+            )
+            .unwrap()
+            .id
+    };
+    let nzb = write_nzb(&tmp.path().join("nzbs"), "mine.nzb", Some("mine-job"), &[&cli_file]);
+
+    let (code, stdout) = run(argv(tmp.path(), &mock, &[&nzb], &[])).await;
+    assert_eq!(code, EXIT_OK, "stdout: {stdout}");
+    assert_eq!(stdout, "queued mine-job\ncomplete mine-job\n");
+    assert_eq!(mock.body_requests(), 3, "only the CLI job's articles are fetched");
+
+    let store = Store::open(&tmp.path().join("db")).unwrap();
+    let backlog = store
+        .list_jobs()
+        .unwrap()
+        .into_iter()
+        .find(|j| j.id == backlog_id)
+        .expect("backlog job still exists");
+    assert_eq!(backlog.state, JobState::Queued);
+    assert!(!tmp.path().join("gui-dl").exists());
+}

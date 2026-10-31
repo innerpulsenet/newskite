@@ -24,6 +24,23 @@ pub(crate) fn with_suffix(name: &str, n: u32) -> String {
     }
 }
 
+/// `Some(n)` when `cand == with_suffix(base, n)` for some `n` (1 for `base` itself).
+pub(crate) fn suffix_number(cand: &str, base: &str) -> Option<u32> {
+    if cand == base {
+        return Some(1);
+    }
+    let (stem, ext) = match base.rfind('.') {
+        Some(i) if i > 0 && i + 1 < base.len() => (&base[..i], &base[i..]),
+        _ => (base, ""),
+    };
+    let digits = cand.strip_prefix(stem)?.strip_prefix(" (")?.strip_suffix(ext)?.strip_suffix(')')?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let n: u32 = digits.parse().ok()?;
+    (n >= 2 && with_suffix(base, n) == cand).then_some(n)
+}
+
 /// Key used to detect name collisions. Lowercased because Windows and macOS file
 /// systems are usually case-insensitive.
 pub(crate) fn claim_key(name: &str) -> String {
@@ -49,6 +66,21 @@ mod tests {
         let p = part_path(Path::new("dir").join("movie.mkv").as_path());
         assert_eq!(p.file_name().unwrap().to_str().unwrap(), "movie.mkv.nkpart");
         assert_eq!(p.parent().unwrap(), Path::new("dir"));
+    }
+
+    #[test]
+    fn suffix_numbers_invert_with_suffix() {
+        assert_eq!(suffix_number("a.bin", "a.bin"), Some(1));
+        assert_eq!(suffix_number("a (2).bin", "a.bin"), Some(2));
+        assert_eq!(suffix_number("archive.part01 (13).rar", "archive.part01.rar"), Some(13));
+        assert_eq!(suffix_number("README (3)", "README"), Some(3));
+        assert_eq!(suffix_number(".hidden (2)", ".hidden"), Some(2));
+        assert_eq!(suffix_number("a (1).bin", "a.bin"), None);
+        assert_eq!(suffix_number("a (02).bin", "a.bin"), None);
+        assert_eq!(suffix_number("a ().bin", "a.bin"), None);
+        assert_eq!(suffix_number("a (x).bin", "a.bin"), None);
+        assert_eq!(suffix_number("b (2).bin", "a.bin"), None);
+        assert_eq!(suffix_number("a (2).bin.nkpart", "a.bin"), None);
     }
 
     #[test]
