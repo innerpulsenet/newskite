@@ -213,6 +213,26 @@ fn next_runnable_job_ordering() {
 }
 
 #[test]
+fn next_runnable_job_among_is_restricted_to_the_ids() {
+    let store = mem();
+    let oldest = store.insert_job_at(&new_job("oldest"), 10).unwrap();
+    let b = store.insert_job_at(&new_job("b"), 30).unwrap();
+    let a = store.insert_job_at(&new_job("a"), 20).unwrap();
+    let done = store.insert_job_at(&new_job("done"), 5).unwrap();
+    store.set_job_state(done.id, JobState::Done, None).unwrap();
+
+    assert!(store.next_runnable_job_among(&[]).unwrap().is_none());
+    assert!(store.next_runnable_job_among(&[done.id, 9_999]).unwrap().is_none());
+    // The unlisted older job is skipped; among the listed ones the oldest wins.
+    assert_eq!(store.next_runnable_job_among(&[b.id, a.id]).unwrap().unwrap().id, a.id);
+    store.set_job_state(a.id, JobState::Paused, None).unwrap();
+    assert_eq!(store.next_runnable_job_among(&[b.id, a.id]).unwrap().unwrap().id, a.id);
+    store.set_job_state(a.id, JobState::Done, None).unwrap();
+    assert_eq!(store.next_runnable_job_among(&[b.id, a.id]).unwrap().unwrap().id, b.id);
+    assert_eq!(store.next_runnable_job().unwrap().unwrap().id, oldest.id);
+}
+
+#[test]
 fn reset_interrupted_requeues_downloading_only() {
     let store = mem();
     let a = store.insert_job(&new_job("a")).unwrap();
@@ -570,4 +590,129 @@ fn foreign_keys_are_enforced() {
     let p = store.list_bookmarks().unwrap()[0].id;
     store.remove_bookmark(p).unwrap();
     assert!(store.list_bookmarks().unwrap().is_empty());
+}
+
+#[test]
+fn second_open_of_the_same_dir_is_refused_until_the_first_is_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = Store::open(dir.path()).unwrap();
+    let j = first.insert_job(&new_job("live")).unwrap();
+    first.set_job_state(j.id, JobState::Downloading, None).unwrap();
+
+    // A second instance (same process or another one) must not get the database, so it
+    // can never reset the first instance's live job.
+    match Store::open(dir.path()) {
+        Err(StoreError::Invalid(msg)) => assert!(msg.contains("another Newskite instance"), "{msg}"),
+        other => panic!("expected the second open to be refused, got {other:?}"),
+    }
+    assert_eq!(first.get_job(j.id).unwrap().unwrap().state, JobState::Downloading);
+
+    drop(first);
+    let again = Store::open(dir.path()).unwrap();
+    assert_eq!(again.get_job(j.id).unwrap().unwrap().state, JobState::Downloading);
+}
+
+#[test]
+fn pending_job_by_source_finds_older_pending_jobs() {
+    let store = mem();
+    // Job 1 failed and was later retried (pending again); job 2 for the same NZB is done.
+    let first = store.insert_job(&new_job("x")).unwrap();
+    let second = store.insert_job(&new_job("x")).unwrap();
+    store.set_job_state(second.id, JobState::Done, None).unwrap();
+    assert_eq!(store.job_by_source(Path::new("/nzbs/x.nzb")).unwrap().unwrap().id, second.id);
+    let pending = store.pending_job_by_source(Path::new("/nzbs/x.nzb")).unwrap().unwrap();
+    assert_eq!(pending.id, first.id);
+
+    for state in [JobState::Downloading, JobState::Paused] {
+        store.set_job_state(first.id, state, None).unwrap();
+        assert_eq!(store.pending_job_by_source(Path::new("/nzbs/x.nzb")).unwrap().unwrap().id, first.id);
+    }
+    for state in [JobState::Done, JobState::Failed] {
+        store.set_job_state(first.id, state, None).unwrap();
+        assert!(store.pending_job_by_source(Path::new("/nzbs/x.nzb")).unwrap().is_none());
+    }
+    assert!(store.pending_job_by_source(Path::new("/nzbs/none.nzb")).unwrap().is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn database_files_are_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("new").join("db");
+    {
+        let store = Store::open(&data).unwrap();
+        let mut s = Settings::default();
+        s.servers.push(ServerConfig { password: "hunter2".into(), ..Default::default() });
+        store.save_settings(&s).unwrap();
+        assert_eq!(mode(&data), 0o700, "created data dir");
+        for name in [DB_FILE_NAME.to_owned(), format!("{DB_FILE_NAME}-wal"), format!("{DB_FILE_NAME}-shm")] {
+            assert_eq!(mode(&data.join(&name)), 0o600, "{name}");
+        }
+        assert_eq!(mode(&data.join(newskite_store::LOCK_FILE_NAME)), 0o600, "lock file");
+    }
+
+    // Files left world-readable by an older version are tightened on the next open.
+    let old = dir.path().join("old");
+    drop(Store::open(&old).unwrap());
+    std::fs::set_permissions(old.join(DB_FILE_NAME), std::fs::Permissions::from_mode(0o644)).unwrap();
+    let store = Store::open(&old).unwrap();
+    store.save_settings(&Settings::default()).unwrap();
+    assert_eq!(mode(&old.join(DB_FILE_NAME)), 0o600);
+    assert_eq!(mode(&old.join(format!("{DB_FILE_NAME}-wal"))), 0o600);
+}
+
+#[test]
+fn saving_over_an_unreadable_settings_document_keeps_a_backup() {
+    let dir = tempfile::tempdir().unwrap();
+    let corrupt = r#"{"servers": [{"host": "news.example.com", "port": "563", "password": "hunter2"}]}"#;
+    {
+        let store = Store::open(dir.path()).unwrap();
+        store.save_settings(&Settings::default()).unwrap();
+    }
+    let conn = rusqlite::Connection::open(dir.path().join(DB_FILE_NAME)).unwrap();
+    conn.execute("UPDATE settings SET value = ?1 WHERE key = 'settings'", [corrupt]).unwrap();
+    drop(conn);
+
+    let store = Store::open(dir.path()).unwrap();
+    assert!(matches!(store.load_settings(), Err(StoreError::Json(_))));
+    assert!(store.settings_backups().unwrap().is_empty());
+
+    // Saving replaces the live document, but the unreadable one is kept, once.
+    let s = Settings { max_connections: 3, ..Default::default() };
+    store.save_settings(&s).unwrap();
+    store.save_settings(&s).unwrap();
+    assert_eq!(store.load_settings().unwrap().max_connections, 3);
+    let backups = store.settings_backups().unwrap();
+    assert_eq!(backups.len(), 1, "{backups:?}");
+    assert!(backups[0].0.starts_with("settings.unreadable-"), "{}", backups[0].0);
+    assert_eq!(backups[0].1, corrupt);
+
+    // The same unreadable text saved over again is not backed up twice.
+    let conn = rusqlite::Connection::open(dir.path().join(DB_FILE_NAME)).unwrap();
+    conn.execute("UPDATE settings SET value = ?1 WHERE key = 'settings'", [corrupt]).unwrap();
+    drop(conn);
+    store.save_settings(&s).unwrap();
+    assert_eq!(store.settings_backups().unwrap().len(), 1);
+}
+
+#[test]
+fn seen_sources_survive_job_removal_and_track_the_file_fingerprint() {
+    let store = mem();
+    let p = Path::new("/watch/a.nzb");
+    assert!(!store.source_seen(p, 100, 5).unwrap());
+    store.mark_source_seen(p, 100, 5).unwrap();
+    assert!(store.source_seen(p, 100, 5).unwrap());
+    // A different size or mtime means a new file under the same name.
+    assert!(!store.source_seen(p, 101, 5).unwrap());
+    assert!(!store.source_seen(p, 100, 6).unwrap());
+    store.mark_source_seen(p, 101, 6).unwrap();
+    assert!(store.source_seen(p, 101, 6).unwrap());
+    assert!(!store.source_seen(p, 100, 5).unwrap());
+
+    let j = store.insert_job(&new_job("a")).unwrap();
+    store.remove_job(j.id).unwrap();
+    assert!(store.source_seen(p, 101, 6).unwrap());
 }

@@ -1,9 +1,9 @@
 //! The download run: work queue, worker pool, per-server connection slots, output files.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -18,8 +18,8 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::limiter::RateLimiter;
-use crate::naming::{claim_key, part_path, with_suffix};
-use crate::pwrite::write_all_at;
+use crate::naming::{claim_key, part_path, suffix_number, with_suffix};
+use crate::pwrite::{read_exact_at, write_all_at};
 use crate::{backoff_delay, DownloadRequest, EngineError, FileReport, JobReport, Progress};
 
 /// How long a polite `QUIT` may take at the end of a run.
@@ -30,6 +30,10 @@ const MISSING_PREVIEW: usize = 3;
 const FAILOVER_LOG_LIMIT: usize = 5;
 /// Upper bound when searching for a free `"name (n).ext"`.
 const MAX_NAME_SUFFIX: u32 = 10_000;
+/// Allowance for a segment whose NZB entry declares no `bytes`.
+const UNKNOWN_SEGMENT_BYTES: u64 = 16 * 1024 * 1024;
+/// Fixed slack on top of a file's declared bytes when bounding its yEnc `size=`.
+const SIZE_SLACK: u64 = 1024 * 1024;
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -65,8 +69,13 @@ struct FileJob {
     processed: Mutex<usize>,
     bytes: AtomicU64,
     max_end: AtomicU64,
-    /// yEnc `size=` of the first decoded part; 0 = unknown.
+    /// yEnc `size=` of the first accepted part; 0 = unknown.
     size_hint: AtomicU64,
+    /// Largest yEnc `size=` (and so `end=`) accepted for this file, derived from the bytes
+    /// the NZB declares for it.
+    size_cap: u64,
+    /// yEnc `size=` and `name=` of the first accepted part; later parts must match.
+    identity: Mutex<Option<(u64, String)>>,
     crc_errors: AtomicUsize,
     missing: Mutex<Vec<(u32, String)>>,
     report: Mutex<Option<FileReport>>,
@@ -74,9 +83,18 @@ struct FileJob {
 
 impl FileJob {
     fn new(label: String, segments: Vec<Segment>) -> Self {
+        // Segment `bytes` are encoded article sizes, so the decoded file is smaller; the
+        // margin only absorbs NZBs that under-report a little.
+        let declared = segments
+            .iter()
+            .map(|s| if s.bytes > 0 { s.bytes } else { UNKNOWN_SEGMENT_BYTES })
+            .fold(0u64, u64::saturating_add);
+        let size_cap = declared.saturating_add(declared / 4).saturating_add(SIZE_SLACK);
         Self {
             label,
             segments,
+            size_cap,
+            identity: Mutex::new(None),
             output: OnceCell::new(),
             processed: Mutex::new(0),
             bytes: AtomicU64::new(0),
@@ -90,6 +108,33 @@ impl FileJob {
 
     fn is_skipped(&self) -> bool {
         self.output.get().is_some_and(|o| o.skipped)
+    }
+
+    /// Checks a decoded part against the NZB and against the file's other parts. The first
+    /// part that passes fixes the file's yEnc `size=` and `name=`; a part from another post
+    /// (reused message id, wrong article on a server, hostile poster) is refused so it is
+    /// never written into this file. `decode` already guarantees `begin <= end <= size`.
+    fn check_part(&self, part: &YencPart) -> Result<(), String> {
+        if part.size > self.size_cap {
+            return Err(format!(
+                "it declares size={}, more than the {} this NZB file allows",
+                part.size,
+                format::bytes(self.size_cap)
+            ));
+        }
+        let mut identity = lock(&self.identity);
+        match &*identity {
+            None => {
+                *identity = Some((part.size, part.name.clone()));
+                self.size_hint.store(part.size, Ordering::SeqCst);
+                Ok(())
+            }
+            Some((size, name)) if *size == part.size && *name == part.name => Ok(()),
+            Some((size, name)) => Err(format!(
+                "it declares size={} name={:?}, but the file's other parts declare size={size} name={name:?}",
+                part.size, part.name
+            )),
+        }
     }
 }
 
@@ -218,12 +263,21 @@ pub(crate) async fn run(
     // Labels: NZB-derived names, de-duplicated case-insensitively in NZB order.
     let mut seen = HashSet::new();
     let mut files = Vec::with_capacity(nzb.files.len());
+    let mut base_counts: HashMap<String, usize> = HashMap::new();
+    for f in &nzb.files {
+        *base_counts.entry(claim_key(&f.filename())).or_default() += 1;
+    }
+    // A label can identify a completed file only when no other file of the job derives the
+    // same name: within a collision group, which file won the plain name in an earlier run
+    // depended on decode order, so those files are identified by content instead.
+    let mut unique_label = Vec::with_capacity(nzb.files.len());
     for f in &nzb.files {
         let base = f.filename();
         let label = (1..=MAX_NAME_SUFFIX)
             .map(|n| with_suffix(&base, n))
             .find(|cand| seen.insert(claim_key(cand)))
-            .unwrap_or(base);
+            .unwrap_or_else(|| base.clone());
+        unique_label.push(label == base && base_counts.get(&claim_key(&base)) == Some(&1));
         files.push(FileJob::new(label, f.segments.clone()));
     }
 
@@ -233,7 +287,11 @@ pub(crate) async fn run(
     let dir = dest_dir.clone();
     let pre_skipped: Vec<bool> = tokio::task::spawn_blocking(move || -> io::Result<Vec<bool>> {
         std::fs::create_dir_all(&dir)?;
-        Ok(labels.iter().map(|l| skip_files.contains(l) && dir.join(l).is_file()).collect())
+        Ok(labels
+            .iter()
+            .zip(&unique_label)
+            .map(|(l, &unique)| unique && skip_files.contains(l) && dir.join(l).is_file())
+            .collect())
     })
     .await
     .map_err(|e| io::Error::other(format!("preparing the download folder failed: {e}")))??;
@@ -477,6 +535,10 @@ async fn process_segment(shared: &Arc<Shared>, held: &mut Option<Held>, fi: usiz
     let mut failures = 0u32;
     let mut prefer = 0usize;
     let mut reason: Option<String> = None;
+    // Set once a server answered "missing", "undecodable" or "foreign" for this segment:
+    // from then on a fallback that keeps failing transiently is given up on for this
+    // article instead of aborting the job.
+    let mut failover = false;
 
     loop {
         if shared.abort.is_cancelled() {
@@ -496,9 +558,13 @@ async fn process_segment(shared: &Arc<Shared>, held: &mut Option<Held>, fi: usiz
                 continue;
             }
             Err(ConnFail::Transient { server, err }) => {
-                match retry_wait(shared, &mut failures, &mut prefer, server, &err).await {
-                    Flow::Continue => continue,
-                    Flow::Stop => return Flow::Stop,
+                match retry_wait(shared, &mut failures, &mut prefer, server, &err, failover).await {
+                    Retry::Again => continue,
+                    Retry::SkipServer => {
+                        reason = Some(skip_server(shared, &mut tried, server, &seg.message_id, &err));
+                        continue;
+                    }
+                    Retry::Stop => return Flow::Stop,
                 }
             }
         }
@@ -520,24 +586,27 @@ async fn process_segment(shared: &Arc<Shared>, held: &mut Option<Held>, fi: usiz
                         _ = limiter.acquire(raw.len()) => {}
                     }
                 }
-                match yenc::decode(&raw) {
-                    Ok(part) => {
-                        drop(raw);
-                        return store_part(shared, fi, part).await;
-                    }
-                    Err(e) => {
+                let checked = yenc::decode(&raw).map_err(|e| format!("could not be decoded: {e}")).and_then(|part| {
+                    file.check_part(&part).map(|()| part).map_err(|why| format!("does not belong to this file: {why}"))
+                });
+                drop(raw);
+                match checked {
+                    Ok(part) => return store_part(shared, fi, part).await,
+                    Err(why) => {
                         let msg = format!(
-                            "{}: article <{}> from {} could not be decoded: {e}",
+                            "{}: article <{}> from {} {why}",
                             file.label, seg.message_id, shared.servers[server].address
                         );
                         shared.log(msg.clone());
                         reason = Some(msg);
                         tried[server] = true;
+                        failover = true;
                     }
                 }
             }
             Err(NntpError::ArticleMissing(_)) => {
                 tried[server] = true;
+                failover = true;
                 if let Some(&next) = shared.order(&tried, server).first() {
                     let n = shared.failovers.fetch_add(1, Ordering::Relaxed);
                     if n < FAILOVER_LOG_LIMIT {
@@ -563,29 +632,50 @@ async fn process_segment(shared: &Arc<Shared>, held: &mut Option<Held>, fi: usiz
             }
             Err(err) => {
                 *held = None;
-                match retry_wait(shared, &mut failures, &mut prefer, server, &err).await {
-                    Flow::Continue => {}
-                    Flow::Stop => return Flow::Stop,
+                match retry_wait(shared, &mut failures, &mut prefer, server, &err, failover).await {
+                    Retry::Again => {}
+                    Retry::SkipServer => {
+                        reason = Some(skip_server(shared, &mut tried, server, &seg.message_id, &err));
+                    }
+                    Retry::Stop => return Flow::Stop,
                 }
             }
         }
     }
 }
 
+/// Outcome of [`retry_wait`].
+enum Retry {
+    /// Backoff slept; try again.
+    Again,
+    /// Retries exhausted while failing over: treat the article as not available on this
+    /// server (the failure counter is reset for the next one).
+    SkipServer,
+    /// The job was aborted (or cancelled).
+    Stop,
+}
+
 /// Counts a transient failure; either sleeps the backoff (and moves on to the next
-/// server) or, once retries are exhausted, aborts the job with `Connect`.
+/// server) or, once retries are exhausted, gives up on the server for this article (when
+/// `failover`, i.e. another server already answered that it lacks the article) or aborts
+/// the job with `Connect`.
 async fn retry_wait(
     shared: &Shared,
     failures: &mut u32,
     prefer: &mut usize,
     server: usize,
     err: &NntpError,
-) -> Flow {
+    failover: bool,
+) -> Retry {
     *failures += 1;
     let address = &shared.servers[server].address;
     if *failures > shared.retries {
+        if failover {
+            *failures = 0;
+            return Retry::SkipServer;
+        }
         shared.fail(EngineError::Connect(format!("{address}: {err}")));
-        return Flow::Stop;
+        return Retry::Stop;
     }
     let delay = backoff_delay(*failures);
     shared.log(format!(
@@ -596,9 +686,21 @@ async fn retry_wait(
     ));
     *prefer = (server + 1) % shared.servers.len();
     tokio::select! {
-        _ = shared.abort.cancelled() => Flow::Stop,
-        _ = tokio::time::sleep(delay) => Flow::Continue,
+        _ = shared.abort.cancelled() => Retry::Stop,
+        _ = tokio::time::sleep(delay) => Retry::Again,
     }
+}
+
+/// Marks `server` as tried for this article after it kept failing during fail-over;
+/// returns the logged reason.
+fn skip_server(shared: &Shared, tried: &mut [bool], server: usize, message_id: &str, err: &NntpError) -> String {
+    tried[server] = true;
+    let msg = format!(
+        "Article <{message_id}> could not be fetched from {} ({err}); treating it as not available there",
+        shared.servers[server].address
+    );
+    shared.log(msg.clone());
+    msg
 }
 
 async fn record_missing(shared: &Arc<Shared>, fi: usize, si: usize, reason: Option<String>) -> Flow {
@@ -614,10 +716,11 @@ async fn record_missing(shared: &Arc<Shared>, fi: usize, si: usize, reason: Opti
 /// Writes a decoded part into its file (deciding the output on the first part).
 async fn store_part(shared: &Arc<Shared>, fi: usize, part: YencPart) -> Flow {
     let file = &shared.files[fi];
-    let name_hint = part.name.clone();
+    let part = Arc::new(part);
     let init = {
         let shared = shared.clone();
-        move || async move { open_output(shared, fi, Some(name_hint)).await }
+        let first = part.clone();
+        move || async move { open_output(shared, fi, first).await }
     };
     let out = match file.output.get_or_try_init(init).await {
         Ok(o) => o.clone(),
@@ -629,7 +732,6 @@ async fn store_part(shared: &Arc<Shared>, fi: usize, part: YencPart) -> Flow {
     if out.skipped {
         return finish_segment(shared, fi, None).await;
     }
-    let _ = file.size_hint.compare_exchange(0, part.size, Ordering::SeqCst, Ordering::SeqCst);
     if part.crc_ok == Some(false) {
         file.crc_errors.fetch_add(1, Ordering::Relaxed);
     }
@@ -641,8 +743,7 @@ async fn store_part(shared: &Arc<Shared>, fi: usize, part: YencPart) -> Flow {
     let end = part.end;
     // decode() guarantees begin >= 1.
     let offset = part.begin.saturating_sub(1);
-    let data = part.data;
-    let written = tokio::task::spawn_blocking(move || write_all_at(&handle, &data, offset)).await;
+    let written = tokio::task::spawn_blocking(move || write_all_at(&handle, &part.data, offset)).await;
     match written {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
@@ -685,9 +786,9 @@ async fn finish_segment(shared: &Arc<Shared>, fi: usize, stored: Option<(&str, u
 }
 
 /// Decides the output name for a file and opens its `.nkpart` (or marks it skipped).
-async fn open_output(shared: Arc<Shared>, fi: usize, yenc_name: Option<String>) -> io::Result<Arc<Output>> {
+async fn open_output(shared: Arc<Shared>, fi: usize, first: Arc<YencPart>) -> io::Result<Arc<Output>> {
     let s = shared.clone();
-    let out = tokio::task::spawn_blocking(move || resolve_output(&s, fi, yenc_name, true))
+    let out = tokio::task::spawn_blocking(move || resolve_output(&s, fi, Some(&first), true))
         .await
         .map_err(|e| io::Error::other(format!("opening output failed: {e}")))??;
     let out = Arc::new(out);
@@ -700,26 +801,28 @@ async fn open_output(shared: Arc<Shared>, fi: usize, yenc_name: Option<String>) 
     Ok(out)
 }
 
-/// Blocking: picks a free name (or detects a completed earlier download) and, when
-/// `create`, creates the `.nkpart` file.
-fn resolve_output(shared: &Shared, fi: usize, yenc_name: Option<String>, create: bool) -> io::Result<Output> {
+/// Blocking: picks a free name (or detects a completed earlier download from the file's
+/// first decoded part) and, when `create`, creates the `.nkpart` file.
+fn resolve_output(shared: &Shared, fi: usize, first: Option<&YencPart>, create: bool) -> io::Result<Output> {
     let file = &shared.files[fi];
-    let base = yenc_name
+    let base = first
+        .map(|p| p.name.as_str())
         .filter(|n| !n.trim().is_empty())
-        .map(|n| sanitize_filename(&n))
+        .map(sanitize_filename)
         .unwrap_or_else(|| file.label.clone());
     let mut claimed = lock(&shared.claimed);
 
-    let existing = shared.dest_dir.join(&base);
-    if shared.skip_files.contains(&base) && !claimed.contains(&claim_key(&base)) && existing.is_file() {
-        claimed.insert(claim_key(&base));
-        return Ok(Output {
-            name: base,
-            part_path: part_path(&existing),
-            final_path: existing,
-            file: Mutex::new(None),
-            skipped: true,
-        });
+    if let Some(part) = first {
+        if let Some((name, existing)) = completed_earlier(shared, &claimed, &base, part) {
+            claimed.insert(claim_key(&name));
+            return Ok(Output {
+                name,
+                part_path: part_path(&existing),
+                final_path: existing,
+                file: Mutex::new(None),
+                skipped: true,
+            });
+        }
     }
     let (name, final_path) = free_name(shared, &mut claimed, &base)?;
     drop(claimed);
@@ -731,6 +834,41 @@ fn resolve_output(shared: &Shared, fi: usize, yenc_name: Option<String>, create:
         None
     };
     Ok(Output { name, final_path, part_path: part, file: Mutex::new(handle), skipped: false })
+}
+
+/// Blocking: the `skip_files` entry (`base` or a numbered `"<stem> (n).<ext>"` variant of
+/// it, lowest `n` first) that no file of this job claimed yet and whose on-disk content is
+/// this file's: same length as the part's yEnc `size=` and the part's bytes at its offset.
+/// Matching by content (not by name alone) keeps files whose names collide from being taken
+/// for each other, and finds outputs an earlier run saved under a numbered name.
+fn completed_earlier(
+    shared: &Shared,
+    claimed: &HashSet<String>,
+    base: &str,
+    part: &YencPart,
+) -> Option<(String, PathBuf)> {
+    let mut candidates: Vec<(u32, &String)> =
+        shared.skip_files.iter().filter_map(|s| suffix_number(s, base).map(|n| (n, s))).collect();
+    candidates.sort();
+    candidates.into_iter().find_map(|(_, name)| {
+        if claimed.contains(&claim_key(name)) {
+            return None;
+        }
+        let path = shared.dest_dir.join(name);
+        (path.parent() == Some(shared.dest_dir.as_path()) && holds_part(&path, part)).then(|| (name.clone(), path))
+    })
+}
+
+/// Blocking: whether the regular file at `path` is `part.size` bytes long and holds the
+/// part's data at its offset.
+fn holds_part(path: &Path, part: &YencPart) -> bool {
+    let Ok(f) = File::open(path) else { return false };
+    match f.metadata() {
+        Ok(m) if m.is_file() && m.len() == part.size => {}
+        _ => return false,
+    }
+    let mut buf = vec![0u8; part.data.len()];
+    read_exact_at(&f, &mut buf, part.begin.saturating_sub(1)).is_ok() && buf == part.data
 }
 
 /// First of `base`, `base (2)`, ... that no file of this job claimed and that does not
@@ -819,13 +957,21 @@ fn fail_file(shared: &Shared, name: &str, missing: &[String]) {
     shared.emit(EngineEvent::FileFailed { name: name.to_string(), missing: missing.to_vec() });
 }
 
-/// Blocking: sets the final length, closes the handle and renames `.nkpart` to the final
-/// name (picking a fresh name if something appeared there meanwhile).
+/// Blocking: sets the final length, flushes the data to disk, closes the handle and
+/// renames `.nkpart` to the final name (picking a fresh name if something appeared there
+/// meanwhile), then flushes the directory entry.
+///
+/// The flushes make the file durable before `FileDone` lets a caller record it as complete:
+/// otherwise a power loss could keep the rename (and the caller's record) but lose the
+/// delayed-allocation data, and a resume would skip a file full of zeros.
 fn complete_file(shared: &Shared, out: &Output, handle: Option<Arc<File>>, len: u64) -> io::Result<(String, PathBuf)> {
-    match handle {
-        Some(h) => h.set_len(len)?,
-        None => OpenOptions::new().write(true).open(&out.part_path)?.set_len(len)?,
-    }
+    let handle = match handle {
+        Some(h) => h,
+        None => Arc::new(OpenOptions::new().write(true).open(&out.part_path)?),
+    };
+    handle.set_len(len)?;
+    handle.sync_data()?;
+    drop(handle);
     let (name, path) = if out.final_path.symlink_metadata().is_ok() {
         let mut claimed = lock(&shared.claimed);
         let picked = free_name(shared, &mut claimed, &out.name)?;
@@ -836,7 +982,20 @@ fn complete_file(shared: &Shared, out: &Output, handle: Option<Arc<File>>, len: 
         (out.name.clone(), out.final_path.clone())
     };
     std::fs::rename(&out.part_path, &path)?;
+    sync_dir(&shared.dest_dir);
     Ok((name, path))
+}
+
+/// Best effort: flushes a directory so a rename inside it is durable. Not possible (nor
+/// needed: NTFS journals metadata) on Windows; failures are only logged at debug level
+/// because some file systems do not support it.
+fn sync_dir(dir: &Path) {
+    #[cfg(unix)]
+    if let Err(e) = File::open(dir).and_then(|d| d.sync_all()) {
+        tracing::debug!(target: "newskite_engine", dir = %dir.display(), error = %e, "directory flush failed");
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
 }
 
 #[cfg(test)]

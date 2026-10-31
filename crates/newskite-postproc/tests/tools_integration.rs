@@ -304,9 +304,16 @@ fn crc32(data: &[u8]) -> u32 {
 
 /// Minimal stored (uncompressed) zip writer that allows arbitrary entry names.
 fn write_raw_zip(path: &Path, entries: &[(&str, &[u8])]) {
+    let with_modes: Vec<(&str, &[u8], u32)> = entries.iter().map(|(n, d)| (*n, *d, 0)).collect();
+    write_raw_zip_modes(path, &with_modes);
+}
+
+/// Like [`write_raw_zip`], with a Unix mode per entry (0 = none). A symbolic link is an
+/// entry with mode `S_IFLNK | perms` whose data is the link destination.
+fn write_raw_zip_modes(path: &Path, entries: &[(&str, &[u8], u32)]) {
     let mut out = Vec::new();
     let mut central = Vec::new();
-    for (name, data) in entries {
+    for (name, data, mode) in entries {
         let offset = out.len() as u32;
         let crc = crc32(data);
         let len = data.len() as u32;
@@ -327,12 +334,13 @@ fn write_raw_zip(path: &Path, entries: &[(&str, &[u8])]) {
         out.extend(*data);
 
         central.extend(0x0201_4b50u32.to_le_bytes());
-        central.extend(20u16.to_le_bytes()); // version made by
+        // version made by: 2.0, host 3 (Unix) when a mode is given so tools honor it
+        central.extend(if *mode != 0 { 0x0314u16 } else { 20u16 }.to_le_bytes());
         central.extend(&hdr[4..]); // version needed .. extra len (26 bytes)
         central.extend(0u16.to_le_bytes()); // comment len
         central.extend(0u16.to_le_bytes()); // disk
         central.extend(0u16.to_le_bytes()); // internal attrs
-        central.extend(0u32.to_le_bytes()); // external attrs
+        central.extend((mode << 16).to_le_bytes()); // external attrs (Unix mode in the high half)
         central.extend(offset.to_le_bytes());
         central.extend(name.as_bytes());
     }
@@ -377,6 +385,69 @@ fn zip_slip_archive_is_refused_by_every_extractor() {
     }
     if ran == 0 {
         eprintln!("note: no zip extractor installed; zip-slip test did nothing");
+    }
+}
+
+const S_IFLNK: u32 = 0o120_000;
+
+/// One set plants a link pointing outside the target and then fails (an entry is written
+/// through the link, which the tool refuses); a second set, or a retry, then writes
+/// `link/pwn.txt`. No file may land outside the target, whichever extractor runs.
+#[cfg(unix)]
+#[test]
+fn escaping_link_from_failed_set_is_never_written_through() {
+    let tools = detect_tools();
+    let candidates = [
+        ("7z", Tools { sevenz: tools.sevenz.clone(), ..Tools::none() }),
+        ("unzip", Tools { unzip: tools.unzip.clone(), ..Tools::none() }),
+    ];
+    let mut ran = 0;
+    for (label, t) in candidates {
+        if !t.can_extract() {
+            eprintln!("note: {label} not installed; skipping that link variant");
+            continue;
+        }
+        ran += 1;
+        for link_dest in ["ABS", "../../outside"] {
+            let f = fixture();
+            let outside = f.dl.parent().unwrap().join("outside");
+            fs::create_dir_all(&outside).unwrap();
+            let dest = if link_dest == "ABS" { outside.to_str().unwrap().to_string() } else { link_dest.to_string() };
+            write_raw_zip_modes(
+                &f.dl.join("a.zip"),
+                &[("link", dest.as_bytes(), S_IFLNK | 0o777), ("link/x", b"x", 0o100_644)],
+            );
+            write_raw_zip(&f.dl.join("b.zip"), &[("link/pwn.txt", b"owned")]);
+            let (r, logs) = run(&f.dl, "job", &PostOptions::default(), &t);
+            assert!(!outside.join("pwn.txt").exists(), "{label}/{link_dest}: file written outside the target {logs:#?}");
+            assert!(!outside.join("x").exists(), "{label}/{link_dest}: file written outside the target {logs:#?}");
+            assert!(r.extract.is_failed(), "{label}/{link_dest}: {:?}", r.extract);
+            let target = f.dl.join("job");
+            if let Ok(dest) = fs::read_link(target.join("link")) {
+                let resolved = target.join(dest);
+                assert!(!resolved.starts_with(&outside), "{label}/{link_dest}: escaping link left behind");
+            }
+
+            // Retry (or a later run) with the escaping link already in the target folder:
+            // it must be replaced, never followed.
+            let _ = fs::remove_file(target.join("link"));
+            let _ = fs::remove_dir_all(target.join("link"));
+            std::os::unix::fs::symlink(&outside, target.join("link")).unwrap();
+            fs::remove_file(f.dl.join("a.zip")).unwrap();
+            let (_r, logs) = run(&f.dl, "job", &PostOptions::default(), &t);
+            assert!(!outside.join("pwn.txt").exists(), "{label}/{link_dest} retry: file written outside the target {logs:#?}");
+            assert_eq!(fs::read(target.join("link").join("pwn.txt")).unwrap(), b"owned", "{label}/{link_dest} retry {logs:#?}");
+            // No staging folders are left behind.
+            let leftovers: Vec<_> = fs::read_dir(&target)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|e| e.file_name().to_string_lossy().starts_with(".newskite"))
+                .collect();
+            assert!(leftovers.is_empty(), "{label}: staging folder left behind: {leftovers:?}");
+        }
+    }
+    if ran == 0 {
+        eprintln!("note: no zip extractor installed; link test did nothing");
     }
 }
 

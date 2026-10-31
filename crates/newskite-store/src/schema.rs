@@ -62,6 +62,16 @@ const MIGRATIONS: &[&str] = &[
         value  INTEGER NOT NULL DEFAULT 0
     );
     "#,
+    // v2: watch-folder sources that were imported (or whose job was removed), kept when
+    // jobs are deleted so the watch folder does not import them again.
+    r#"
+    CREATE TABLE seen_sources (
+        source_path  TEXT    PRIMARY KEY,
+        size         INTEGER NOT NULL,
+        mtime        INTEGER NOT NULL,
+        seen_at      INTEGER NOT NULL
+    );
+    "#,
 ];
 
 /// The schema version this build writes.

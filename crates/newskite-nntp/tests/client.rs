@@ -220,6 +220,89 @@ async fn auth_502_is_auth_failed() {
     assert!(matches!(&err, NntpError::AuthFailed(t) if t == "502 not permitted"), "{err:?}");
 }
 
+/// Connection-limit and overload replies at AUTHINFO time must stay transient so the
+/// engine backs off instead of disabling a server whose other sessions are working.
+#[tokio::test]
+async fn auth_connection_limit_replies_are_transient() {
+    let cases: [(&'static str, &'static str); 4] = [
+        ("381 password required\r\n", "502 Too many connections\r\n"),
+        ("381 password required\r\n", "481 connection limit reached for this account\r\n"),
+        ("381 password required\r\n", "482 Max connections exceeded\r\n"),
+        ("400 service temporarily unavailable\r\n", "281 unused\r\n"),
+    ];
+    for (first, second) in cases {
+        let (addr, _server) = scripted("200 ready\r\n", vec![first, second]).await;
+        let err = NntpConnection::connect(&server_cfg(addr, USER, PASS), TIMEOUT).await.unwrap_err();
+        assert!(matches!(err, NntpError::Connect(_)), "{first:?}/{second:?}: {err:?}");
+        assert!(err.is_transient());
+    }
+    // A plain credential rejection is still permanent.
+    let (addr, _server) =
+        scripted("200 ready\r\n", vec!["381 password required\r\n", "481 Authentication failed\r\n"]).await;
+    let err = NntpConnection::connect(&server_cfg(addr, USER, PASS), TIMEOUT).await.unwrap_err();
+    assert!(matches!(&err, NntpError::AuthFailed(t) if t == "481 Authentication failed"), "{err:?}");
+}
+
+/// A server that echoes the credentials back must not leak them into error text.
+#[tokio::test]
+async fn auth_error_text_is_redacted() {
+    let (addr, _server) = scripted(
+        "200 ready\r\n",
+        vec!["381 password required\r\n", "481 invalid credentials mockuser/hunter2-secret\r\n"],
+    )
+    .await;
+    let err = NntpConnection::connect(&server_cfg(addr, USER, PASS), TIMEOUT).await.unwrap_err();
+    let text = err.to_string();
+    assert!(matches!(err, NntpError::AuthFailed(_)), "{err:?}");
+    assert!(!text.contains(PASS) && !text.contains(USER), "{text}");
+    assert!(text.contains("481 invalid credentials ***/***"), "{text}");
+}
+
+/// BODY refusals other than 430/423/480 must not surface as transient `Protocol` errors
+/// that the engine would retry until the whole job aborts.
+#[tokio::test]
+async fn body_refusals_are_classified() {
+    let (addr, _server) = scripted(
+        "200 ready\r\n",
+        vec![
+            "381 password required\r\n",
+            "281 ok\r\n",
+            "451 removed by request\r\n",
+            "503 program fault\r\n",
+            "502 Access denied, account expired mockuser\r\n",
+        ],
+    )
+    .await;
+    let mut conn = NntpConnection::connect(&server_cfg(addr, USER, PASS), TIMEOUT).await.unwrap();
+    let err = conn.body("a@b").await.unwrap_err();
+    assert!(matches!(&err, NntpError::ArticleMissing(id) if id == "a@b"), "{err:?}");
+    let err = conn.body("<c@d>").await.unwrap_err();
+    assert!(matches!(&err, NntpError::ArticleMissing(id) if id == "c@d"), "{err:?}");
+    assert!(!conn.is_broken());
+    let err = conn.body("e@f").await.unwrap_err();
+    assert!(
+        matches!(&err, NntpError::AuthFailed(t) if t == "502 Access denied, account expired ***"),
+        "{err:?}"
+    );
+    assert!(!err.is_transient());
+
+    for reply in ["481 session revoked\r\n", "482 nope\r\n"] {
+        let (addr, _server) = scripted("200 ready\r\n", vec![reply]).await;
+        let mut conn = NntpConnection::connect(&server_cfg(addr, "", ""), TIMEOUT).await.unwrap();
+        let err = conn.body("a@b").await.unwrap_err();
+        assert!(matches!(err, NntpError::AuthFailed(_)), "{reply:?}: {err:?}");
+    }
+
+    for reply in ["400 shutting down\r\n", "502 Too many connections\r\n"] {
+        let (addr, _server) = scripted("200 ready\r\n", vec![reply]).await;
+        let mut conn = NntpConnection::connect(&server_cfg(addr, "", ""), TIMEOUT).await.unwrap();
+        let err = conn.body("a@b").await.unwrap_err();
+        assert!(matches!(err, NntpError::Connect(_)), "{reply:?}: {err:?}");
+        assert!(err.is_transient());
+        assert!(conn.is_broken());
+    }
+}
+
 #[tokio::test]
 async fn invalid_message_ids_are_rejected_without_sending() {
     let mock = MockServer::start(MockConfig::default()).await;

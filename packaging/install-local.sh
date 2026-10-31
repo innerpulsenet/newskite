@@ -6,7 +6,7 @@
 #   ~/.local/share/applications/net.innerpulse.Newskite.desktop   (Exec points at the binary)
 #   ~/.local/share/metainfo/net.innerpulse.Newskite.metainfo.xml
 #   ~/.local/share/mime/packages/newskite-nzb.xml
-#   ~/.local/share/icons/hicolor/{scalable,16x16,...,256x256}/apps/net.innerpulse.Newskite.*
+#   ~/.local/share/icons/hicolor/{scalable,16x16,...,512x512}/apps/net.innerpulse.Newskite.*
 # then refreshes the desktop, MIME and icon caches when the tools exist, and makes Newskite
 # the default handler for application/x-nzb, nzb:// and nzblnk: links (skip with --no-default).
 #

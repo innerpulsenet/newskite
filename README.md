@@ -1,3 +1,11 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: light)" srcset="assets/brand/product/newskite-lockup-on-light.svg">
+    <source media="(prefers-color-scheme: dark)" srcset="assets/brand/product/newskite-lockup-on-dark.svg">
+    <img alt="newskite" src="assets/brand/product/newskite-lockup-on-dark.svg" width="420">
+  </picture>
+</p>
+
 # Newskite
 
 Newskite is a desktop Usenet (NZB) download client written in Rust. You give it an NZB file;
@@ -126,19 +134,34 @@ queued and resume on the next run). Prefer `NEWSKITE_PASS` over `--pass`, becaus
 arguments are visible to other users in the process list. `newskite --headless --help` lists
 every option.
 
-## Where data and credentials are stored
+## Where data is stored
 
 Everything lives in one SQLite database. On Linux that is
 `~/.local/share/newskite/db/newskite.sqlite3` (the `db` folder under the platform data
 directory; on Windows and macOS it is under the usual per-user application data folder).
-The headless `--db DIR` option points it elsewhere.
+The headless `--db DIR` option points it elsewhere. Only one Newskite process can use a
+data directory at a time: while the GUI is running, a headless run on the same directory
+exits with an "another Newskite instance" error instead of touching the GUI's queue.
 
-**Server passwords are stored unencrypted.** The settings, including every server's
-username and password, are kept as plain JSON in the `settings` table of that database.
-Archive passwords you enter for a job are stored in plain text in the `jobs` table. Anyone
-who can read your home directory can read them. Newskite does not use the system keyring.
-Passwords given to the headless CLI with `--server`/`--pass`/`NEWSKITE_PASS` are kept only in
-memory and never written to the database. Passwords are not written to the log.
+## Credential storage
+
+Newskite does not use the system keyring and does not encrypt anything it stores. On Linux
+and macOS the database files are created readable only by you (mode `0600`, and a data
+directory Newskite creates is `0700`), but anyone with access to your account, root, or a
+backup of the files, or anyone who can watch your processes, can recover these:
+
+- **Server passwords** are stored unencrypted: the settings, including every server's
+  username and password, are kept as plain JSON in the `settings` table of the database in
+  `~/.local/share/newskite/db`.
+- **Archive passwords** you enter for a job are stored in plain text with that job (the `jobs`
+  table). During extraction they are passed to `7z`/`unrar` (and `unzip`) on the command line,
+  so other local users can see them in the process list while the tool runs. The log shows
+  those commands with the password masked as `-p***`.
+- **Headless CLI:** prefer the `NEWSKITE_PASS` environment variable over `--pass`, because a
+  password given on the command line is visible to other users in the process list. Passwords given with `--server`/`--pass`/`NEWSKITE_PASS` are kept only in
+  memory and never written to the database.
+
+Passwords are never written to the message log.
 
 ## Post-processing tools
 
@@ -166,8 +189,9 @@ All packaging files are in [`packaging/`](packaging):
 | `net.innerpulse.Newskite.metainfo.xml` | AppStream metadata for software centers |
 | `mime/newskite-nzb.xml` | shared-mime-info type `application/x-nzb` (`*.nzb` glob and `<nzb` magic) |
 | `icons/net.innerpulse.Newskite.svg` | Scalable app icon |
-| `icons/net.innerpulse.Newskite-16.svg` | Simplified source for the 16 px render |
-| `icons/hicolor/<size>/apps/*.png` | PNG renders at 16, 32, 48, 64, 128 and 256 px |
+| `icons/hicolor/<size>/apps/*.png` | PNG renders at 16, 24, 32, 48, 64, 128, 256 and 512 px |
+| `icons/light/` | The same set on a light (paper) tile, for light docks and launchers |
+| `icons/make-icons.mjs` | Generates every icon file above (see [Brand](#brand)) |
 | `build-appimage.sh` | Builds an AppDir and, with `appimagetool`, an `.AppImage` |
 | `install-local.sh` / `uninstall-local.sh` | Per-user install into `~/.local` without root |
 | `tests/check-packaging.sh` | Validates all of the above in a temporary directory |
@@ -213,20 +237,9 @@ packaging/uninstall-local.sh        # removes exactly those files; keeps your da
 handler for `.nzb` files and `nzb:`/`nzblnk:` links (`--no-default` skips that). See `--help`
 on each script for the options.
 
-### Regenerating the PNG icons
+### Regenerating the icons
 
-The PNGs are rendered from the SVGs with `rsvg-convert` (package `librsvg2-bin`):
-
-```sh
-cd packaging/icons
-for s in 32 48 64 128 256; do
-  rsvg-convert -w $s -h $s net.innerpulse.Newskite.svg -o hicolor/${s}x${s}/apps/net.innerpulse.Newskite.png
-done
-rsvg-convert -w 16 -h 16 net.innerpulse.Newskite-16.svg -o hicolor/16x16/apps/net.innerpulse.Newskite.png
-```
-
-Inkscape (`inkscape -w S -h S -o out.png in.svg`) or ImageMagick (`magick -background none
--density 384 in.svg -resize SxS out.png`) work too.
+The icons are generated, not hand-drawn; see [Brand](#brand) for the command.
 
 ## Platform status
 
@@ -243,3 +256,28 @@ Inkscape (`inkscape -w S -h S -o out.png in.svg`) or ImageMagick (`magick -backg
 
 Licensed under either of the MIT license or the Apache License, Version 2.0, at your option
 (`MIT OR Apache-2.0`, as declared in `Cargo.toml`).
+
+## Brand
+
+Newskite is an [innerpulse](https://innerpulse.net) product.
+
+The app icon is the innerpulse ink tile and six-bar mark, with one row of small violet
+squares beneath it: Usenet articles arriving and assembling into a file. At 16 to 32 px the
+row is dropped and the stock innerpulse icon is used, drawn in whole pixels so it stays sharp.
+
+- `assets/brand/product/`: the Newskite wordmark and horizontal lockups (on dark and on light)
+  and the social card.
+- `assets/brand/kit/`: the stock innerpulse mark, app icons and UI icons, copied from the
+  brand kit.
+- `assets/brand/fonts/`: the brand typefaces (Instrument Sans, JetBrains Mono).
+- `assets/brand/app-icon-256.png`: the 256 px app icon, a copy of the hicolor render.
+- `packaging/icons/`: the installed app icons and `preview.png`, a contact sheet of every size.
+
+To regenerate the icons, point `BRAND_KIT` at the innerpulse-brand kit and `NODE_PATH` at a
+`node_modules` that contains `sharp`:
+
+```sh
+BRAND_KIT=/path/to/innerpulse-brand NODE_PATH=/path/to/node_modules \
+  node packaging/icons/make-icons.mjs
+packaging/tests/check-packaging.sh
+```

@@ -1,6 +1,7 @@
 //! The queue runner: picks jobs, drives the engine, persists progress and outcomes.
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -38,6 +39,12 @@ enum End {
 
 /// Starts a run unless one is active. See [`crate::Service::start`].
 pub(crate) fn start(inner: &Arc<Inner>) -> bool {
+    start_with(inner, None)
+}
+
+/// Starts a run unless one is active; with `only`, the run processes just those job ids.
+/// See [`crate::Service::start_jobs`].
+pub(crate) fn start_with(inner: &Arc<Inner>, only: Option<Vec<i64>>) -> bool {
     if inner.shutdown.is_cancelled() {
         inner.log(LogLevel::Warn, "the queue cannot start: the service is stopping");
         return false;
@@ -64,7 +71,7 @@ pub(crate) fn start(inner: &Arc<Inner>) -> bool {
     let task_inner = inner.clone();
     inner.rt.spawn(async move {
         let mut guard = RunGuard { inner: task_inner.clone(), armed: true };
-        run_queue(&task_inner, &mut guard).await;
+        run_queue(&task_inner, &mut guard, only.as_deref()).await;
     });
     true
 }
@@ -89,6 +96,7 @@ impl Drop for RunGuard {
             st.last_error = Some("the queue run stopped unexpectedly".into());
         }
         self.inner.log(LogLevel::Error, "the queue run stopped unexpectedly");
+        crate::timers::flush_throughput(&self.inner);
         self.inner.emit(ServiceEvent::QueueIdle);
         self.inner.running_tx.send_replace(false);
     }
@@ -99,7 +107,9 @@ enum Pick {
     End(End),
 }
 
-async fn run_queue(inner: &Arc<Inner>, guard: &mut RunGuard) {
+/// Runs the queue until nothing runnable is left. With `only`, just the jobs whose id is
+/// listed are considered; every other queued job is left alone.
+async fn run_queue(inner: &Arc<Inner>, guard: &mut RunGuard, only: Option<&[i64]>) {
     let mut processed = 0usize;
     let mut attempted: HashSet<i64> = HashSet::new();
     let mut forced_end: Option<End> = None;
@@ -120,7 +130,11 @@ async fn run_queue(inner: &Arc<Inner>, guard: &mut RunGuard) {
             } else if st.paused {
                 Pick::End(End::Paused)
             } else {
-                match inner.store.next_runnable_job() {
+                let next = match only {
+                    Some(ids) => inner.store.next_runnable_job_among(ids),
+                    None => inner.store.next_runnable_job(),
+                };
+                match next {
                     Err(e) => Pick::End(End::Store(format!("could not read the queue: {e}"))),
                     Ok(None) => Pick::End(End::Drained),
                     Ok(Some(job)) if attempted.contains(&job.id) => {
@@ -186,6 +200,8 @@ fn finish_run_locked(inner: &Inner, st: &mut crate::RunState, end: &End, process
     st.active_job = None;
     st.job_cancel = None;
     st.removed_active = false;
+    // Before the idle signal, so whoever waits for it sees this run's bytes in the totals.
+    crate::timers::flush_throughput(inner);
     inner.emit(ServiceEvent::QueueIdle);
     inner.running_tx.send_replace(false);
 }
@@ -230,7 +246,18 @@ async fn process_job(
         inner.log(LogLevel::Warn, format!("could not read file progress of {}: {e}", job.name));
         Vec::new()
     });
-    let done_files: Vec<&JobFile> = files.iter().filter(|f| f.state == "done").collect();
+    let done_files: Vec<JobFile> = files.into_iter().filter(|f| f.state == "done").collect();
+    let dest = job.dest_dir.clone();
+    let (done_files, notes) = match tokio::task::spawn_blocking(move || verify_done_files(&dest, done_files)).await {
+        Ok(checked) => checked,
+        Err(e) => {
+            inner.log(LogLevel::Warn, format!("could not check the completed files of {}: {e}", job.name));
+            (Vec::new(), Vec::new())
+        }
+    };
+    for note in notes {
+        inner.log(LogLevel::Warn, note);
+    }
     let base_bytes: u64 = done_files.iter().map(|f| f.bytes_done).sum();
     let skip_files: HashSet<String> = done_files.iter().map(|f| f.name.clone()).collect();
     if !skip_files.is_empty() {
@@ -464,6 +491,51 @@ async fn forward_events(
         inner.emit(ServiceEvent::Engine { job_id, event: ev });
     }
     persist(run_bytes, &mut persist_error_logged);
+}
+
+/// Blocking: keeps the `done` rows whose file is still in `dest` with the recorded length;
+/// returns them plus a log line for each dropped one. A file shorter than recorded is what
+/// lost writes (power loss) leave behind; it is this job's own output, so it is removed and
+/// downloaded again under its own name. A missing file or one of another length is only
+/// dropped from the skip list (the engine then picks a free name rather than overwrite it).
+fn verify_done_files(dest: &Path, done: Vec<JobFile>) -> (Vec<JobFile>, Vec<String>) {
+    let mut keep = Vec::with_capacity(done.len());
+    let mut notes = Vec::new();
+    for f in done {
+        let path = dest.join(&f.name);
+        // Names come from the engine and are single components; anything else is not ours.
+        if path.parent() != Some(dest) {
+            notes.push(format!("{}: unexpected file name in the job record; downloading it again", f.name));
+            continue;
+        }
+        let len = match std::fs::symlink_metadata(&path) {
+            Ok(m) if m.is_file() => m.len(),
+            Ok(_) | Err(_) => {
+                notes.push(format!("{} is no longer in the download folder; downloading it again", f.name));
+                continue;
+            }
+        };
+        if len == f.bytes_total {
+            keep.push(f);
+            continue;
+        }
+        if len < f.bytes_total && std::fs::remove_file(&path).is_ok() {
+            notes.push(format!(
+                "{} is incomplete on disk ({} of {}); downloading it again",
+                f.name,
+                format::bytes(len),
+                format::bytes(f.bytes_total)
+            ));
+        } else {
+            notes.push(format!(
+                "{} on disk is {}, not the recorded {}; downloading it again",
+                f.name,
+                format::bytes(len),
+                format::bytes(f.bytes_total)
+            ));
+        }
+    }
+    (keep, notes)
 }
 
 fn upsert_file(inner: &Inner, job_id: i64, name: &str, bytes_total: u64, bytes_done: u64, state: &str) {

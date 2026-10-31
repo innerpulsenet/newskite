@@ -79,7 +79,10 @@ fi
 
 # --- icons -------------------------------------------------------------------------------
 check "scalable icon is well-formed SVG" grep -q '<svg ' "${PKG_DIR}/icons/${APP_ID}.svg"
-for size in 16 32 48 64 128 256; do
+if have xmllint; then check "scalable icon parses as XML" xmllint --noout "${PKG_DIR}/icons/${APP_ID}.svg"; fi
+check "GUI window icon exists" test -f "${REPO_DIR}/assets/brand/app-icon-256.png"
+check "GUI window icon matches the 256px hicolor PNG" cmp -s "${REPO_DIR}/assets/brand/app-icon-256.png" "${PKG_DIR}/icons/hicolor/256x256/apps/${APP_ID}.png"
+for size in 16 24 32 48 64 128 256 512; do
     png="${PKG_DIR}/icons/hicolor/${size}x${size}/apps/${APP_ID}.png"
     if [[ ! -f "${png}" ]]; then bad "missing ${size}px PNG"; continue; fi
     # PNG IHDR: width and height are big-endian u32 at byte offsets 16 and 20.

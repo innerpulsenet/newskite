@@ -1,5 +1,6 @@
-//! Cross-platform positional writes: write a buffer at an absolute file offset without
-//! moving a shared cursor, so several segments can be written to one file concurrently.
+//! Cross-platform positional I/O: write (or read) a buffer at an absolute file offset
+//! without moving a shared cursor, so several segments can be written to one file
+//! concurrently.
 
 use std::fs::File;
 use std::io;
@@ -45,6 +46,39 @@ pub(crate) fn write_all_at(file: &File, buf: &[u8], offset: u64) -> io::Result<(
     f.write_all(buf)
 }
 
+/// Reads exactly `buf.len()` bytes at byte `offset` of `file`.
+#[cfg(unix)]
+pub(crate) fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
+    std::os::unix::fs::FileExt::read_exact_at(file, buf, offset)
+}
+
+/// Reads exactly `buf.len()` bytes at byte `offset` of `file`.
+#[cfg(windows)]
+pub(crate) fn read_exact_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !buf.is_empty() {
+        match file.seek_read(buf, offset) {
+            Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "failed to fill whole buffer")),
+            Ok(n) => {
+                buf = &mut buf[n..];
+                offset += n as u64;
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Fallback for targets without positional I/O: seek + read.
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = file;
+    f.seek(SeekFrom::Start(offset))?;
+    f.read_exact(buf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -61,5 +95,10 @@ mod tests {
         let mut s = String::new();
         File::open(&path).unwrap().read_to_string(&mut s).unwrap();
         assert_eq!(s, "hello world");
+        let file = File::open(&path).unwrap();
+        let mut buf = [0u8; 5];
+        read_exact_at(&file, &mut buf, 6).unwrap();
+        assert_eq!(&buf, b"world");
+        assert!(read_exact_at(&file, &mut buf, 8).is_err(), "short read is an error");
     }
 }

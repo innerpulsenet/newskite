@@ -13,7 +13,11 @@
 //!   on Unix) is persisted with replacement characters. Such paths are rare for NZB
 //!   sources and download folders and the lossy form is still shown correctly in the UI.
 //! - Server passwords (inside the settings JSON) and per-job archive passwords are stored
-//!   in plain text in this local database. They are never logged by this crate.
+//!   in plain text in this local database. They are never logged by this crate. On Unix
+//!   the database files are kept at mode `0600` and a data directory created by
+//!   [`Store::open`] gets mode `0700`.
+//! - Only one [`Store`] may have a given data directory open at a time (an exclusive
+//!   advisory lock on [`LOCK_FILE_NAME`]); a second open is refused.
 
 mod model;
 mod schema;
@@ -23,7 +27,7 @@ pub use model::{
     Bookmark, Job, JobFile, JobState, NewBookmark, NewJob, ParseJobStateError, ThroughputSample, Totals,
 };
 pub use schema::SCHEMA_VERSION;
-pub use store::{Store, DB_FILE_NAME};
+pub use store::{Store, DB_FILE_NAME, LOCK_FILE_NAME};
 
 /// Errors returned by [`Store`].
 #[derive(Debug, thiserror::Error)]

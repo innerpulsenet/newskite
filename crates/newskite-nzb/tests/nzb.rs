@@ -101,6 +101,36 @@ fn prefixed_namespace_and_char_refs() {
 }
 
 #[test]
+fn unknown_entities_in_attributes_keep_predefined_ones_resolved() {
+    // HTML entities such as `&eacute;` are not XML, but some indexers emit them. They must be
+    // kept verbatim without disabling the predefined entities in the same attribute.
+    let xml = r#"<nzb><file poster="Jos&eacute; &lt;j@x&gt;" date="1"
+        subject="Caf&eacute;&nbsp;&amp; co &quot;f.bin&quot; &#x41;&#66; &bogus yEnc (1/1)">
+        <groups><group>g</group></groups>
+        <segments><segment bytes="5" number="1">id@host</segment></segments>
+      </file></nzb>"#;
+    let nzb = parse(xml.as_bytes()).unwrap();
+    let f = &nzb.files[0];
+    assert_eq!(
+        f.subject,
+        r#"Caf&eacute;&nbsp;& co "f.bin" AB &bogus yEnc (1/1)"#
+    );
+    assert_eq!(f.poster, "Jos&eacute; <j@x>");
+    assert_eq!(f.filename(), "f.bin");
+}
+
+#[test]
+fn attribute_whitespace_is_normalized_with_unknown_entities() {
+    let xml = "<nzb><file poster=\"p\" date=\"1\" subject=\"a\tb\r\nc &eacute; &quot;x.bin&quot;\">\
+        <groups><group>g</group></groups>\
+        <segments><segment bytes=\"5\" number=\"1\">id@host</segment></segments>\
+      </file></nzb>";
+    let nzb = parse(xml.as_bytes()).unwrap();
+    assert_eq!(nzb.files[0].subject, "a b c &eacute; \"x.bin\"");
+    assert_eq!(nzb.files[0].filename(), "x.bin");
+}
+
+#[test]
 fn job_name_falls_back_to_file_stem() {
     let xml = r#"<nzb><file subject="x" poster="p" date="1"><groups/><segments>
         <segment number="1" bytes="1">a@b</segment></segments></file></nzb>"#;

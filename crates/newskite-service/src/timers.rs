@@ -8,7 +8,7 @@ use std::time::Duration;
 use newskite_store::ThroughputSample;
 use tokio::time::MissedTickBehavior;
 
-use crate::{lock, now_secs, runner, Inner, LogLevel, ServiceError, ServiceEvent, SAMPLE_RETENTION_SECS};
+use crate::{lock, now_secs, runner, Fingerprint, Inner, LogLevel, ServiceError, ServiceEvent, SAMPLE_RETENTION_SECS};
 
 /// Sampler ticks between two prunes of old throughput samples (one hour).
 const PRUNE_EVERY_TICKS: u64 = 3600;
@@ -18,26 +18,58 @@ const PRUNE_EVERY_TICKS: u64 = 3600;
 pub(crate) fn spawn_sampler(inner: &Arc<Inner>) {
     let weak = Arc::downgrade(inner);
     let token = inner.shutdown.clone();
-    let progress = inner.progress.clone();
     inner.rt.spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
         interval.tick().await; // the first tick completes immediately
-        let mut last = progress.bytes_down();
         let mut ticks: u64 = 0;
         loop {
             tokio::select! {
-                _ = token.cancelled() => break,
+                _ = token.cancelled() => {
+                    // Record what moved since the last tick (the job interrupted by the
+                    // shutdown may have added bytes after Service::shutdown flushed).
+                    if let Some(inner) = weak.upgrade() {
+                        flush_throughput(&inner);
+                    }
+                    break;
+                }
                 _ = interval.tick() => {}
             }
             let Some(inner) = weak.upgrade() else { break };
-            let now = progress.bytes_down();
-            let delta = now.saturating_sub(last);
-            last = now;
+            let delta = take_delta(&inner);
             sample(&inner, delta, ticks.is_multiple_of(PRUNE_EVERY_TICKS));
             ticks = ticks.wrapping_add(1);
         }
     });
+}
+
+/// Bytes downloaded since the last call (marks them as recorded).
+fn take_delta(inner: &Inner) -> u64 {
+    let mut sampled = lock(&inner.sampled_down);
+    let now = inner.progress.bytes_down();
+    let delta = now.saturating_sub(*sampled);
+    *sampled = now.max(*sampled);
+    delta
+}
+
+/// Writes the bytes downloaded since the last sampler tick to the current second of the
+/// throughput history and to the lifetime total, without publishing a speed. Called when
+/// a run ends and at shutdown, so a run shorter than a tick (or the tail of the last one)
+/// is not lost.
+pub(crate) fn flush_throughput(inner: &Inner) {
+    let delta = take_delta(inner);
+    if delta == 0 {
+        return;
+    }
+    let result = inner
+        .store
+        .add_sample(&ThroughputSample { ts: now_secs(), bytes_up: 0, bytes_down: delta })
+        .and_then(|()| inner.store.add_downloaded_bytes(delta));
+    if let Err(e) = result {
+        if !inner.sampler_error_logged.swap(true, Ordering::Relaxed) {
+            inner.log(LogLevel::Warn, format!("could not store throughput: {e}"));
+        }
+    }
 }
 
 /// One sampler tick: publish the speed, store a sample when bytes moved or a run is
@@ -144,16 +176,20 @@ pub(crate) fn scan_watch_folder(inner: &Arc<Inner>, manual: bool) -> Result<Vec<
     let mut imported = Vec::new();
     for path in candidates {
         let Ok(canonical) = std::fs::canonicalize(&path) else { continue };
-        match inner.store.job_by_source(&canonical) {
-            Ok(Some(_)) => continue,
-            Ok(None) => {}
+        let Some(fp) = Fingerprint::of(&canonical) else { continue };
+        // Cheap check first, so known files are not parsed every interval; import_nzb
+        // checks again under the import lock.
+        match inner.watch_source_known(&canonical, fp) {
+            Ok(true) => continue,
+            Ok(false) => {}
             Err(e) => {
                 inner.log(LogLevel::Error, format!("could not check {}: {e}", path.display()));
                 return Err(e.into());
             }
         }
-        match inner.add_nzb_inner(&canonical) {
-            Ok(job) => imported.push(job.name),
+        match inner.import_nzb(&canonical, Some(fp)) {
+            Ok(Some(job)) => imported.push(job.name),
+            Ok(None) => {}
             Err(e) => {
                 let mtime = std::fs::metadata(&canonical).and_then(|m| m.modified()).ok();
                 let fresh = lock(&inner.watch_rejected).insert((canonical.clone(), mtime));

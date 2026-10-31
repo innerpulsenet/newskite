@@ -1,6 +1,7 @@
 //! The [`Store`] itself: a mutex-guarded SQLite connection with typed accessors.
 
 use std::collections::{HashMap, HashSet};
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -16,11 +17,19 @@ use crate::StoreError;
 /// File name of the database inside the directory passed to [`Store::open`].
 pub const DB_FILE_NAME: &str = "newskite.sqlite3";
 
+/// File name of the single-instance lock inside the directory passed to [`Store::open`].
+/// While a [`Store`] opened from that directory is alive it holds an exclusive advisory
+/// lock on this file; a second [`Store::open`] of the same directory is refused.
+pub const LOCK_FILE_NAME: &str = "newskite.lock";
+
 /// How long a statement waits on a locked database before failing with `SQLITE_BUSY`.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Key of the settings document in the `settings` table.
 const SETTINGS_KEY: &str = "settings";
+
+/// Key prefix of unreadable settings documents kept by [`Store::save_settings`].
+const SETTINGS_BACKUP_PREFIX: &str = "settings.unreadable-";
 
 /// Key of the lifetime downloaded-bytes counter in the `counters` table.
 const DOWNLOADED_BYTES_KEY: &str = "downloaded_bytes";
@@ -38,6 +47,9 @@ const BOOKMARK_COLUMNS: &str = "id, parent_id, name, newsgroup, color, expanded,
 pub struct Store {
     conn: Mutex<Connection>,
     path: Option<PathBuf>,
+    /// The locked [`LOCK_FILE_NAME`] (file stores only). Dropping the store closes it,
+    /// which releases the lock.
+    _lock: Option<File>,
 }
 
 impl std::fmt::Debug for Store {
@@ -130,6 +142,78 @@ fn bookmark_exists(conn: &Connection, id: i64) -> Result<bool, StoreError> {
         .is_some())
 }
 
+/// Create `dir` and its missing parents; on Unix the directories created here get mode
+/// `0700` (existing ones are left alone).
+fn create_private_dir(dir: &Path) -> Result<(), StoreError> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(dir)?;
+    Ok(())
+}
+
+/// Open options that create a file with mode `0600` on Unix.
+fn private_file_options() -> std::fs::OpenOptions {
+    let mut opts = std::fs::OpenOptions::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts
+}
+
+/// Take the exclusive single-instance lock on `dir/`[`LOCK_FILE_NAME`]. Returns `None`
+/// only when the filesystem does not support file locks at all, in which case the store
+/// still opens (without the guard).
+fn lock_data_dir(dir: &Path) -> Result<Option<File>, StoreError> {
+    let lock_path = dir.join(LOCK_FILE_NAME);
+    let file = private_file_options().read(true).write(true).create(true).truncate(false).open(&lock_path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(std::fs::TryLockError::WouldBlock) => Err(StoreError::Invalid(format!(
+            "another Newskite instance is already using {}; close it first or use a different data directory",
+            dir.display()
+        ))),
+        Err(std::fs::TryLockError::Error(e)) if e.kind() == std::io::ErrorKind::Unsupported => Ok(None),
+        Err(std::fs::TryLockError::Error(e)) => Err(e.into()),
+    }
+}
+
+/// Make sure the database file exists with mode `0600` before SQLite opens it (SQLite gives
+/// `-wal`/`-shm` the main file's mode), and tighten files an older version left readable
+/// by others. No-op outside Unix.
+fn make_db_files_private(db: &Path) -> Result<(), StoreError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        match private_file_options().write(true).create_new(true).open(db) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e.into()),
+        }
+        let mut wal = db.as_os_str().to_owned();
+        wal.push("-wal");
+        let mut shm = db.as_os_str().to_owned();
+        shm.push("-shm");
+        for p in [db.to_path_buf(), PathBuf::from(wal), PathBuf::from(shm)] {
+            let Ok(meta) = std::fs::metadata(&p) else { continue };
+            if meta.permissions().mode() & 0o077 != 0 {
+                // Best effort: a file owned by someone else cannot be changed, and that
+                // must not stop the store from opening.
+                let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = db;
+    Ok(())
+}
+
 impl Store {
     // -----------------------------------------------------------------------------------
     // Opening
@@ -137,20 +221,32 @@ impl Store {
 
     /// Open (creating if needed) `dir/newskite.sqlite3`. Creates `dir` and its parents,
     /// enables WAL, foreign keys and a busy timeout, and runs pending migrations.
+    ///
+    /// Single instance: the store takes an exclusive advisory lock on
+    /// `dir/`[`LOCK_FILE_NAME`] for as long as it lives. If another store (in this or
+    /// another process) already holds it, this returns [`StoreError::Invalid`] with a
+    /// message saying another Newskite instance is using the directory.
+    ///
+    /// Privacy (Unix): directories this call creates get mode `0700`, and the database
+    /// file, its `-wal`/`-shm` companions and the lock file are kept at `0600`, because the
+    /// database holds server and archive passwords in plain text. An existing data
+    /// directory keeps its mode.
     pub fn open(dir: &Path) -> Result<Self, StoreError> {
-        std::fs::create_dir_all(dir)?;
+        create_private_dir(dir)?;
+        let lock = lock_data_dir(dir)?;
         let path = dir.join(DB_FILE_NAME);
+        make_db_files_private(&path)?;
         let conn = Connection::open(&path)?;
-        Self::init(conn, Some(path))
+        Self::init(conn, Some(path), lock)
     }
 
     /// Open a private in-memory database (tests, `--headless` dry runs).
     pub fn open_in_memory() -> Result<Self, StoreError> {
         let conn = Connection::open_in_memory()?;
-        Self::init(conn, None)
+        Self::init(conn, None, None)
     }
 
-    fn init(mut conn: Connection, path: Option<PathBuf>) -> Result<Self, StoreError> {
+    fn init(mut conn: Connection, path: Option<PathBuf>, lock: Option<File>) -> Result<Self, StoreError> {
         conn.busy_timeout(BUSY_TIMEOUT)?;
         conn.pragma_update(None, "foreign_keys", true)?;
         // journal_mode returns the resulting mode as a row; in-memory databases report
@@ -158,7 +254,7 @@ impl Store {
         let _mode: String = conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         schema::migrate(&mut conn)?;
-        Ok(Self { conn: Mutex::new(conn), path })
+        Ok(Self { conn: Mutex::new(conn), path, _lock: lock })
     }
 
     /// Path of the database file, or `None` for an in-memory store.
@@ -235,6 +331,25 @@ impl Store {
             .optional()?)
     }
 
+    /// The oldest pending job (`queued`, `downloading` or `paused`) whose source NZB path
+    /// equals `p`, if any. Unlike [`Store::job_by_source`] this looks at every job for the
+    /// path, not only the newest one, so it is the right check for "is this NZB already in
+    /// the queue". Comparison is on the stored UTF-8 form of the path.
+    pub fn pending_job_by_source(&self, p: &Path) -> Result<Option<Job>, StoreError> {
+        let conn = self.conn();
+        Ok(conn
+            .query_row(
+                &format!(
+                    "SELECT {JOB_COLUMNS} FROM jobs
+                     WHERE source_path = ?1 AND state IN ('queued', 'downloading', 'paused')
+                     ORDER BY id ASC LIMIT 1"
+                ),
+                [path_to_db(p)],
+                job_from_row,
+            )
+            .optional()?)
+    }
+
     /// Set a job's state and its error text (`None` clears the error).
     pub fn set_job_state(&self, id: i64, s: JobState, error: Option<&str>) -> Result<(), StoreError> {
         let n = self.conn().execute(
@@ -288,8 +403,33 @@ impl Store {
             .optional()?)
     }
 
+    /// Like [`Store::next_runnable_job`], restricted to the jobs whose id is in `ids`
+    /// (same order: oldest `created_at` first, ties broken by id). Ids that do not exist
+    /// or are not `queued`/`paused` are ignored; an empty `ids` yields `None`.
+    pub fn next_runnable_job_among(&self, ids: &[i64]) -> Result<Option<Job>, StoreError> {
+        if ids.is_empty() {
+            return Ok(None);
+        }
+        let placeholders = vec!["?"; ids.len()].join(", ");
+        let conn = self.conn();
+        Ok(conn
+            .query_row(
+                &format!(
+                    "SELECT {JOB_COLUMNS} FROM jobs WHERE state IN ('queued', 'paused')
+                     AND id IN ({placeholders})
+                     ORDER BY created_at ASC, id ASC LIMIT 1"
+                ),
+                rusqlite::params_from_iter(ids.iter()),
+                job_from_row,
+            )
+            .optional()?)
+    }
+
     /// Startup recovery: every job left `downloading` by a previous process becomes
     /// `queued` again. Returns how many jobs were reset.
+    ///
+    /// Safe to call right after [`Store::open`]: the single-instance lock guarantees no
+    /// other live store owns those jobs, so they really were interrupted.
     pub fn reset_interrupted(&self) -> Result<usize, StoreError> {
         Ok(self
             .conn()
@@ -521,14 +661,93 @@ impl Store {
     }
 
     /// Persist the settings document (as JSON, including server passwords in plain text).
+    ///
+    /// If the document it replaces cannot be loaded (see [`Store::load_settings`]), that
+    /// document is first kept, verbatim, under a `settings.unreadable-<unix secs>` key (once
+    /// per distinct text), so saving the defaults shown after a load failure never destroys
+    /// the user's server list. See [`Store::settings_backups`].
     pub fn save_settings(&self, s: &Settings) -> Result<(), StoreError> {
         let json = serde_json::to_string(s)?;
-        self.conn().execute(
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let current: Option<String> = tx
+            .query_row("SELECT value FROM settings WHERE key = ?1", [SETTINGS_KEY], |r| r.get(0))
+            .optional()?;
+        if let Some(raw) = current.filter(|raw| serde_json::from_str::<Settings>(raw).is_err()) {
+            let kept: bool = tx
+                .query_row(
+                    "SELECT 1 FROM settings WHERE substr(key, 1, ?1) = ?2 AND value = ?3",
+                    params![SETTINGS_BACKUP_PREFIX.len() as i64, SETTINGS_BACKUP_PREFIX, raw],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if !kept {
+                let base = format!("{SETTINGS_BACKUP_PREFIX}{}", now_unix());
+                let mut key = base.clone();
+                let mut n = 2u32;
+                while tx
+                    .query_row("SELECT 1 FROM settings WHERE key = ?1", [&key], |_| Ok(()))
+                    .optional()?
+                    .is_some()
+                {
+                    key = format!("{base}-{n}");
+                    n += 1;
+                }
+                tx.execute("INSERT INTO settings (key, value) VALUES (?1, ?2)", params![key, raw])?;
+            }
+        }
+        tx.execute(
             "INSERT INTO settings (key, value) VALUES (?1, ?2)
              ON CONFLICT (key) DO UPDATE SET value = excluded.value",
             params![SETTINGS_KEY, json],
         )?;
+        tx.commit()?;
         Ok(())
+    }
+
+    /// Unreadable settings documents kept by [`Store::save_settings`], as `(key, raw text)`
+    /// pairs, oldest first. The text may contain passwords; never log it.
+    pub fn settings_backups(&self) -> Result<Vec<(String, String)>, StoreError> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT key, value FROM settings WHERE substr(key, 1, ?1) = ?2 ORDER BY length(key), key",
+        )?;
+        let rows = stmt.query_map(params![SETTINGS_BACKUP_PREFIX.len() as i64, SETTINGS_BACKUP_PREFIX], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    // -----------------------------------------------------------------------------------
+    // Seen sources (watch folder)
+    // -----------------------------------------------------------------------------------
+
+    /// Record that the NZB file at `p` with this fingerprint (`size` in bytes, `mtime` in
+    /// unix nanoseconds) was imported or its job removed, replacing an older fingerprint for
+    /// the same path. These rows are kept when jobs are removed, so the watch folder does
+    /// not import the same file again.
+    pub fn mark_source_seen(&self, p: &Path, size: u64, mtime: i64) -> Result<(), StoreError> {
+        self.conn().execute(
+            "INSERT INTO seen_sources (source_path, size, mtime, seen_at) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (source_path) DO UPDATE SET
+                 size = excluded.size, mtime = excluded.mtime, seen_at = excluded.seen_at",
+            params![path_to_db(p), to_db(size), mtime, now_unix()],
+        )?;
+        Ok(())
+    }
+
+    /// `true` when [`Store::mark_source_seen`] recorded `p` with exactly this fingerprint.
+    pub fn source_seen(&self, p: &Path, size: u64, mtime: i64) -> Result<bool, StoreError> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT 1 FROM seen_sources WHERE source_path = ?1 AND size = ?2 AND mtime = ?3",
+                params![path_to_db(p), to_db(size), mtime],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
     }
 
     // -----------------------------------------------------------------------------------

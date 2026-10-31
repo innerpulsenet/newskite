@@ -172,6 +172,7 @@ pub fn default_data_dir() -> PathBuf {
 }
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
 
