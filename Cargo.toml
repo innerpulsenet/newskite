@@ -1,0 +1,38 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+license = "MIT OR Apache-2.0"
+authors = ["Pat"]
+repository = "https://github.com/innerpulsenet/newskite"
+
+[workspace.dependencies]
+newskite-types = { path = "crates/newskite-types" }
+newskite-nzb = { path = "crates/newskite-nzb" }
+newskite-nntp = { path = "crates/newskite-nntp" }
+newskite-engine = { path = "crates/newskite-engine" }
+newskite-store = { path = "crates/newskite-store" }
+newskite-theme = { path = "crates/newskite-theme" }
+newskite-postproc = { path = "crates/newskite-postproc" }
+newskite-service = { path = "crates/newskite-service" }
+newskite-cli = { path = "crates/newskite-cli" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "fs"] }
+tokio-util = "0.7"
+directories = "6"
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+strip = true
+
+[profile.dev.package."*"]
+opt-level = 2

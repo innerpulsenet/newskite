@@ -1,0 +1,1 @@
+//! stub — see CONTRACTS.md
