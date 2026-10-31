@@ -1,0 +1,14 @@
+[package]
+name = "newskite"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Desktop Usenet (NZB) download client"
+
+[[bin]]
+name = "newskite"
+path = "src/main.rs"
+
+[dependencies]
+newskite-types.workspace = true
