@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Newskite application icon. Original artwork for this project.
+     A two-tone kite on a dusk-blue tile; a bowed tail trails below. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <title>Newskite</title>
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2f6fb3"/>
+      <stop offset="1" stop-color="#173a6b"/>
+    </linearGradient>
+    <linearGradient id="sheen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.18"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Tile -->
+  <rect x="12" y="12" width="232" height="232" rx="52" fill="url(#tile)"/>
+  <rect x="12" y="12" width="232" height="116" rx="52" fill="url(#sheen)"/>
+
+  <!-- Tail: a loose S-curve trailing in the wind, with two bows -->
+  <path d="M141 164 C 154 186, 108 192, 116 230" fill="none" stroke="#ffd36b"
+        stroke-width="6" stroke-linecap="round"/>
+  <path d="M118 182 L 132 188 L 120 198 Z M146 180 L 132 188 L 144 196 Z" fill="#ffb347"/>
+  <path d="M102 208 L 116 213 L 104 222 Z M130 206 L 116 213 L 128 222 Z" fill="#ffb347"/>
+
+  <!-- Kite, tilted slightly as if catching the wind -->
+  <g transform="rotate(-10 128 100)">
+    <!-- four panels: light on the left, warm on the right -->
+    <path d="M128 30 L 128 92 L 72 92 Z" fill="#f4f7fb"/>
+    <path d="M128 30 L 184 92 L 128 92 Z" fill="#ffd36b"/>
+    <path d="M72 92 L 128 92 L 128 168 Z" fill="#d5e2f0"/>
+    <path d="M128 92 L 184 92 L 128 168 Z" fill="#ffb347"/>
+    <!-- spars -->
+    <path d="M128 30 L 128 168 M72 92 L 184 92" stroke="#173a6b" stroke-opacity="0.55"
+          stroke-width="4" stroke-linecap="round"/>
+    <!-- outline -->
+    <path d="M128 30 L 184 92 L 128 168 L 72 92 Z" fill="none" stroke="#0f2a4f"
+          stroke-opacity="0.35" stroke-width="3" stroke-linejoin="round"/>
+  </g>
+</svg>

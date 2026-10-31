@@ -4,7 +4,19 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "Newskite headless command-line mode: download NZBs with the shared queue service"
 
 [dependencies]
 newskite-types.workspace = true
+newskite-service.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }
+clap = { version = "4.6.7", features = ["derive", "env"] }
+
+[dev-dependencies]
+newskite-nntp = { workspace = true, features = ["testkit"] }
+newskite-nzb.workspace = true
+newskite-store.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+sha2 = "0.10"
+tempfile = "3.27"

@@ -4,7 +4,19 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "Newskite download engine: concurrent NNTP segment fetch, yEnc decode and offset writes"
 
 [dependencies]
 newskite-types.workspace = true
+newskite-nzb.workspace = true
+newskite-nntp.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
+tokio-util.workspace = true
+
+[dev-dependencies]
+newskite-nntp = { workspace = true, features = ["testkit"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+sha2 = "0.10"
+tempfile = "3.27"

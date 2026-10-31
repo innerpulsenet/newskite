@@ -144,9 +144,7 @@ impl Settings {
     /// Guarantee the "at least one server row" invariant after loading/editing.
     pub fn normalized(mut self) -> Self {
         if self.servers.is_empty() {
-            let mut s = ServerConfig::default();
-            s.enabled = false;
-            self.servers.push(s);
+            self.servers.push(ServerConfig { enabled: false, ..Default::default() });
         }
         if self.max_connections == 0 {
             self.max_connections = 1;
@@ -166,7 +164,7 @@ pub fn default_download_dir() -> PathBuf {
     PathBuf::from(crate::APP_NAME)
 }
 
-/// Directory for the databases: `~/.local/share/Newskite/db` on Linux.
+/// Directory for the databases: `~/.local/share/newskite/db` on Linux (the directories crate lowercases it).
 pub fn default_data_dir() -> PathBuf {
     directories::ProjectDirs::from("net", "innerpulse", crate::APP_NAME)
         .map(|p| p.data_dir().join("db"))

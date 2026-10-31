@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- AppStream metadata for Newskite. Validate with appstreamcli (see the repository README.md). -->
+<component type="desktop-application">
+  <id>net.innerpulse.Newskite</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT OR Apache-2.0</project_license>
+  <name>Newskite</name>
+  <summary>Download files from Usenet using NZB files</summary>
+  <developer id="net.innerpulse">
+    <name>Innerpulse</name>
+  </developer>
+  <description>
+    <p>
+      Newskite is a desktop Usenet download client. Give it an NZB file and it fetches the
+      binary articles from your news server over TLS, decodes them and writes the original
+      files to disk, then verifies, repairs and extracts them when the matching tools are
+      installed.
+    </p>
+    <ul>
+      <li>Download queue with precise progress that resumes after a restart</li>
+      <li>Multiple servers with priorities, per-server connection counts and a connection test</li>
+      <li>PAR2 verify and repair plus RAR, 7z and ZIP extraction using external tools</li>
+      <li>Watch folder, speed limit, scheduler window and optional shutdown when done</li>
+      <li>Live throughput graph, activity log and bookmarks</li>
+      <li>Follows the desktop light or dark color scheme</li>
+      <li>Headless command-line mode that drives the same queue engine</li>
+    </ul>
+    <p>
+      Newskite does not include a Usenet server subscription or a search indexer.
+      Server passwords are stored unencrypted in the local database.
+    </p>
+  </description>
+  <url type="homepage">https://github.com/innerpulsenet/newskite</url>
+  <launchable type="desktop-id">net.innerpulse.Newskite.desktop</launchable>
+  <categories>
+    <category>Network</category>
+    <category>FileTransfer</category>
+  </categories>
+  <keywords>
+    <keyword>usenet</keyword>
+    <keyword>nzb</keyword>
+    <keyword>nntp</keyword>
+    <keyword>newsgroup</keyword>
+  </keywords>
+  <provides>
+    <binary>newskite</binary>
+    <mediatype>application/x-nzb</mediatype>
+  </provides>
+  <supports>
+    <control>pointing</control>
+    <control>keyboard</control>
+  </supports>
+  <requires>
+    <display_length compare="ge">768</display_length>
+  </requires>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.1.0" date="2026-10-31">
+      <description>
+        <p>First release: NZB import, TLS downloads, queue, post-processing and headless mode.</p>
+      </description>
+    </release>
+  </releases>
+</component>

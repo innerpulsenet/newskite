@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- shared-mime-info definition for NZB manifests, installed by Newskite. -->
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-nzb">
+    <comment>NZB Usenet download list</comment>
+    <acronym>NZB</acronym>
+    <expanded-acronym>NewzBin</expanded-acronym>
+    <sub-class-of type="application/xml"/>
+    <generic-icon name="text-xml"/>
+    <glob pattern="*.nzb"/>
+    <magic priority="80">
+      <match type="string" value="&lt;nzb" offset="0:256"/>
+      <match type="string" value="//newzbin.com/DTD/2003/nzb" offset="0:512"/>
+    </magic>
+    <root-XML namespaceURI="http://www.newzbin.com/DTD/2003/nzb" localName="nzb"/>
+  </mime-type>
+</mime-info>

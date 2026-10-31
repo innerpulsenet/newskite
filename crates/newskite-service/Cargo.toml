@@ -4,7 +4,22 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "Newskite queue service: job queue, persistence wiring, throughput sampling and automation shared by the GUI and the CLI"
 
 [dependencies]
 newskite-types.workspace = true
+newskite-nzb.workspace = true
+newskite-nntp.workspace = true
+newskite-engine.workspace = true
+newskite-store.workspace = true
+newskite-postproc.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
+tokio-util.workspace = true
+
+[dev-dependencies]
+newskite-nntp = { workspace = true, features = ["testkit"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+sha2 = "0.10"
+tempfile = "3.27"
