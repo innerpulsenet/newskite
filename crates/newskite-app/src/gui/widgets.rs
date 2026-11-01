@@ -344,6 +344,18 @@ pub fn status_chip_width(ui: &Ui, text: &str) -> f32 {
 /// An outlined status chip: a 1 px outline in the status color, its 12 px glyph and the
 /// words (12.5 px sans). Reads without color: the glyph carries the state.
 pub fn status_chip(ui: &mut Ui, pal: &Palette, status: Status, text: &str) -> Response {
+    status_chip_live(ui, pal, status, text, None)
+}
+
+/// [`status_chip`] whose live dot breathes: `breath` is the beat's 0…1 breath while
+/// bytes move (`None` rests). Only a `Live` chip has a dot, so other statuses ignore it.
+pub fn status_chip_live(
+    ui: &mut Ui,
+    pal: &Palette,
+    status: Status,
+    text: &str,
+    breath: Option<f32>,
+) -> Response {
     let color = status.color(pal);
     let font = FontId::proportional(12.5);
     let galley = ui.painter().layout_no_wrap(text.to_owned(), font, color);
@@ -364,7 +376,22 @@ pub fn status_chip(ui: &mut Ui, pal: &Palette, status: Status, text: &str) -> Re
         match status.glyph() {
             Some(g) => paint_icon(painter, glyph_rect, g, color),
             None => {
-                painter.circle_filled(glyph_rect.center(), 3.5, color);
+                let c = glyph_rect.center();
+                match breath {
+                    Some(b) => {
+                        // A soft ring that grows as the dot dims, then the dot.
+                        let b = b.clamp(0.0, 1.0);
+                        painter.circle_stroke(
+                            c,
+                            3.5 + 3.0 * (1.0 - b),
+                            Stroke::new(1.0, Palette::fade(color, 0.45 * b)),
+                        );
+                        painter.circle_filled(c, 3.5, Palette::fade(color, 0.6 + 0.4 * b));
+                    }
+                    None => {
+                        painter.circle_filled(c, 3.5, color);
+                    }
+                }
             }
         }
         painter.galley(
@@ -509,6 +536,32 @@ pub fn segment_track(
     color: Color32,
     width: f32,
 ) -> Response {
+    segment_track_live(ui, pal, fraction, color, width, None)
+}
+
+/// Opacity of filled cell `i` of `n` under a sweep at `phase` (0…1): a soft highlight
+/// two cells wide travels left to right across the filled cells once per cycle, the
+/// rest sit at 0.78. Pure, for tests.
+pub fn sweep_alpha(i: usize, n: usize, phase: f32) -> f32 {
+    if n == 0 {
+        return 1.0;
+    }
+    let head = phase.clamp(0.0, 1.0) * (n as f32 + 2.0) - 1.0;
+    let d = (i as f32 - head).abs();
+    let glow = (1.0 - d / 2.0).clamp(0.0, 1.0);
+    0.78 + 0.22 * glow * glow
+}
+
+/// [`segment_track`] with a highlight sweeping along the filled cells while the job
+/// downloads (`sweep` is the beat phase; `None` rests).
+pub fn segment_track_live(
+    ui: &mut Ui,
+    pal: &Palette,
+    fraction: f32,
+    color: Color32,
+    width: f32,
+    sweep: Option<f32>,
+) -> Response {
     let width = if width.is_finite() {
         width.max(10.0)
     } else {
@@ -521,11 +574,16 @@ pub fn segment_track(
         let cell_w = (rect.width() - TRACK_GAP * (cells as f32 - 1.0)) / cells as f32;
         let painter = ui.painter();
         let r = CornerRadius::same(1);
+        let filled = fill.iter().filter(|a| **a >= 1.0).count();
         for (i, amount) in fill.iter().enumerate() {
             let x = rect.left() + i as f32 * (cell_w + TRACK_GAP);
             let cell = Rect::from_min_size(Pos2::new(x, rect.top()), Vec2::new(cell_w, TRACK_H));
             if *amount >= 1.0 {
-                painter.rect_filled(cell, r, color);
+                let c = match sweep {
+                    Some(phase) => Palette::fade(color, sweep_alpha(i, filled, phase)),
+                    None => color,
+                };
+                painter.rect_filled(cell, r, c);
             } else {
                 painter.rect_filled(cell, r, pal.well);
                 if *amount > 0.0 {
@@ -549,10 +607,22 @@ pub fn grid_lit(_col: usize, _row: usize) -> bool {
     false
 }
 
+/// Brightness (0…1) of well `(col, row)` of the article grid under an ambient wave at
+/// `phase`: a soft diagonal band drifts across the empty wells. Decorative only: the
+/// wells stay wells (no cell is ever lit in the accent, which would read as a count).
+pub fn grid_wave(col: usize, row: usize, phase: f32) -> f32 {
+    let (cols, rows) = GRID_SIZE;
+    let along = (col as f32 + row as f32 * 1.5) / (cols as f32 + rows as f32 * 1.5);
+    let d = (along - phase.clamp(0.0, 1.0)).rem_euclid(1.0);
+    let d = d.min(1.0 - d) * 2.0;
+    (1.0 - d * 2.5).clamp(0.0, 1.0)
+}
+
 /// The empty queue's article grid: a few rows of quiet, unlit wells, where articles
 /// will land once an NZB is queued. No baseline and no lit cells, so it reads as an
-/// empty matrix, not as a chart.
-pub fn article_grid(ui: &mut Ui, pal: &Palette) {
+/// empty matrix, not as a chart. With `wave` (the ambient beat phase) a faint band
+/// drifts across the wells.
+pub fn article_grid(ui: &mut Ui, pal: &Palette, wave: Option<f32>) {
     let (cols, rows) = GRID_SIZE;
     let (cell, gap) = (7.0, 3.0);
     let w = cols as f32 * cell + (cols as f32 - 1.0) * gap;
@@ -568,10 +638,28 @@ pub fn article_grid(ui: &mut Ui, pal: &Palette) {
                 rect.left() + col as f32 * (cell + gap),
                 rect.top() + row as f32 * (cell + gap),
             );
+            let fill = match wave {
+                Some(phase) => {
+                    let w = grid_wave(col, row, phase);
+                    if w > 0.0 {
+                        // The well brightened toward the strong hairline, never the accent.
+                        let lift = Palette::fade(pal.border_strong, 0.55 * w);
+                        painter.rect_filled(
+                            Rect::from_min_size(min, Vec2::splat(cell)),
+                            CornerRadius::same(1),
+                            pal.well,
+                        );
+                        lift
+                    } else {
+                        pal.well
+                    }
+                }
+                None => pal.well,
+            };
             painter.rect_filled(
                 Rect::from_min_size(min, Vec2::splat(cell)),
                 CornerRadius::same(1),
-                pal.well,
+                fill,
             );
         }
     }
@@ -692,6 +780,26 @@ mod tests {
         assert_eq!(track_fill(7.0, 2), vec![1.0; 2]);
         // A tiny fraction still shows in the first cell.
         assert!(track_fill(0.01, 28)[0] > 0.0);
+    }
+
+    #[test]
+    fn sweep_and_wave_stay_in_range() {
+        for k in 0..=20 {
+            let phase = k as f32 / 20.0;
+            for i in 0..10 {
+                let a = sweep_alpha(i, 10, phase);
+                assert!((0.78..=1.0).contains(&a), "{a}");
+            }
+            for row in 0..GRID_SIZE.1 {
+                for col in 0..GRID_SIZE.0 {
+                    let w = grid_wave(col, row, phase);
+                    assert!((0.0..=1.0).contains(&w));
+                }
+            }
+        }
+        assert_eq!(sweep_alpha(3, 0, 0.5), 1.0);
+        // The head of the sweep is brightest.
+        assert!(sweep_alpha(4, 10, 5.0 / 12.0) > sweep_alpha(0, 10, 5.0 / 12.0));
     }
 
     #[test]

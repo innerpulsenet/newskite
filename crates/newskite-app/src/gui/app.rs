@@ -259,6 +259,8 @@ pub struct ViewState {
     pub masthead_mark: [f64; 6],
     /// The About mark's bar heights this frame.
     pub about_mark: [f64; 6],
+    /// Reduced motion is in effect this frame (copied from the app so views can rest).
+    pub reduced_motion: bool,
 }
 
 /// The toolbar's inline Open NZB field.
@@ -393,6 +395,7 @@ impl NewskiteApp {
                 about_open: false,
                 masthead_mark: brand::rest_heights(),
                 about_mark: brand::rest_heights(),
+                reduced_motion,
             },
             actions: Vec::new(),
             last_jobs_reload: Instant::now(),
@@ -1036,6 +1039,7 @@ impl NewskiteApp {
         let mut actions = Vec::new();
         let pal = self.palette;
         let width = ctx.content_rect().width();
+        self.view.reduced_motion = self.reduced_motion;
 
         egui::TopBottomPanel::top("toolbar")
             .frame(
@@ -1057,7 +1061,7 @@ impl NewskiteApp {
                     .stroke(egui::Stroke::new(1.0, pal.border)),
             )
             .show(ctx, |ui| {
-                statusbar::show(ui, &pal, &self.data, &mut actions)
+                statusbar::show(ui, &pal, &self.data, self.reduced_motion, &mut actions)
             });
 
         // One panel id per arrangement so each keeps its own (user-resizable) height. The
@@ -1113,10 +1117,23 @@ impl NewskiteApp {
                 queue::show_center(ui, &pal, &self.data, &mut self.view, &mut actions);
             });
 
+        let reduced = self.reduced_motion;
         if let Some(draft) = self.view.settings.as_mut() {
-            settings::show(ctx, &pal, draft, self.view.dialog_open, &mut actions);
-        } else if self.view.about_open {
-            about::show(ctx, &pal, &self.view.about_mark, &mut actions);
+            settings::show(
+                ctx,
+                &pal,
+                draft,
+                self.view.dialog_open,
+                reduced,
+                &mut actions,
+            );
+        } else {
+            motion::fade_reset(ctx, settings::fade_id());
+        }
+        if self.view.about_open && self.view.settings.is_none() {
+            about::show(ctx, &pal, &self.view.about_mark, reduced, &mut actions);
+        } else {
+            motion::fade_reset(ctx, about::fade_id());
         }
 
         self.actions.extend(actions);

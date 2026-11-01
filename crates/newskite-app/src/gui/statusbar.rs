@@ -1,11 +1,30 @@
 //! Status bar (outline §6.4).
 
-use eframe::egui::{Align, Layout, RichText, Ui};
+use eframe::egui::{Align, Layout, Pos2, RichText, Stroke, Ui};
+use newskite_service::JobState;
 use newskite_types::format;
 
 use super::app::{Action, Data};
+use super::brand;
+use super::motion::Beat;
 use super::theme::Palette;
-use super::widgets::{credit, link_label, status_chip, Status, CREDIT_URL};
+use super::widgets::{credit, link_label, status_chip_live, Status, CREDIT_URL};
+
+/// Fraction of the bytes of every unfinished job that is already down (0…1; 0 when
+/// nothing is pending). The status bar's hairline while a run is active.
+pub fn pending_fraction(data: &Data) -> f32 {
+    let (done, total) =
+        data.jobs
+            .iter()
+            .filter(|j| j.state != JobState::Done)
+            .fold((0u64, 0u64), |(d, t), j| {
+                (
+                    d.saturating_add(data.shown_done(j)),
+                    t.saturating_add(j.bytes_total),
+                )
+            });
+    format::fraction(done, total)
+}
 
 /// What the status pill shows.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -92,8 +111,42 @@ impl Pill {
 }
 
 /// Draws the status bar: the support link at the left; the quiet innerpulse credit at
-/// the right end, the state chip beside it.
-pub fn show(ui: &mut Ui, pal: &Palette, data: &Data, actions: &mut Vec<Action>) {
+/// the right end, the state chip beside it (its live dot breathing with the busy beat).
+/// While a run is active a 2 px accent hairline along the top edge shows how much of
+/// the pending bytes is down.
+pub fn show(
+    ui: &mut Ui,
+    pal: &Palette,
+    data: &Data,
+    reduced_motion: bool,
+    actions: &mut Vec<Action>,
+) {
+    let st = &data.status;
+    let beat = Beat::new(
+        ui.ctx(),
+        st.running && data.speed() > 0,
+        reduced_motion,
+        brand::PERIOD_BUSY,
+    );
+    if st.running {
+        let bar = ui.max_rect();
+        let f = pending_fraction(data);
+        let y = bar.top() - 2.0;
+        ui.painter().line_segment(
+            [
+                Pos2::new(bar.left() - 10.0, y),
+                Pos2::new(bar.right() + 10.0, y),
+            ],
+            Stroke::new(2.0, pal.well),
+        );
+        if f > 0.0 {
+            let x = bar.left() - 10.0 + (bar.width() + 20.0) * f;
+            ui.painter().line_segment(
+                [Pos2::new(bar.left() - 10.0, y), Pos2::new(x, y)],
+                Stroke::new(2.0, pal.accent),
+            );
+        }
+    }
     ui.horizontal_centered(|ui| {
         link_label(ui, pal, "Support Issues?").on_hover_text("Help resources are not set up yet.");
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -102,7 +155,8 @@ pub fn show(ui: &mut Ui, pal: &Palette, data: &Data, actions: &mut Vec<Action>) 
             }
             ui.add_space(14.0);
             let state = pill_state(data);
-            let r = status_chip(ui, pal, state.status(), &state.text());
+            let breath = beat.moving.then(|| beat.breath());
+            let r = status_chip_live(ui, pal, state.status(), &state.text(), breath);
             if let Pill::Error(e) = &state {
                 r.on_hover_text(e);
             }
@@ -141,6 +195,32 @@ mod tests {
         // The run has stopped: paused.
         d.status.running = false;
         assert_eq!(pill_state(&d), Pill::Paused);
+    }
+
+    #[test]
+    fn pending_fraction_counts_unfinished_jobs_only() {
+        use newskite_service::Job;
+        use std::path::PathBuf;
+        let job = |id, state, done, total| Job {
+            id,
+            name: String::new(),
+            state,
+            bytes_total: total,
+            bytes_done: done,
+            dest_dir: PathBuf::new(),
+            source_path: PathBuf::new(),
+            created_at: 0,
+            error: None,
+            password: None,
+        };
+        let mut d = Data::default();
+        assert_eq!(pending_fraction(&d), 0.0);
+        d.jobs = vec![
+            job(1, JobState::Done, 100, 100),
+            job(2, JobState::Downloading, 25, 100),
+            job(3, JobState::Queued, 0, 100),
+        ];
+        assert!((pending_fraction(&d) - 0.125).abs() < 1e-6);
     }
 
     #[test]

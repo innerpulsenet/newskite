@@ -7,6 +7,7 @@ use super::app::Action;
 use super::brand;
 use super::fonts;
 use super::icons;
+use super::motion;
 use super::theme::Palette;
 use super::widgets::{credit, kit_button, ButtonKind, CREDIT_URL};
 
@@ -18,11 +19,25 @@ pub fn version_line() -> String {
     format!("Version {}", env!("CARGO_PKG_VERSION"))
 }
 
-/// Draws the modal with the mark at `mark` heights. Esc is handled by the app.
-pub fn show(ctx: &egui::Context, pal: &Palette, mark: &[f64; 6], actions: &mut Vec<Action>) {
+/// Key of the dialog's fade-in (reset by the app while it is closed).
+pub fn fade_id() -> Id {
+    Id::new("about-fade")
+}
+
+/// Draws the modal with the mark at `mark` heights. Esc is handled by the app. The
+/// sheet and its backdrop fade in over 160 ms (at once under reduced motion).
+pub fn show(
+    ctx: &egui::Context,
+    pal: &Palette,
+    mark: &[f64; 6],
+    reduced_motion: bool,
+    actions: &mut Vec<Action>,
+) {
+    let t = motion::fade_in(ctx, fade_id(), 0.16, reduced_motion);
     egui::Modal::new(Id::new("about-modal"))
-        .backdrop_color(pal.backdrop)
+        .backdrop_color(Palette::fade(pal.backdrop, t))
         .show(ctx, |ui| {
+            ui.set_opacity(t);
             ui.set_width(320.0);
             ui.vertical_centered(|ui| {
                 ui.add_space(12.0);

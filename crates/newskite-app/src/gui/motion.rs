@@ -9,6 +9,87 @@
 //! 3. otherwise full motion.
 
 use std::path::Path;
+use std::time::Duration;
+
+use eframe::egui::{self, Id};
+
+/// Frame interval while something moves (40 fps).
+pub const FRAME: Duration = Duration::from_millis(25);
+
+/// The product's shared beat: a phase (0…1) over `period` seconds that every live
+/// element follows, so the masthead, the graph marker, the slot row, the live chip and
+/// the queue sweep breathe together. `moving` is false when nothing should move (not
+/// active, or reduced motion), and then the phase rests at zero.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Beat {
+    /// Phase of the current cycle, 0…1.
+    pub phase: f32,
+    /// Something moves this frame.
+    pub moving: bool,
+    /// Motion is allowed at all (not reduced).
+    pub animate: bool,
+}
+
+impl Beat {
+    /// The beat at egui time `now` for a cycle of `period` seconds; it requests the next
+    /// frame while moving.
+    pub fn new(ctx: &egui::Context, active: bool, reduced_motion: bool, period: f64) -> Self {
+        let now = ctx.input(|i| i.time);
+        Self::at(now, active, reduced_motion, period).tick(ctx)
+    }
+
+    /// The beat at a given time (pure; for tests).
+    pub fn at(now: f64, active: bool, reduced_motion: bool, period: f64) -> Self {
+        let moving = active && !reduced_motion && now.is_finite() && period > 0.0;
+        let phase = if moving {
+            (now / period).rem_euclid(1.0) as f32
+        } else {
+            0.0
+        };
+        Self {
+            phase,
+            moving,
+            animate: !reduced_motion,
+        }
+    }
+
+    fn tick(self, ctx: &egui::Context) -> Self {
+        if self.moving {
+            ctx.request_repaint_after(FRAME);
+        }
+        self
+    }
+
+    /// A soft 0…1 breath over the cycle (1 at the start, 0 halfway, 1 again).
+    pub fn breath(self) -> f32 {
+        0.5 + 0.5 * (self.phase * std::f32::consts::TAU).cos()
+    }
+}
+
+/// A fade from 0 to 1 over `secs` that starts the first time `id` is seen: 0 on that
+/// frame, then eased toward 1. Under reduced motion it is 1 at once. Pair with
+/// [`fade_reset`] when the thing closes, so it fades in again next time.
+pub fn fade_in(ctx: &egui::Context, id: Id, secs: f32, reduced_motion: bool) -> f32 {
+    if reduced_motion {
+        return 1.0;
+    }
+    let seen = ctx.data(|d| d.get_temp::<bool>(id)).unwrap_or(false);
+    if !seen {
+        ctx.data_mut(|d| d.insert_temp(id, true));
+        // Seeds the animation at 0; egui snaps on the first call.
+        ctx.animate_bool_with_time(id.with("fade"), false, secs);
+        ctx.request_repaint();
+        return 0.0;
+    }
+    ctx.animate_bool_with_time(id.with("fade"), true, secs)
+}
+
+/// Forgets a [`fade_in`] so it plays again.
+pub fn fade_reset(ctx: &egui::Context, id: Id) {
+    ctx.data_mut(|d| {
+        d.remove_temp::<bool>(id);
+    });
+}
 
 /// Environment variable that overrides the desktop setting.
 pub const ENV: &str = "NEWSKITE_REDUCED_MOTION";
@@ -78,6 +159,24 @@ fn read_small(path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn beat_phase_and_rest() {
+        let b = Beat::at(10.3, true, false, 1.2);
+        assert!(b.moving && b.animate);
+        assert!((0.0..1.0).contains(&b.phase));
+        assert!((b.phase - ((10.3_f64 / 1.2).rem_euclid(1.0) as f32)).abs() < 1e-6);
+        let rest = Beat::at(10.3, false, false, 1.2);
+        assert!(!rest.moving && rest.phase == 0.0 && rest.breath() == 1.0);
+        let reduced = Beat::at(10.3, true, true, 1.2);
+        assert!(!reduced.moving && !reduced.animate);
+        assert!(!Beat::at(f64::NAN, true, false, 1.2).moving);
+        assert!(!Beat::at(1.0, true, false, 0.0).moving);
+        for i in 0..20 {
+            let b = Beat::at(i as f64 * 0.07, true, false, 1.0);
+            assert!((0.0..=1.0).contains(&b.breath()));
+        }
+    }
 
     #[test]
     fn env_overrides() {
