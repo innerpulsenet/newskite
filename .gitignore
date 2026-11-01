@@ -1,3 +1,8 @@
 /target
 /dist
 *.AppImage
+
+# kittest snapshot comparison output
+*.new.png
+*.diff.png
+*.old.png

@@ -2,13 +2,25 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use eframe::egui::{self, Align, DragValue, Id, Layout, RichText, TextEdit, Ui};
 use newskite_types::{ServerConfig, Settings};
 
 use super::app::Action;
+use super::appearance::Appearance;
 use super::theme::Palette;
-use super::widgets::{card, section_title};
+use super::widgets::{card, error_line, kit_button, notice, section_title, ButtonKind, Status};
+use crate::launch::expand_tilde;
+
+/// Server row ids are unique for the whole process, not per sheet: a server "Test" can
+/// outlive the sheet that started it (it runs up to the test timeout), and its late
+/// result must not land on a row of a sheet opened afterwards.
+static NEXT_ROW_ID: AtomicU64 = AtomicU64::new(0);
+
+fn new_row_id() -> u64 {
+    NEXT_ROW_ID.fetch_add(1, Ordering::Relaxed)
+}
 
 /// Which settings field a folder picker fills.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,9 +55,9 @@ pub struct SettingsDraft {
     /// Edited copy; discarded on Cancel.
     pub settings: Settings,
     /// Stable ids of server rows (parallel to `settings.servers`) so test results land
-    /// on the right row after rows are removed.
+    /// on the right row after rows are removed. Unique across sheets (see
+    /// [`NEXT_ROW_ID`]).
     pub row_ids: Vec<u64>,
-    next_row_id: u64,
     /// Test state per row id.
     pub tests: HashMap<u64, TestState>,
     /// Download folder as text.
@@ -54,21 +66,26 @@ pub struct SettingsDraft {
     pub watch_folder: String,
     /// Error from the last save attempt.
     pub save_error: Option<String>,
+    /// Settings › Appearance (applied on Save).
+    pub appearance: Appearance,
+    /// Why the stored settings could not be read, shown as a notice at the top.
+    pub load_error: Option<String>,
 }
 
 impl SettingsDraft {
     /// Starts editing a copy of `settings` (normalized: at least one server row).
     pub fn new(settings: Settings) -> Self {
         let settings = settings.normalized();
-        let n = settings.servers.len() as u64;
+        let row_ids = settings.servers.iter().map(|_| new_row_id()).collect();
         Self {
             download_dir: settings.download_dir.display().to_string(),
             watch_folder: settings.watch_folder.display().to_string(),
             settings,
-            row_ids: (0..n).collect(),
-            next_row_id: n,
+            row_ids,
             tests: HashMap::new(),
             save_error: None,
+            appearance: Appearance::default(),
+            load_error: None,
         }
     }
 
@@ -89,9 +106,11 @@ impl SettingsDraft {
         }
     }
 
-    /// Records a test result for a row (ignored if the row was removed).
+    /// Records a test result for a row. Ignored unless this sheet started a test on that
+    /// row that is still waiting (the row was removed, or the result belongs to a test
+    /// from a sheet that has since closed).
     pub fn set_test_result(&mut self, row_id: u64, result: Result<String, String>) {
-        if self.row_ids.contains(&row_id) {
+        if self.row_ids.contains(&row_id) && self.tests.get(&row_id) == Some(&TestState::Running) {
             self.tests.insert(row_id, TestState::Done(result));
         }
     }
@@ -99,8 +118,7 @@ impl SettingsDraft {
     /// Appends an empty server row.
     pub fn add_server(&mut self) {
         self.settings.servers.push(ServerConfig::default());
-        self.row_ids.push(self.next_row_id);
-        self.next_row_id += 1;
+        self.row_ids.push(new_row_id());
     }
 
     /// Removes a row; the last row is replaced by an empty disabled one so at least one
@@ -120,17 +138,38 @@ impl SettingsDraft {
         }
     }
 
-    /// The settings that Save would persist (folder texts applied, trimmed).
+    /// The settings that Save would persist (folder texts applied with `~` expanded,
+    /// trimmed, normalized).
     pub fn result(&self) -> Settings {
+        self.edited().normalized()
+    }
+
+    /// The edited settings before normalization: what [`validate`] checks, so a value
+    /// normalization would silently change is reported instead.
+    pub fn edited(&self) -> Settings {
+        let folder = |text: &str| {
+            let text = text.trim();
+            if text.is_empty() {
+                PathBuf::new()
+            } else {
+                expand_tilde(text)
+            }
+        };
         let mut s = self.settings.clone();
-        s.download_dir = PathBuf::from(self.download_dir.trim());
-        s.watch_folder = PathBuf::from(self.watch_folder.trim());
+        s.download_dir = folder(&self.download_dir);
+        s.watch_folder = folder(&self.watch_folder);
         for srv in &mut s.servers {
             srv.host = srv.host.trim().to_owned();
             srv.username = srv.username.trim().to_owned();
         }
-        s.normalized()
+        s
     }
+}
+
+/// Whether `host` looks like `name:port` (one colon). Bare IPv6 literals have several
+/// colons and are left alone; bracketed ones are written without the port.
+fn host_has_port(host: &str) -> bool {
+    host.matches(':').count() == 1 || (host.starts_with('[') && host.contains("]:"))
 }
 
 /// Validation problems that block saving (empty = valid).
@@ -149,6 +188,10 @@ pub fn validate(s: &Settings) -> Vec<String> {
             errs.push(format!(
                 "Server {n}: enter a bare host name (no scheme, path or spaces)."
             ));
+        } else if host_has_port(host) {
+            errs.push(format!(
+                "Server {n}: put the port in the Port field, not after the host name."
+            ));
         }
         if srv.enabled && host.is_empty() && s.servers.len() > 1 {
             errs.push(format!(
@@ -161,9 +204,13 @@ pub fn validate(s: &Settings) -> Vec<String> {
     }
     if s.download_dir.as_os_str().is_empty() {
         errs.push("Download folder is required.".to_owned());
+    } else if !s.download_dir.is_absolute() {
+        errs.push("Download folder must be a full path (starting with / or ~).".to_owned());
     }
     if s.watch_enabled && s.watch_folder.as_os_str().is_empty() {
         errs.push("Choose a watch folder or turn the watch folder off.".to_owned());
+    } else if !s.watch_folder.as_os_str().is_empty() && !s.watch_folder.is_absolute() {
+        errs.push("Watch folder must be a full path (starting with / or ~).".to_owned());
     }
     errs
 }
@@ -186,6 +233,19 @@ pub fn show(
                 ui.label(RichText::new("Settings").heading().strong().color(pal.text));
             });
             ui.add_space(6.0);
+            if let Some(e) = &draft.load_error {
+                notice(
+                    ui,
+                    pal,
+                    Status::Warn,
+                    "The stored settings could not be read.",
+                    &format!(
+                        "Defaults are shown below; saving replaces the stored settings and keeps \
+                         the unreadable document in the database as a backup. ({e})"
+                    ),
+                );
+                ui.add_space(8.0);
+            }
             egui::ScrollArea::vertical()
                 .max_height(max_h)
                 .min_scrolled_height(max_h)
@@ -200,16 +260,18 @@ pub fn show(
                     postprocess_section(ui, pal, &mut draft.settings);
                     ui.add_space(8.0);
                     automation_section(ui, pal, &mut draft.settings);
+                    ui.add_space(8.0);
+                    appearance_section(ui, pal, &mut draft.appearance);
                 });
 
+            let errors = validate(&draft.edited());
             let result = draft.result();
-            let errors = validate(&result);
             ui.add_space(8.0);
             for e in &errors {
-                ui.label(RichText::new(e).color(pal.negative));
+                error_line(ui, pal, e);
             }
             if let Some(e) = &draft.save_error {
-                ui.label(RichText::new(format!("Saving failed: {e}")).color(pal.negative));
+                error_line(ui, pal, &format!("Saving failed: {e}"));
             }
             ui.separator();
             ui.horizontal(|ui| {
@@ -221,14 +283,21 @@ pub fn show(
                     .color(pal.muted),
                 );
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let save = ui.add_enabled(
+                    // The sheet's one filled call to action.
+                    let save = kit_button(
+                        ui,
+                        pal,
+                        ButtonKind::Primary,
+                        None,
+                        "Save",
                         errors.is_empty(),
-                        egui::Button::new(RichText::new("Save").strong()),
                     );
-                    if save.clicked() {
+                    if save.clicked() && errors.is_empty() {
+                        // The app applies the sheet's appearance only once the save
+                        // succeeds, so a failed save changes nothing.
                         actions.push(Action::SaveSettings(Box::new(result)));
                     }
-                    if ui.button("Cancel").clicked() {
+                    if kit_button(ui, pal, ButtonKind::Outline, None, "Cancel", true).clicked() {
                         actions.push(Action::CloseSettings);
                     }
                 });
@@ -340,10 +409,6 @@ fn connection_section(
                     });
                 }
                 Some(TestState::Done(r)) => {
-                    let (text, color) = match r {
-                        Ok(t) => (t.as_str(), pal.text),
-                        Err(e) => (e.as_str(), pal.negative),
-                    };
                     egui::Frame::new()
                         .fill(pal.sunken)
                         .stroke(egui::Stroke::new(
@@ -358,7 +423,14 @@ fn connection_section(
                         .inner_margin(egui::Margin::same(6))
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
-                            ui.label(RichText::new(text).monospace().color(color));
+                            match r {
+                                Ok(t) => {
+                                    ui.label(RichText::new(t).monospace().color(pal.text));
+                                }
+                                Err(e) => {
+                                    error_line(ui, pal, e);
+                                }
+                            }
                         });
                 }
                 None => {}
@@ -527,12 +599,33 @@ fn automation_section(ui: &mut Ui, pal: &Palette, s: &mut Settings) {
                         .suffix(" s"),
                 );
                 ui.label(
-                    RichText::new("cancellable from the banner")
+                    RichText::new("cancelable from the banner")
                         .small()
                         .color(pal.muted),
                 );
             });
         });
+    });
+}
+
+fn appearance_section(ui: &mut Ui, pal: &Palette, appearance: &mut Appearance) {
+    section(ui, pal, "Appearance", |ui| {
+        ui.horizontal(|ui| {
+            ui.label("Theme");
+            ui.add_space(8.0);
+            for a in Appearance::ALL {
+                ui.radio_value(appearance, a, a.label());
+                ui.add_space(10.0);
+            }
+        });
+        ui.label(
+            RichText::new(
+                "Follow desktop uses your desktop color scheme and follows its changes. \
+                 The innerpulse themes are the studio's ink and paper grounds with the violet accent.",
+            )
+            .small()
+            .color(pal.muted),
+        );
     });
 }
 
@@ -548,22 +641,102 @@ mod tests {
         assert_eq!(d.settings.servers.len(), 1, "normalized to one row");
         d.add_server();
         d.add_server();
-        assert_eq!(d.row_ids, vec![0, 1, 2]);
-        d.tests.insert(1, TestState::Running);
+        let ids = d.row_ids.clone();
+        assert_eq!(ids.len(), 3);
+        assert!(ids.windows(2).all(|w| w[0] < w[1]), "distinct, increasing");
+        d.tests.insert(ids[1], TestState::Running);
         d.remove_server(1);
-        assert_eq!(d.row_ids, vec![0, 2]);
-        d.set_test_result(1, Ok("gone".into()));
+        assert_eq!(d.row_ids, vec![ids[0], ids[2]]);
+        d.set_test_result(ids[1], Ok("gone".into()));
         assert!(
-            !d.tests.contains_key(&1),
+            !d.tests.contains_key(&ids[1]),
             "result for a removed row is dropped"
         );
-        d.set_test_result(2, Ok("200 hi".into()));
-        assert_eq!(d.tests.get(&2), Some(&TestState::Done(Ok("200 hi".into()))));
+        d.set_test_result(ids[2], Ok("never asked".into()));
+        assert!(
+            !d.tests.contains_key(&ids[2]),
+            "no test was started on that row"
+        );
+        d.tests.insert(ids[2], TestState::Running);
+        d.set_test_result(ids[2], Ok("200 hi".into()));
+        assert_eq!(
+            d.tests.get(&ids[2]),
+            Some(&TestState::Done(Ok("200 hi".into())))
+        );
         d.remove_server(0);
         d.remove_server(0);
         assert_eq!(d.settings.servers.len(), 1, "never zero rows");
         assert!(!d.settings.servers[0].enabled);
         d.remove_server(99); // out of range is ignored
+    }
+
+    #[test]
+    fn a_late_test_result_never_lands_on_a_reopened_sheet() {
+        let mut first = SettingsDraft::new(Settings::default());
+        let row = first.row_ids[0];
+        first.tests.insert(row, TestState::Running);
+        drop(first); // Cancel while the test runs.
+        let mut second = SettingsDraft::new(Settings::default());
+        assert!(!second.row_ids.contains(&row), "row ids are not reused");
+        second.settings.servers[0].host = "b.example.net".into();
+        second.set_test_result(row, Err("connection timed out".into()));
+        assert!(second.tests.is_empty(), "{:?}", second.tests);
+    }
+
+    #[test]
+    fn host_with_port_relative_folders_and_zero_connections_are_rejected() {
+        let mut s = Settings {
+            download_dir: PathBuf::from("/tmp/dl"),
+            ..Default::default()
+        };
+        s.servers[0].host = "news.example.net:563".into();
+        assert!(
+            validate(&s).iter().any(|e| e.contains("Port field")),
+            "{:?}",
+            validate(&s)
+        );
+        for ok in ["news.example.net", "2001:db8::1", "::1", "10.0.0.1"] {
+            s.servers[0].host = ok.into();
+            assert!(validate(&s).is_empty(), "{ok}: {:?}", validate(&s));
+        }
+        s.servers[0].host = "[2001:db8::1]:563".into();
+        assert!(!validate(&s).is_empty());
+        s.servers[0].host = "news.example.net".into();
+
+        s.download_dir = PathBuf::from("Downloads/usenet");
+        assert!(validate(&s).iter().any(|e| e.contains("full path")));
+        s.download_dir = PathBuf::from("/tmp/dl");
+        s.watch_folder = PathBuf::from("nzbs");
+        assert!(validate(&s).iter().any(|e| e.contains("Watch folder")));
+        s.watch_folder = PathBuf::new();
+
+        // The sheet validates before normalizing, so 0 is reported rather than changed.
+        let mut d = SettingsDraft::new(s);
+        d.download_dir = "/tmp/dl".into();
+        d.settings.max_connections = 0;
+        assert!(validate(&d.edited())
+            .iter()
+            .any(|e| e.contains("Max connections")));
+        assert_eq!(
+            d.result().max_connections.max(1),
+            d.result().max_connections
+        );
+    }
+
+    #[test]
+    fn tilde_folders_expand_to_home() {
+        let Some(home) = crate::launch::home_dir() else {
+            return;
+        };
+        let mut d = SettingsDraft::new(Settings::default());
+        d.download_dir = " ~/Downloads/usenet ".into();
+        d.watch_folder = "~".into();
+        let r = d.result();
+        assert_eq!(r.download_dir, home.join("Downloads/usenet"));
+        assert_eq!(r.watch_folder, home);
+        assert!(validate(&d.edited())
+            .iter()
+            .all(|e| !e.contains("full path")));
     }
 
     #[test]

@@ -444,7 +444,8 @@ Ctrl-C → service shutdown (active job left resumable), exit 130.
 `main.rs`: `newskite --headless ...` → `newskite_cli::run_headless`; otherwise GUI, with any
 positional `*.nzb` paths/`file://`/`nzb://` URIs added to the queue on launch. GUI per
 outline §5–§7 in `src/gui/`. Theme tokens → egui `Visuals`; **no literal colors** outside
-`newskite-theme`.
+`newskite-theme`, except the innerpulse brand token sets in `gui/brand_tokens.rs` (converted
+only in `gui/theme.rs`).
 
 Implemented (additive): the crate is a library `newskite_app` plus the thin `newskite` binary,
 so the GUI can be driven headlessly in tests. **egui/eframe/egui_extras/egui_kittest 0.33.3**
@@ -465,3 +466,71 @@ while a run is active (`Ready` when idle — no persistent connection exists); t
 the last 24 h of stored samples (downsampled, dashed) and the live 10 min series (accent);
 NZB files dropped on the window are imported; desktop notification on `QueueIdle` (Linux/BSD,
 notify-rust) only when jobs finished since the last one.
+
+Branding (innerpulse kit; additive). `AppConfig` gained `appearance_file: Option<PathBuf>`
+(None = in memory only) and `reduced_motion: Option<bool>` (None = detect); construct it with
+`..AppConfig::default()`. New `Action`s: `OpenAbout`, `CloseAbout`, `OpenUrl(String)`,
+`SetAppearance(Appearance)`. New pub fields/items: `NewskiteApp::{appearance, reduced_motion,
+set_appearance, working_tempo}`, `Data::{articles_fetched, articles_missing,
+settings_load_error}`, `ViewState::{about_open, masthead_mark, about_mark}`,
+`SettingsDraft::{appearance, load_error}`, `Palette::{faint, backdrop, well, mark, action,
+action_hover, action_text, focus, fade}`. Modules: `gui::brand` (the six-bar mark: rest
+heights, `draw_in_heights`, `beat_heights` copied from `pulse.mjs`, `paint_mark` with
+whole-pixel bars, `MarkClock`), `gui::brand_tokens` (ink/paper `BrandSet`s, `EMBER`,
+`ink()`, `paper()`, `brand_set_of`), `gui::appearance` (`Appearance::{FollowDesktop, Ink,
+Paper}`, JSON at `<data dir>/appearance.json`, `{"theme":"follow-desktop"|"innerpulse-ink"|
+"innerpulse-paper"}`; Settings belongs to newskite-types, so the choice is a GUI-only file;
+missing/unreadable = follow desktop, the default per F10; applied on Save), `gui::motion`
+(reduced motion: `NEWSKITE_REDUCED_MOTION=1|0` overrides, else kdeglobals `[KDE]
+AnimationDurationFactor` 0 = reduced; re-read every 5 s), `gui::icons` (kit UI icons from
+`assets/brand/kit/ui-icons/` plus Back/Home/List/Newsgroups/Open NZB/folder/key/chevron-up
+drawn in the kit grammar, all rasterized by the `egui_extras` svg loader at the target's
+physical size and tinted; the product wordmark cropped to its glyph box), `gui::fonts`
+(Instrument Sans 400/600 and JetBrains Mono 400/600 static instances embedded from
+`assets/brand/fonts/static/`, SIL OFL 1.1 in `assets/brand/fonts/OFL.txt`; egui's defaults
+stay as fallbacks; `ui()` skips a frame until the families are live), `gui::about`.
+Behavior: the masthead mark draws in once on start and beats only while working (1.2 s while
+bytes move, 2.4 s while a job is active without traffic; a started pass always finishes);
+the About mark (64 px) draws in then beats every 4.5 s; under reduced motion both rest.
+Repaints for motion are requested only while a mark moves (25 ms frames; between passes a
+single wake-up for the next one). Ember appears only as the mark, focus rings and the one
+filled button per view (Queue › Start, Settings › Save; a disabled primary drops to the
+outline). Status is an outlined chip with the kit glyph and words (job states: queued idle,
+downloading live in the accent, done ok, failed err, paused warn). Progress is a segment track
+(≤ 40 near-square cells, each an equal slice of the job). NNTP Activity shows `Articles` (count
+of `SegmentDone` this session) and `Missing` (sum of `FileFailed.missing`). The window icon is
+`assets/brand/app-icon-256.png`. If `Service::open` fails because another process holds the
+data directory lock, the binary shows a native "Newskite is already open" message naming the
+NZB arguments that were not queued and exits 1 (no hand-off to the running window yet).
+
+Review fixes (additive). The "already open" and fatal start-up messages are drawn in a small
+eframe window of the app's own (rfd's message dialog needs `zenity`, which KDE does not
+install); only when no window can open (eframe itself failed) is `kdialog` or `zenity` tried,
+and the .deb recommends `zenity | kdialog` for that case. The app icon is the stock innerpulse
+app icon at every size (`packaging/icons/make-icons.mjs` installs the kit's renders; no accent
+in the icon). The .deb and AppImage install `fonts-OFL.txt` and a DEP-5
+`packaging/debian/copyright`. New pub items: `launch::{percent_decode_bytes, home_dir,
+expand_tilde, path_from_text}`; `UiMsg::{NzbImported, WatchScanned}` (NZB imports and manual
+watch scans run on `spawn_blocking`, never in the frame); `OpenNzbState::importing`;
+`NewskiteApp::{last_notice, reload_history}`; `gui::events::{Pending, SegmentTally,
+SharedPending}` (the forwarder folds `SegmentDone` per job and stamps `Throughput` on arrival,
+so a stalled UI thread never grows a queue); `statusbar::{Pill::Pausing, short_cause}` (pause is
+cooperative: the pill keeps the speed until the run stops; the error chip shows the elided
+cause); `widgets::error_line` (every error line carries the err glyph); `Palette::{chart,
+series}` and `brand_tokens::{CHART_LIGHT, CHART_DARK, chart_set, CHART_SERIES_SLOT}` (the live
+series is chart-3 on the brand themes, the desktop accent otherwise);
+`sidebar::{LABEL_SLOTS, slot_name, label_color}` (bookmark swatches are chart slots stored as
+`chart-N`, drawn as squares; typed hex still works); `docks::{history_buckets,
+grid_card_height}`; `queue::table_widths`; `SettingsDraft::edited`. Behavior: the history trace
+is 160 nine-minute buckets of the last 24 h (idle time at zero), re-read every minute and after
+each run; the empty queue's article grid shows unlit wells only; dock cards have exact heights
+and scroll inside; the queue table shrinks Name/Progress to fit and scrolls sideways only below
+its minimum; settings row ids are unique per process and test results apply only to a row
+waiting on one; Save applies the appearance only when the settings save succeeds; validation
+rejects `host:port`, relative folders, and runs before normalization; `~` is expanded in the
+folders and the Open NZB field, which also accepts pasted `file://` URIs. Engine: per-article
+"bad article" log lines (undecodable, foreign, invalid id) are capped at 5 per job plus one
+summary line. Theme: with the portal in use, `ThemeWatcher` re-resolves on a helper thread and
+keeps a portal theme through up to two unanswered refreshes. GUI snapshot tests compare against
+the PNGs in `tests/snapshots/` (kittest, threshold 0.6, a small pixel allowance for clock
+text); `UPDATE_SNAPSHOTS=1` rewrites them, and failures leave `*.new.png`/`*.diff.png` (ignored by git).

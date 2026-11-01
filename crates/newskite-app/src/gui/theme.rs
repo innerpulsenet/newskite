@@ -1,8 +1,9 @@
 //! Desktop color tokens → egui visuals.
 //!
-//! This is the **only** module of the GUI that turns color values into [`Color32`]s.
-//! Every other module receives a [`Palette`] (all derived from [`Tokens`]) and must
-//! not construct colors itself; a unit test enforces that.
+//! This is the **only** module of the GUI that turns color values into [`Color32`]s
+//! (the brand's literal token values live beside it in [`super::brand_tokens`]). Every
+//! other module receives a [`Palette`] (all derived from [`Tokens`] and the brand's ember
+//! constants) and must not construct colors itself; a unit test enforces that.
 
 use std::str::FromStr;
 
@@ -11,6 +12,9 @@ use eframe::egui::{
     FontFamily, FontId, Shadow, Stroke, TextStyle, Visuals,
 };
 use newskite_theme::{Rgb, Theme, Tokens};
+
+use super::brand_tokens::{brand_set_of, chart_set, CHART_SERIES_SLOT, EMBER};
+use super::fonts;
 
 /// Converts a token color to an opaque egui color.
 pub fn to_color32(c: Rgb) -> Color32 {
@@ -64,6 +68,8 @@ pub struct Palette {
     pub text: Color32,
     /// Secondary text.
     pub muted: Color32,
+    /// Tertiary text (captions, disabled icons); the brand's text-3 on its own themes.
+    pub faint: Color32,
     /// Accent (selection, live series, primary actions).
     pub accent: Color32,
     /// Text drawn on top of `accent`.
@@ -92,8 +98,28 @@ pub struct Palette {
     pub negative_soft: Color32,
     /// Window shadow.
     pub shadow: Color32,
+    /// Modal backdrop.
+    pub backdrop: Color32,
+    /// An empty cell of a segment track or the article grid: a quiet accent-tinted well.
+    pub well: Color32,
+    /// The innerpulse mark: ember on dark grounds, the deep ember on light ones.
+    pub mark: Color32,
+    /// Fill of the one filled call to action per view (the same in every theme).
+    pub action: Color32,
+    /// Its hover / pressed fill.
+    pub action_hover: Color32,
+    /// Text on the action fill.
+    pub action_text: Color32,
+    /// Ember as a small signal: focus rings.
+    pub focus: Color32,
     /// Fully transparent (for "no fill").
     pub transparent: Color32,
+    /// The kit's categorical chart slots 1–7 for this ground (series and user labels;
+    /// never status).
+    pub chart: [Color32; 7],
+    /// The single live series of the throughput graph: the family accent at its chart
+    /// step on the brand themes, the desktop accent otherwise.
+    pub series: Color32,
 }
 
 impl Palette {
@@ -105,6 +131,7 @@ impl Palette {
         // darker of text/surface keeps them derived from tokens in both schemes.
         let shadow_base = if dark { t.surface_sunken } else { t.text };
         let shadow_alpha: u8 = if dark { 150 } else { 50 };
+        let backdrop_alpha: u8 = if dark { 153 } else { 110 };
         Self {
             dark,
             surface: to_color32(t.surface),
@@ -112,6 +139,7 @@ impl Palette {
             sunken: to_color32(t.surface_sunken),
             text: to_color32(t.text),
             muted: to_color32(t.text_muted),
+            faint: to_color32(t.text_muted.mix(t.surface, 0.22)),
             accent: to_color32(t.accent),
             accent_text: to_color32(t.accent_text),
             accent_fg: to_color32(accent_fg),
@@ -131,13 +159,46 @@ impl Palette {
                 shadow_base.b,
                 shadow_alpha,
             ),
+            backdrop: Color32::from_rgba_unmultiplied(
+                shadow_base.r,
+                shadow_base.g,
+                shadow_base.b,
+                backdrop_alpha,
+            ),
+            well: to_color32(t.surface.mix(t.accent, if dark { 0.2 } else { 0.16 })),
+            mark: to_color32(if dark {
+                EMBER.mark_on_dark
+            } else {
+                EMBER.mark_on_light
+            }),
+            action: to_color32(EMBER.action),
+            action_hover: to_color32(EMBER.action_hover),
+            action_text: to_color32(EMBER.action_text),
+            focus: to_color32(if dark {
+                EMBER.pulse_on_dark
+            } else {
+                EMBER.pulse_on_light
+            }),
             transparent: Color32::TRANSPARENT,
+            chart: chart_set(dark).map(to_color32),
+            series: to_color32(t.accent),
         }
     }
 
-    /// The palette of a resolved theme.
+    /// The palette of a resolved theme. The two brand themes take their exact tertiary
+    /// text step from the kit; desktop themes derive it.
     pub fn from_theme(theme: &Theme) -> Self {
-        Self::from_tokens(&theme.tokens, theme.dark)
+        let mut p = Self::from_tokens(&theme.tokens, theme.dark);
+        if let Some(set) = brand_set_of(theme) {
+            p.faint = to_color32(set.text_3);
+            p.series = p.chart[CHART_SERIES_SLOT - 1];
+        }
+        p
+    }
+
+    /// `color` at `alpha` (0…1) of its opacity, for disabled and pressed states.
+    pub fn fade(color: Color32, alpha: f32) -> Color32 {
+        color.gamma_multiply(alpha.clamp(0.0, 1.0))
     }
 }
 
@@ -150,7 +211,8 @@ pub fn visuals(t: &Tokens, dark: bool) -> Visuals {
     } else {
         Visuals::light()
     };
-    let radius = CornerRadius::same(5);
+    // The kit's one radius is 4 px; cards and dialogs take twice that.
+    let radius = CornerRadius::same(4);
 
     v.dark_mode = dark;
     v.override_text_color = None;
@@ -166,14 +228,10 @@ pub fn visuals(t: &Tokens, dark: bool) -> Visuals {
     v.panel_fill = p.surface;
     v.window_fill = p.raised;
     v.window_stroke = Stroke::new(1.0, p.border);
-    v.window_corner_radius = CornerRadius::same(10);
-    v.menu_corner_radius = CornerRadius::same(7);
-    v.window_shadow = Shadow {
-        offset: [0, 8],
-        blur: 24,
-        spread: 0,
-        color: p.shadow,
-    };
+    v.window_corner_radius = CornerRadius::same(8);
+    v.menu_corner_radius = CornerRadius::same(6);
+    // Dialogs: surface 1 and a hairline, no shadow (the backdrop separates them).
+    v.window_shadow = Shadow::NONE;
     v.popup_shadow = Shadow {
         offset: [0, 4],
         blur: 12,
@@ -245,6 +303,7 @@ pub fn visuals(t: &Tokens, dark: bool) -> Visuals {
 
 /// Applies a theme to the context (both egui theme slots, so OS light/dark flips in
 /// egui never swap in a non-token palette) and returns the matching [`Palette`].
+/// Fonts are installed separately ([`fonts::install`]).
 pub fn apply(ctx: &egui::Context, theme: &Theme) -> Palette {
     let vis = visuals(&theme.tokens, theme.dark);
     for slot in [egui::Theme::Dark, egui::Theme::Light] {
@@ -259,25 +318,23 @@ pub fn apply(ctx: &egui::Context, theme: &Theme) -> Palette {
     Palette::from_theme(theme)
 }
 
-/// Spacing and type scale shared by both schemes.
+/// Spacing and type scale shared by both schemes: Instrument Sans 13.5 px body,
+/// headings in its 600 weight, JetBrains Mono for monospace; nothing below 11 px.
 fn tune_style(style: &mut egui::Style) {
     style.spacing.item_spacing = egui::vec2(8.0, 6.0);
-    style.spacing.button_padding = egui::vec2(8.0, 4.0);
+    style.spacing.button_padding = egui::vec2(10.0, 4.0);
     style.spacing.interact_size.y = 24.0;
-    style.spacing.window_margin = egui::Margin::same(14);
+    style.spacing.window_margin = egui::Margin::same(16);
     style.text_styles = [
-        (
-            TextStyle::Heading,
-            FontId::new(16.0, FontFamily::Proportional),
-        ),
-        (TextStyle::Body, FontId::new(13.0, FontFamily::Proportional)),
+        (TextStyle::Heading, fonts::semibold_id(17.0)),
+        (TextStyle::Body, FontId::new(13.5, FontFamily::Proportional)),
         (
             TextStyle::Button,
             FontId::new(13.0, FontFamily::Proportional),
         ),
         (
             TextStyle::Small,
-            FontId::new(11.0, FontFamily::Proportional),
+            FontId::new(11.5, FontFamily::Proportional),
         ),
         (
             TextStyle::Monospace,
@@ -398,7 +455,8 @@ mod tests {
         assert_eq!(parse_user_color("not a color"), None);
     }
 
-    /// F10 / acceptance: no literal colors in UI code outside this module.
+    /// F10 / acceptance: no literal colors in UI code outside this module and the brand
+    /// token file.
     #[test]
     fn no_literal_colors_outside_theme_module() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/gui");
@@ -435,7 +493,11 @@ mod tests {
             if path.extension().and_then(|e| e.to_str()) != Some("rs") {
                 continue;
             }
-            if path.file_name().and_then(|n| n.to_str()) == Some("theme.rs") {
+            // The two places allowed to hold or convert literal colors.
+            if matches!(
+                path.file_name().and_then(|n| n.to_str()),
+                Some("theme.rs" | "brand_tokens.rs")
+            ) {
                 continue;
             }
             let src = std::fs::read_to_string(&path).expect("readable source");

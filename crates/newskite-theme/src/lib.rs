@@ -332,9 +332,15 @@ pub(crate) struct Sources {
 }
 
 pub(crate) fn resolve_from(src: &Sources) -> Theme {
+    resolve_detailed(src).0
+}
+
+/// [`resolve_from`], also saying whether the portal was asked and gave no answer (absent,
+/// slow or empty), so a watcher can keep an earlier portal theme through a late reply.
+pub(crate) fn resolve_detailed(src: &Sources) -> (Theme, bool) {
     if let Some(path) = &src.kdeglobals {
         match from_kdeglobals_path(path) {
-            Ok(Some(theme)) => return theme,
+            Ok(Some(theme)) => return (theme, false),
             Ok(None) => {}
             Err(e) => tracing::warn!("ignoring kdeglobals: {e}"),
         }
@@ -342,10 +348,11 @@ pub(crate) fn resolve_from(src: &Sources) -> Theme {
     let hint = src.prefers_dark.unwrap_or(false);
     if src.portal {
         if let Some(app) = portal::query().filter(|a| !a.is_empty()) {
-            return theme_from_portal(app, hint);
+            return (theme_from_portal(app, hint), false);
         }
+        return (fallback(hint), true);
     }
-    fallback(hint)
+    (fallback(hint), false)
 }
 
 fn theme_from_portal(app: portal::Appearance, hint: bool) -> Theme {

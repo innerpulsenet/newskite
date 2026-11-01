@@ -28,6 +28,10 @@ const QUIT_TIMEOUT: Duration = Duration::from_secs(2);
 const MISSING_PREVIEW: usize = 3;
 /// Individual fail-over log lines per job before going quiet.
 const FAILOVER_LOG_LIMIT: usize = 5;
+/// Individual "bad article" log lines (undecodable, foreign or invalid ids) per job before
+/// going quiet; a summary line follows at the end of the run (outline §6.3: one line per
+/// meaningful event, never one per segment).
+const BAD_ARTICLE_LOG_LIMIT: usize = 5;
 /// Upper bound when searching for a free `"name (n).ext"`.
 const MAX_NAME_SUFFIX: u32 = 10_000;
 /// Allowance for a segment whose NZB entry declares no `bytes`.
@@ -158,6 +162,9 @@ struct Shared {
     fatal: Mutex<Option<EngineError>>,
     bytes_written: AtomicU64,
     failovers: AtomicUsize,
+    /// Articles rejected as damaged, foreign or with an invalid id (see
+    /// [`BAD_ARTICLE_LOG_LIMIT`]).
+    bad_articles: AtomicUsize,
 }
 
 impl Shared {
@@ -170,6 +177,17 @@ impl Shared {
         let line = line.into();
         tracing::info!(target: "newskite_engine", "{line}");
         self.emit(EngineEvent::Log(line));
+    }
+
+    /// Logs a per-article problem, but only the first [`BAD_ARTICLE_LOG_LIMIT`] of a run;
+    /// the rest go to tracing only and are summarized by [`finish`].
+    fn log_bad_article(&self, line: &str) {
+        let n = self.bad_articles.fetch_add(1, Ordering::Relaxed);
+        if n < BAD_ARTICLE_LOG_LIMIT {
+            self.log(line);
+        } else {
+            tracing::debug!(target: "newskite_engine", "{line}");
+        }
     }
 
     /// Records the first fatal error and stops every worker.
@@ -352,6 +370,7 @@ pub(crate) async fn run(
         fatal: Mutex::new(None),
         bytes_written: AtomicU64::new(0),
         failovers: AtomicUsize::new(0),
+        bad_articles: AtomicUsize::new(0),
     });
 
     let fallback = match shared.servers.len() {
@@ -407,6 +426,7 @@ fn finish(shared: &Shared, cancel: &CancellationToken) -> Result<JobReport, Engi
     if failovers > FAILOVER_LOG_LIMIT {
         shared.log(format!("{failovers} article(s) were fetched from fallback servers"));
     }
+    log_bad_article_summary(shared);
     if !missing.is_empty() {
         shared.log(format!("Download incomplete: {} missing article(s)", missing.len()));
         return Err(EngineError::MissingArticles { ids: missing });
@@ -414,6 +434,16 @@ fn finish(shared: &Shared, cancel: &CancellationToken) -> Result<JobReport, Engi
     let bytes_written = shared.bytes_written.load(Ordering::SeqCst);
     shared.log(format!("Download complete: {} file(s), {} written", reports.len(), format::bytes(bytes_written)));
     Ok(JobReport { files: reports, bytes_written })
+}
+
+/// The end-of-run line for bad articles beyond the individually logged ones.
+fn log_bad_article_summary(shared: &Shared) {
+    let bad = shared.bad_articles.load(Ordering::Relaxed);
+    if bad > BAD_ARTICLE_LOG_LIMIT {
+        shared.log(format!(
+            "{bad} article fetch(es) were rejected as damaged, foreign or invalid (first {BAD_ARTICLE_LOG_LIMIT} listed above)"
+        ));
+    }
 }
 
 fn skipped_report(shared: &Shared, file: &FileJob) -> FileReport {
@@ -597,7 +627,7 @@ async fn process_segment(shared: &Arc<Shared>, held: &mut Option<Held>, fi: usiz
                             "{}: article <{}> from {} {why}",
                             file.label, seg.message_id, shared.servers[server].address
                         );
-                        shared.log(msg.clone());
+                        shared.log_bad_article(&msg);
                         reason = Some(msg);
                         tried[server] = true;
                         failover = true;
@@ -627,7 +657,7 @@ async fn process_segment(shared: &Arc<Shared>, held: &mut Option<Held>, fi: usiz
             }
             Err(NntpError::InvalidMessageId(id)) => {
                 let msg = format!("{}: invalid message id {id:?}", file.label);
-                shared.log(msg.clone());
+                shared.log_bad_article(&msg);
                 return record_missing(shared, fi, si, Some(msg)).await;
             }
             Err(err) => {
@@ -1022,6 +1052,7 @@ mod tests {
             fatal: Mutex::new(None),
             bytes_written: AtomicU64::new(0),
             failovers: AtomicUsize::new(0),
+            bad_articles: AtomicUsize::new(0),
         };
         let ids: Vec<String> = (1..=5).map(|i| format!("id{i}@x")).collect();
         fail_file(&shared, "f.bin", &ids);
@@ -1030,6 +1061,43 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         }
         assert_eq!(rx.try_recv().unwrap(), EngineEvent::FileFailed { name: "f.bin".into(), missing: ids });
+    }
+
+    #[test]
+    fn bad_article_lines_are_capped_and_summarized() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let shared = Shared {
+            dest_dir: PathBuf::from("."),
+            servers: Vec::new(),
+            released: Notify::new(),
+            files: Vec::new(),
+            queue: Mutex::new(VecDeque::new()),
+            claimed: Mutex::new(HashSet::new()),
+            skip_files: HashSet::new(),
+            retries: 0,
+            connect_timeout: Duration::from_secs(1),
+            limiter: None,
+            events: tx,
+            progress: Arc::new(Progress::new()),
+            abort: CancellationToken::new(),
+            fatal: Mutex::new(None),
+            bytes_written: AtomicU64::new(0),
+            failovers: AtomicUsize::new(0),
+            bad_articles: AtomicUsize::new(0),
+        };
+        for i in 0..60 {
+            shared.log_bad_article(&format!("f.bin: article <{i}@x> could not be decoded"));
+        }
+        log_bad_article_summary(&shared);
+        let mut lines = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let EngineEvent::Log(l) = ev {
+                lines.push(l);
+            }
+        }
+        assert_eq!(lines.len(), BAD_ARTICLE_LOG_LIMIT + 1, "{lines:?}");
+        assert!(lines[0].contains("<0@x>"));
+        assert!(lines.last().is_some_and(|l| l.starts_with("60 article fetch(es) were rejected")));
     }
 
     #[test]
@@ -1058,6 +1126,7 @@ mod tests {
             fatal: Mutex::new(None),
             bytes_written: AtomicU64::new(0),
             failovers: AtomicUsize::new(0),
+            bad_articles: AtomicUsize::new(0),
         };
         assert_eq!(shared.order(&[false, false, false], 0), vec![0, 1, 2]);
         assert_eq!(shared.order(&[false, false, false], 2), vec![2, 0, 1]);
