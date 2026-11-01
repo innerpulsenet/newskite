@@ -167,13 +167,17 @@ async fn pipelined_bodies_arrive_in_order() {
     assert!(!conn.is_broken());
 
     conn.begin_body("one@x").await.unwrap();
-    assert!(matches!(conn.send_body("x@y").await, Err(NntpError::Protocol(_))), "no send inside a body");
+    // A request may go out while the current body block is still being read.
+    conn.send_body("one@x").await.unwrap();
+    assert_eq!(conn.outstanding_bodies(), 4);
     assert_eq!(conn.finish_body().await.unwrap(), b"first\r\n");
     assert!(matches!(conn.begin_body("gone@x").await, Err(NntpError::ArticleMissing(id)) if id == "gone@x"));
     conn.begin_body("big@x").await.unwrap();
     assert_eq!(conn.finish_body().await.unwrap(), big_body);
     conn.begin_body("three@x").await.unwrap();
     assert_eq!(conn.finish_body().await.unwrap(), b".dot\r\n");
+    conn.begin_body("one@x").await.unwrap();
+    assert_eq!(conn.finish_body().await.unwrap(), b"first\r\n");
     assert_eq!(conn.outstanding_bodies(), 0);
     assert!(matches!(conn.begin_body("one@x").await, Err(NntpError::Protocol(_))));
     assert!(matches!(conn.finish_body().await, Err(NntpError::Protocol(_))));
