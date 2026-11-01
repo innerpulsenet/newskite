@@ -660,3 +660,27 @@ fn cleanup_removes_sidecars_but_keeps_unarchived_payload() {
     assert_eq!(left, vec!["Release".to_string(), "sample.mkv".to_string()], "{logs:#?}");
     assert!(logs.iter().any(|l| l.contains("kept 1 other file")), "{logs:#?}");
 }
+
+#[test]
+fn obfuscated_target_in_subfolder_is_renamed_into_it() {
+    // Releases often carry Sample/<name>-sample.mkv in the PAR2 set. par2cmdline does not
+    // create the folder, so the rename failed with an I/O error and aborted the others.
+    let tools = detect_tools();
+    require!(tools, par2);
+    let _guard = par2_guard();
+    let f = fixture();
+    let main = pseudo_random(200_000, 51);
+    let sample = pseudo_random(60_000, 52);
+    fs::create_dir(f.dl.join("Sample")).unwrap();
+    fs::write(f.dl.join("main.bin"), &main).unwrap();
+    fs::write(f.dl.join("Sample").join("s.mkv"), &sample).unwrap();
+    par2_create(&tools, &f.dl, "set.par2", &["main.bin", &Path::new("Sample").join("s.mkv").to_string_lossy()]);
+    fs::rename(f.dl.join("main.bin"), f.dl.join("obfA")).unwrap();
+    fs::rename(f.dl.join("Sample").join("s.mkv"), f.dl.join("obfB")).unwrap();
+    fs::remove_dir(f.dl.join("Sample")).unwrap();
+
+    let (r, logs) = run(&f.dl, "job", &PostOptions::default(), &tools);
+    assert_eq!(r.par2, Verdict::Repaired, "{logs:#?}");
+    assert_eq!(fs::read(f.dl.join("main.bin")).unwrap(), main);
+    assert_eq!(fs::read(f.dl.join("Sample").join("s.mkv")).unwrap(), sample);
+}
