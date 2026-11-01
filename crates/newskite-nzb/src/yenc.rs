@@ -120,6 +120,8 @@ impl Header {
     }
 }
 
+/// Whether `line` is a `keyword` header line: the keyword followed by whitespace or the
+/// end. The slice may extend past the line (a line break counts as whitespace).
 fn is_keyword_line(line: &[u8], keyword: &[u8]) -> bool {
     line.starts_with(keyword)
         && line
@@ -133,15 +135,12 @@ fn is_keyword_line(line: &[u8], keyword: &[u8]) -> bool {
 /// before the `=ybegin` line is ignored. Articles with `part=` (or a `=ypart` line) are
 /// multipart and use the `=ypart begin/end` range; otherwise `begin = 1` and `end = size`.
 /// A missing `=yend` line is tolerated (the remaining lines are data, no CRC is checked).
+///
+/// The data lines are decoded in a single pass over the byte slice: runs of plain bytes are
+/// shifted in bulk and only the escape and line-break bytes are handled one at a time.
 pub fn decode(article_body: &[u8]) -> Result<YencPart, YencError> {
-    let mut lines = article_body
-        .split(|&b| b == b'\n')
-        .map(|l| l.strip_suffix(b"\r").unwrap_or(l));
-
-    let begin_line = lines
-        .by_ref()
-        .find(|l| is_keyword_line(l, b"=ybegin"))
-        .ok_or(YencError::NoHeader)?;
+    let begin_at = find_keyword_line(article_body, 0, b"=ybegin").ok_or(YencError::NoHeader)?;
+    let (begin_line, mut pos) = take_line(article_body, begin_at);
     let ybegin = Header::parse(begin_line, "=ybegin");
     let size: u64 = ybegin
         .num("=ybegin", "size")?
@@ -150,15 +149,14 @@ pub fn decode(article_body: &[u8]) -> Result<YencPart, YencError> {
     let total: Option<u32> = ybegin.num("=ybegin", "total")?;
     let name = ybegin.name.clone().unwrap_or_default();
 
-    let mut lines = lines.peekable();
-    let ypart = match lines.peek() {
-        Some(l) if is_keyword_line(l, b"=ypart") => {
-            let h = Header::parse(l, "=ypart");
-            lines.next();
-            Some(h)
+    let mut ypart = None;
+    {
+        let (line, next) = take_line(article_body, pos);
+        if is_keyword_line(line, b"=ypart") {
+            ypart = Some(Header::parse(line, "=ypart"));
+            pos = next;
         }
-        _ => None,
-    };
+    }
 
     let (begin, end) = match (&ypart, part) {
         (Some(h), _) => {
@@ -183,19 +181,18 @@ pub fn decode(article_body: &[u8]) -> Result<YencPart, YencError> {
     // `end + 1 - begin` cannot underflow: begin >= 1 and end >= begin - 1 in both branches.
     let expected = end + 1 - begin;
 
+    // The data region runs to the `=yend` line (or to the end of the body without one).
+    let (data_end, yend) = match find_keyword_line(article_body, pos, b"=yend") {
+        Some(at) => (at, Some(Header::parse(take_line(article_body, at).0, "=yend"))),
+        None => (article_body.len(), None),
+    };
+
     // Never trust the header for allocation size beyond what the body could possibly hold.
     let cap = usize::try_from(expected)
         .unwrap_or(usize::MAX)
-        .min(article_body.len());
+        .min(data_end - pos);
     let mut data = Vec::with_capacity(cap);
-    let mut yend: Option<Header> = None;
-    for line in lines {
-        if is_keyword_line(line, b"=yend") {
-            yend = Some(Header::parse(line, "=yend"));
-            break;
-        }
-        decode_into(line, &mut data);
-    }
+    decode_into(&article_body[pos..data_end], &mut data);
 
     let got = data.len() as u64;
     if got != expected {
@@ -230,18 +227,56 @@ pub fn decode(article_body: &[u8]) -> Result<YencPart, YencError> {
     })
 }
 
-/// Decodes one line of yEnc data (no line terminators expected; stray CRs are dropped).
-/// A dangling `=` at the end of the line is ignored.
-fn decode_into(line: &[u8], out: &mut Vec<u8>) {
-    let mut iter = line.iter().copied();
-    while let Some(b) = iter.next() {
-        match b {
-            b'\r' | b'\n' => {}
-            b'=' => match iter.next() {
-                Some(e) => out.push(e.wrapping_sub(64).wrapping_sub(42)),
-                None => break,
-            },
-            _ => out.push(b.wrapping_sub(42)),
+/// The line starting at `at` (without its line ending) and the offset of the next line.
+fn take_line(body: &[u8], at: usize) -> (&[u8], usize) {
+    let rest = &body[at.min(body.len())..];
+    match memchr::memchr(b'\n', rest) {
+        Some(n) => (rest[..n].strip_suffix(b"\r").unwrap_or(&rest[..n]), at + n + 1),
+        None => (rest.strip_suffix(b"\r").unwrap_or(rest), body.len()),
+    }
+}
+
+/// Offset of the first line at or after `from` that starts with `keyword` followed by
+/// whitespace or the line end.
+///
+/// yEnc header lines all start with `=y`, a pair that cannot occur inside data (an escaped
+/// `y` would stand for byte 15, whose encoding `9` is never escaped), so the body is
+/// searched for `=y` at a line start instead of being split into lines.
+fn find_keyword_line(body: &[u8], from: usize, keyword: &[u8]) -> Option<usize> {
+    let finder = memchr::memmem::Finder::new(b"=y");
+    let mut at = from;
+    while at < body.len() {
+        let rel = finder.find(&body[at..])?;
+        let p = at + rel;
+        if (p == 0 || body[p - 1] == b'\n') && is_keyword_line(&body[p..], keyword) {
+            return Some(p);
+        }
+        at = p + 2;
+    }
+    None
+}
+
+/// Decodes yEnc data lines into `out`, in one pass over the bytes. CR and LF are dropped,
+/// `=` escapes the next byte and an escape never spans a line break: a dangling `=` at the
+/// end of a line is ignored.
+fn decode_into(mut encoded: &[u8], out: &mut Vec<u8>) {
+    loop {
+        // Plain bytes up to the next escape or line break are shifted as one run.
+        let (run, special) = match memchr::memchr3(b'=', b'\r', b'\n', encoded) {
+            Some(k) => (&encoded[..k], Some(encoded[k])),
+            None => (encoded, None),
+        };
+        out.extend(run.iter().map(|b| b.wrapping_sub(42)));
+        let Some(special) = special else { break };
+        encoded = &encoded[run.len() + 1..];
+        if special == b'=' {
+            match encoded.first() {
+                Some(&e) if e != b'\r' && e != b'\n' => {
+                    out.push(e.wrapping_sub(64).wrapping_sub(42));
+                    encoded = &encoded[1..];
+                }
+                _ => {}
+            }
         }
     }
 }
@@ -250,9 +285,7 @@ fn decode_into(line: &[u8], out: &mut Vec<u8>) {
 /// and an escape never spans a line break.
 pub fn decode_data(encoded: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(encoded.len());
-    for line in encoded.split(|&b| b == b'\n') {
-        decode_into(line, &mut out);
-    }
+    decode_into(encoded, &mut out);
     out
 }
 
@@ -367,6 +400,26 @@ mod tests {
         let h = Header::parse(b"=yend size=1 pcrc32=0xABCD crc32=zz", "=yend");
         assert_eq!(h.crc("pcrc32"), Some(0xabcd));
         assert_eq!(h.crc("crc32"), None);
+    }
+
+    #[test]
+    fn keyword_lines_are_found_only_at_line_starts() {
+        let body = b"junk =yend\r\n=ybegin size=3 name=a\r\nab=yc\r\n=yendx\r\n=yend size=3\r\n";
+        assert_eq!(find_keyword_line(body, 0, b"=ybegin"), Some(12));
+        assert_eq!(find_keyword_line(body, 0, b"=yend"), Some(50));
+        assert_eq!(find_keyword_line(body, 51, b"=yend"), None);
+        assert_eq!(find_keyword_line(b"=yend", 0, b"=yend"), Some(0));
+        assert_eq!(take_line(body, 12), (&b"=ybegin size=3 name=a"[..], 35));
+        assert_eq!(take_line(b"last", 0), (&b"last"[..], 4));
+    }
+
+    #[test]
+    fn dangling_escape_and_bare_cr_are_ignored() {
+        assert_eq!(decode_data(b"*=\r\n*"), vec![0, 0]);
+        assert_eq!(decode_data(b"*=\n*"), vec![0, 0]);
+        assert_eq!(decode_data(b"*\r*"), vec![0, 0]);
+        assert_eq!(decode_data(b"="), Vec::<u8>::new());
+        assert_eq!(decode_data(b""), Vec::<u8>::new());
     }
 
     #[test]
