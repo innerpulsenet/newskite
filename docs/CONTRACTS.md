@@ -588,3 +588,15 @@ Warnings / Errors filter); three across from 900 px, one scrolling column below.
 bar: free space on the download folder's filesystem (`gui::disk::free_bytes`, statvfs via
 rustix; warning color below 2 GiB or below what the queue still needs) and the lifetime
 total at the left, the state pill and credit at the right.
+
+Drag and drop and cell motif (follow-up). winit 0.30's Wayland backend delivers no file
+drag and drop, so on a Wayland session with `DISPLAY` set the GUI event loop uses winit's
+X11 backend (XWayland; WM_CLASS keeps the app id); `NEWSKITE_WAYLAND=1` keeps native
+Wayland. Drops and Ctrl+V of copied files (no text field focused; `file://` URIs or paths,
+one per line) go through `app::expand_drop`: `.nzb` files (any case) are imported, a folder
+adds the `.nzb` files directly inside it, anything else is skipped with a warning (shown
+under the toolbar when nothing was added). While files hover, a foreground overlay shows
+an article grid with one lit cell per NZB being dragged (`widgets::article_grid_lit`). The
+segment-cell motif also carries the queue total (a track in the Queue summary row,
+`queue::queue_bytes`) and the 24 h history (48 thirty-minute cells, brightness from
+`docks::heat_alpha`, idle cells empty).

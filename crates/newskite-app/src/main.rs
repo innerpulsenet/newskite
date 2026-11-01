@@ -171,6 +171,31 @@ fn message_window(title: &str, message: &str) -> bool {
     .is_ok()
 }
 
+/// winit's Wayland backend delivers no file drag and drop (only its X11 backend does), so
+/// on a Wayland session with XWayland available the window runs through X11 and NZB files
+/// can be dropped onto it. `NEWSKITE_WAYLAND=1` keeps the native Wayland backend (no
+/// drops; Ctrl+V of copied files and Add NZB still work). The X11 window keeps the app id
+/// as its WM_CLASS, so the taskbar still matches the desktop entry.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn x11_for_drag_and_drop() -> Option<eframe::EventLoopBuilderHook> {
+    let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty());
+    let x11 = std::env::var_os("DISPLAY").is_some_and(|v| !v.is_empty());
+    let opt_out = std::env::var("NEWSKITE_WAYLAND").is_ok_and(|v| v.trim() == "1");
+    if !wayland || !x11 || opt_out {
+        return None;
+    }
+    tracing::info!("using the X11 backend (XWayland) so NZB files can be dropped on the window");
+    Some(Box::new(|builder| {
+        use winit::platform::x11::EventLoopBuilderExtX11 as _;
+        builder.with_x11();
+    }))
+}
+
+#[cfg(not(all(unix, not(target_os = "macos"))))]
+fn x11_for_drag_and_drop() -> Option<eframe::EventLoopBuilderHook> {
+    None
+}
+
 fn run_gui(items: Vec<LaunchItem>) -> ExitCode {
     init_tracing();
 
@@ -234,6 +259,7 @@ fn run_gui(items: Vec<LaunchItem>) -> ExitCode {
     }
     let native = eframe::NativeOptions {
         viewport,
+        event_loop_builder: x11_for_drag_and_drop(),
         ..Default::default()
     };
     let appearance_file = data_dir.join(appearance::FILE_NAME);

@@ -187,6 +187,16 @@ pub fn queue_summary(data: &Data) -> String {
     parts.join("  ·  ")
 }
 
+/// Bytes down and bytes in total over every pending job (the queue's own track).
+pub fn queue_bytes(data: &Data) -> (u64, u64) {
+    data.queue().iter().fold((0u64, 0u64), |(d, t), j| {
+        (
+            d.saturating_add(data.shown_done(j)),
+            t.saturating_add(j.bytes_total),
+        )
+    })
+}
+
 /// Draws the tab strip, the filter and the selected tab.
 pub fn show_center(
     ui: &mut Ui,
@@ -383,6 +393,13 @@ fn queue_tab(
         && all
             .iter()
             .any(|j| j.state == JobState::Queued && !data.in_run(j));
+    let (done, total) = queue_bytes(data);
+    let busy = Beat::new(
+        ui.ctx(),
+        data.status.running && data.speed() > 0,
+        view.reduced_motion,
+        brand::PERIOD_BUSY * 2.0,
+    );
     summary_row(ui, pal, &queue_summary(data), |ui| {
         if outside
             && kit_button(
@@ -397,6 +414,25 @@ fn queue_tab(
             .clicked()
         {
             actions.push(Action::Start);
+        }
+        // The whole queue as one segment track: every pending byte, done ones lit.
+        if total > 0 {
+            let width = (ui.available_width() * 0.4).clamp(120.0, 280.0);
+            let sweep = busy.moving.then_some(busy.phase);
+            segment_track_live(
+                ui,
+                pal,
+                format::fraction(done, total),
+                pal.accent,
+                width,
+                sweep,
+            )
+            .on_hover_text(format!(
+                "Queue: {}% · {} of {} downloaded",
+                format::percent(done, total),
+                format::bytes(done),
+                format::bytes(total)
+            ));
         }
     });
     if jobs.is_empty() {
@@ -1124,6 +1160,22 @@ mod tests {
         d.status.running = true;
         d.status.speed_bps = 100;
         assert!(queue_summary(&d).contains("about 0:16 at 100 B/s"));
+    }
+
+    #[test]
+    fn queue_track_counts_pending_bytes_only() {
+        let mut a = job(1, "a", 100, JobState::Downloading, 0);
+        a.bytes_done = 50;
+        let d = Data {
+            jobs: vec![
+                a,
+                job(2, "b", 100, JobState::Paused, 0),
+                job(3, "c", 900, JobState::Done, 0),
+            ],
+            ..Data::default()
+        };
+        assert_eq!(queue_bytes(&d), (50, 200));
+        assert_eq!(queue_bytes(&Data::default()), (0, 0));
     }
 
     #[test]

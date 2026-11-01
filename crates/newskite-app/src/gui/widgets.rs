@@ -623,6 +623,12 @@ pub fn grid_wave(col: usize, row: usize, phase: f32) -> f32 {
 /// empty matrix, not as a chart. With `wave` (the ambient beat phase) a faint band
 /// drifts across the wells.
 pub fn article_grid(ui: &mut Ui, pal: &Palette, wave: Option<f32>) {
+    article_grid_lit(ui, pal, wave, 0);
+}
+
+/// [`article_grid`] with the first `lit` cells (row by row, capped at the grid) lit in
+/// the accent: for a real count, such as the NZB files being dragged over the window.
+pub fn article_grid_lit(ui: &mut Ui, pal: &Palette, wave: Option<f32>, lit: usize) {
     let (cols, rows) = GRID_SIZE;
     let (cell, gap) = (7.0, 3.0);
     let w = cols as f32 * cell + (cols as f32 - 1.0) * gap;
@@ -638,6 +644,14 @@ pub fn article_grid(ui: &mut Ui, pal: &Palette, wave: Option<f32>) {
                 rect.left() + col as f32 * (cell + gap),
                 rect.top() + row as f32 * (cell + gap),
             );
+            if row * cols + col < lit {
+                painter.rect_filled(
+                    Rect::from_min_size(min, Vec2::splat(cell)),
+                    CornerRadius::same(1),
+                    pal.accent,
+                );
+                continue;
+            }
             let fill = match wave {
                 Some(phase) => {
                     let w = grid_wave(col, row, phase);

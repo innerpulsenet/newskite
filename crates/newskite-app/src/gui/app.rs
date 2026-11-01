@@ -1033,16 +1033,63 @@ impl NewskiteApp {
         }
     }
 
-    /// NZB files dropped onto the window are imported like Open NZB.
+    /// NZB files dropped onto the window, or copied in a file manager and pasted with
+    /// Ctrl+V while no text field has the keyboard, are imported like Add NZB. A folder
+    /// adds the `.nzb` files directly inside it; anything else is skipped and said so.
     fn dropped_files(&mut self, ctx: &egui::Context) {
-        let paths: Vec<PathBuf> = ctx.input(|i| {
+        let mut paths: Vec<PathBuf> = ctx.input(|i| {
             i.raw
                 .dropped_files
                 .iter()
                 .filter_map(|f| f.path.clone())
                 .collect()
         });
-        for p in paths {
+        let typing = ctx.memory(|m| m.focused().is_some());
+        let modal = self.view.settings.is_some() || self.view.about_open;
+        if !typing && !modal {
+            let pasted: Vec<String> = ctx.input(|i| {
+                i.events
+                    .iter()
+                    .filter_map(|e| match e {
+                        egui::Event::Paste(t) => Some(t.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            });
+            for line in pasted.iter().flat_map(|t| t.lines()) {
+                let line = line.trim();
+                // text/uri-list comments start with '#'.
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                if let Ok(p) = crate::launch::path_from_text(line) {
+                    paths.push(p);
+                }
+            }
+        }
+        if paths.is_empty() {
+            return;
+        }
+        let (nzbs, skipped) = expand_drop(&paths);
+        if !skipped.is_empty() {
+            let names: Vec<String> = skipped
+                .iter()
+                .map(|p| {
+                    p.file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| p.display().to_string())
+                })
+                .collect();
+            let text = format!("Not an NZB file, skipped: {}", names.join(", "));
+            self.service.log(LogLevel::Warn, text.clone());
+            self.data.logs = self.service.logs();
+            if nzbs.is_empty() {
+                // Nothing was added: say so where the user looks, under the toolbar.
+                self.view.open_nzb.visible = true;
+                self.view.open_nzb.error = Some(text);
+            }
+        }
+        for p in nzbs {
             self.actions.push(Action::AddNzb(p));
         }
     }
@@ -1234,6 +1281,7 @@ impl NewskiteApp {
         } else {
             motion::fade_reset(ctx, about::fade_id());
         }
+        drop_overlay(ctx, &pal, reduced);
 
         self.actions.extend(actions);
         self.apply_actions();
@@ -1246,6 +1294,65 @@ impl NewskiteApp {
             THEME_POLL
         });
     }
+}
+
+/// While files are dragged over the window: a veil over everything with a card that
+/// says what a drop will do. Its article grid lights one cell per NZB being dragged
+/// (a real count, not decoration).
+fn drop_overlay(ctx: &egui::Context, pal: &Palette, reduced: bool) {
+    let hovered: Vec<Option<PathBuf>> =
+        ctx.input(|i| i.raw.hovered_files.iter().map(|f| f.path.clone()).collect());
+    if hovered.is_empty() {
+        return;
+    }
+    // Some sources only say a drag is in progress, not which files.
+    let known: Vec<PathBuf> = hovered.iter().flatten().cloned().collect();
+    let (nzbs, _) = expand_drop(&known);
+    let unknown = known.is_empty();
+    let (title, color) = match nzbs.len() {
+        _ if unknown => ("Drop NZB files to add them".to_owned(), pal.text),
+        0 => ("These are not NZB files".to_owned(), pal.warning),
+        1 => ("Drop to add 1 NZB".to_owned(), pal.text),
+        n => (format!("Drop to add {n} NZBs"), pal.text),
+    };
+    let rect = ctx.content_rect();
+    egui::Area::new(egui::Id::new("drop-overlay"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(rect.min)
+        .interactable(false)
+        .show(ctx, |ui| {
+            ui.painter()
+                .rect_filled(rect, 0.0, Palette::fade(pal.surface, 0.82));
+            let card = egui::Rect::from_center_size(rect.center(), egui::vec2(420.0, 170.0));
+            ui.painter().rect(
+                card,
+                egui::CornerRadius::same(10),
+                pal.raised,
+                egui::Stroke::new(2.0, pal.accent),
+                egui::StrokeKind::Inside,
+            );
+            let mut child = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(card.shrink(24.0))
+                    .layout(egui::Layout::top_down(egui::Align::Center)),
+            );
+            let beat = motion::Beat::new(ctx, true, reduced, brand::PERIOD_AMBIENT * 2.0);
+            super::widgets::article_grid_lit(
+                &mut child,
+                pal,
+                beat.moving.then_some(beat.phase),
+                nzbs.len(),
+            );
+            child.add_space(16.0);
+            child.label(egui::RichText::new(title).size(16.0).strong().color(color));
+            child.add_space(4.0);
+            child.label(
+                egui::RichText::new("They join the end of the queue")
+                    .small()
+                    .color(pal.muted),
+            );
+        });
+    ctx.request_repaint_after(motion::FRAME);
 }
 
 fn shutdown_banner(ui: &mut egui::Ui, pal: &Palette, secs: u32, actions: &mut Vec<Action>) {
@@ -1350,6 +1457,40 @@ fn spawn_forwarder(
     }
 }
 
+/// `true` for a path whose extension is `.nzb` (any case).
+pub fn is_nzb(p: &std::path::Path) -> bool {
+    p.extension().is_some_and(|e| e.eq_ignore_ascii_case("nzb"))
+}
+
+/// Splits dropped paths into NZB files to import and paths to skip. A folder contributes
+/// the `.nzb` files directly inside it (sorted by name, not recursive); a folder without
+/// any is skipped.
+pub fn expand_drop(paths: &[PathBuf]) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let mut nzbs = Vec::new();
+    let mut skipped = Vec::new();
+    for p in paths {
+        if p.is_dir() {
+            let mut inside: Vec<PathBuf> = std::fs::read_dir(p)
+                .map(|rd| {
+                    rd.filter_map(|e| e.ok().map(|e| e.path()))
+                        .filter(|f| f.is_file() && is_nzb(f))
+                        .collect()
+                })
+                .unwrap_or_default();
+            inside.sort();
+            if inside.is_empty() {
+                skipped.push(p.clone());
+            }
+            nzbs.extend(inside);
+        } else if is_nzb(p) {
+            nzbs.push(p.clone());
+        } else {
+            skipped.push(p.clone());
+        }
+    }
+    (nzbs, skipped)
+}
+
 /// Drops from `seen` the jobs that are no longer done or failed (retried, removed), so
 /// their next completion notifies again.
 fn forget_unfinished(seen: &mut HashSet<i64>, jobs: &[Job]) {
@@ -1443,6 +1584,40 @@ mod tests {
             completion_notice(&jobs, &seen).as_deref(),
             Some("1 download finished")
         );
+    }
+
+    #[test]
+    fn drops_keep_nzbs_expand_folders_and_skip_the_rest() {
+        let dir = tempfile_dir();
+        let a = dir.join("a.NZB");
+        let b = dir.join("notes.txt");
+        let folder = dir.join("batch");
+        let empty = dir.join("empty");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::create_dir_all(&empty).unwrap();
+        for p in [
+            &a,
+            &b,
+            &folder.join("2.nzb"),
+            &folder.join("1.nzb"),
+            &folder.join("x.jpg"),
+        ] {
+            std::fs::write(p, "x").unwrap();
+        }
+        let (nzbs, skipped) = expand_drop(&[a.clone(), b.clone(), folder.clone(), empty.clone()]);
+        assert_eq!(nzbs, vec![a, folder.join("1.nzb"), folder.join("2.nzb")]);
+        assert_eq!(skipped, vec![b, empty]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn tempfile_dir() -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "newskite-drop-test-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
     }
 
     #[test]
