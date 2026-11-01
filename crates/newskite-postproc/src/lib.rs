@@ -77,7 +77,7 @@ pub struct PostOptions {
 
 impl Default for PostOptions {
     fn default() -> Self {
-        Self { repair: true, extract: true, cleanup: false, password: None }
+        Self { repair: true, extract: true, cleanup: true, password: None }
     }
 }
 
@@ -232,7 +232,10 @@ pub fn process(
     }
 
     // 1. PAR2
-    let files = list_files(&dir)?;
+    let mut files = list_files(&dir)?;
+    if par2::name_obfuscated_par2(&dir, &files, log) > 0 {
+        files = list_files(&dir)?;
+    }
     let (par2_verdict, backups) = par2::run(&dir, &files, tools.par2.as_deref(), opts.repair, log);
     log(format!("par2: {par2_verdict}"));
 
@@ -307,7 +310,9 @@ pub fn process(
     if opts.cleanup && report.extract == Verdict::Ok {
         let mut doomed: Vec<PathBuf> = extracted.iter().flat_map(|s| s.volumes.iter().cloned()).collect();
         if skipped.is_empty() {
-            doomed.extend(files.iter().filter(|f| detect::is_par2(f)).cloned());
+            // Every set extracted: the parity data and the release's sidecar files are
+            // leftovers too. `files` was listed after par2 renamed obfuscated files back.
+            doomed.extend(files.iter().filter(|f| detect::is_par2(f) || is_sidecar(f)).cloned());
             doomed.extend(backups);
         }
         doomed.sort();
@@ -320,8 +325,23 @@ pub fn process(
             }
         }
         log(format!("cleanup: removed {} file(s)", report.removed.len()));
+        let kept = list_files(&dir).map(|v| v.len()).unwrap_or(0);
+        if kept > 0 {
+            log(format!("cleanup: kept {kept} other file(s) that are not archives, parity or release sidecars"));
+        }
     }
     Ok(report)
+}
+
+/// Release sidecar files (checksums, info, scene metadata) that have no use once the
+/// archives are extracted. Anything else is kept: some releases carry payload files
+/// (a sample, subtitles) unarchived next to the archives.
+const SIDECAR_EXTENSIONS: &[&str] = &["sfv", "nfo", "srr", "srs", "md5", "sha1", "sha256", "url"];
+
+fn is_sidecar(path: &Path) -> bool {
+    path.extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .is_some_and(|e| SIDECAR_EXTENSIONS.contains(&e.as_str()))
 }
 
 /// `dir/<sanitized job_name>`, or `dir/<name>.extracted` when a non-folder of that name
@@ -362,7 +382,17 @@ mod tests {
         assert!(!format!("{o:?}").contains("hunter2"));
         let o = PostOptions::from_settings(&PostProcessSettings::default(), Some(String::new()));
         assert_eq!(o.password, None);
-        assert!(o.repair && o.extract && !o.cleanup);
+        assert!(o.repair && o.extract && o.cleanup);
+    }
+
+    #[test]
+    fn sidecars_recognized() {
+        for n in ["geth.nfo", "x.SFV", "a.srr", "b.sha256", "c.url"] {
+            assert!(is_sidecar(Path::new(n)), "{n}");
+        }
+        for n in ["movie.mkv", "sample.mkv", "subs.srt", "notes", "nfo"] {
+            assert!(!is_sidecar(Path::new(n)), "{n}");
+        }
     }
 
     #[test]

@@ -345,6 +345,21 @@ pub(crate) fn find_par2_sets(files: &[PathBuf]) -> Vec<Par2Set> {
         .collect()
 }
 
+/// Every PAR2 packet starts with this magic.
+const PAR2_MAGIC: &[u8; 8] = b"PAR2\0PKT";
+
+/// The recovery-set id of a PAR2 file (bytes 32..48 of its first packet header), or
+/// `None` when the file does not start with a PAR2 packet. Used to find PAR2 files whose
+/// names were obfuscated (no `.par2` extension).
+pub(crate) fn par2_set_id(path: &Path) -> Option<[u8; 16]> {
+    let mut head = [0u8; 48];
+    File::open(path).ok()?.read_exact(&mut head).ok()?;
+    if &head[..8] != PAR2_MAGIC {
+        return None;
+    }
+    head[32..48].try_into().ok()
+}
+
 /// True for `*.par2` (any case).
 pub(crate) fn is_par2(path: &Path) -> bool {
     path.file_name().map(|n| n.to_string_lossy()).is_some_and(|n| strip_suffix_ci(&n, ".par2").is_some())
@@ -353,6 +368,24 @@ pub(crate) fn is_par2(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn par2_set_id_reads_packet_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut packet = PAR2_MAGIC.to_vec();
+        packet.extend_from_slice(&[0u8; 24]); // length + packet hash
+        packet.extend_from_slice(&[7u8; 16]); // recovery set id
+        packet.extend_from_slice(b"PAR 2.0\0Main\0\0\0\0");
+        let par2 = dir.path().join("x9QzL");
+        std::fs::write(&par2, &packet).unwrap();
+        assert_eq!(par2_set_id(&par2), Some([7u8; 16]));
+        let other = dir.path().join("plain");
+        std::fs::write(&other, b"Rar!\x1a\x07\x00 and more bytes than forty-eight in total....").unwrap();
+        assert_eq!(par2_set_id(&other), None);
+        let short = dir.path().join("short");
+        std::fs::write(&short, &packet[..20]).unwrap();
+        assert_eq!(par2_set_id(&short), None);
+    }
 
     #[test]
     fn magic_bytes() {

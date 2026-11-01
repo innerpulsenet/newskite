@@ -100,9 +100,9 @@ fn zip_extracts_into_job_folder_with_7z() {
     let target = f.dl.join("My Release_ 2024");
     assert_eq!(r.extracted_to.as_deref(), Some(target.as_path()));
     assert_payload_extracted(&target, &f.src);
-    // cleanup is off by default
-    assert!(zip.exists());
-    assert!(r.removed.is_empty());
+    // cleanup is on by default
+    assert!(!zip.exists());
+    assert_eq!(r.removed, vec![zip.clone()]);
 }
 
 #[test]
@@ -572,8 +572,9 @@ fn par2_repair_then_extract_then_cleanup() {
     };
     assert!(par2_files.len() >= 2);
     damage(&zip, 20_000, 2_000);
-    // A file unrelated to the archive set must survive cleanup.
+    // Release sidecars go with the archives; an unarchived payload file stays.
     fs::write(f.dl.join("info.nfo"), b"release notes").unwrap();
+    fs::write(f.dl.join("extra.mkv"), b"payload").unwrap();
 
     let opts = PostOptions { cleanup: true, ..Default::default() };
     let (r, logs) = run(&f.dl, "Release", &opts, &tools);
@@ -584,10 +585,78 @@ fn par2_repair_then_extract_then_cleanup() {
     let mut expected = par2_files.clone();
     expected.push(zip.clone());
     expected.push(f.dl.join("release.zip.1")); // par2's backup of the damaged copy
+    expected.push(f.dl.join("info.nfo"));
     expected.sort();
     assert_eq!(r.removed, expected, "{logs:#?}");
     for p in &expected {
         assert!(!p.exists(), "{} should be gone", p.display());
     }
-    assert!(f.dl.join("info.nfo").exists());
+    assert!(f.dl.join("extra.mkv").exists());
+}
+
+#[test]
+fn fully_obfuscated_release_is_renamed_by_par2_then_extracted() {
+    // Mirrors common posts: every file (archive volumes AND the .par2 files) has a random
+    // name with no extension. par2cmdline only accepts a main file ending in .par2, so the
+    // PAR2 files must be found by magic bytes and named before repair can rename the rest.
+    let tools = detect_tools();
+    require!(tools, par2, sevenz);
+    let _guard = par2_guard();
+    let f = fixture();
+    let archive = f.dl.join("release.7z");
+    sh(
+        tools.sevenz.as_ref().unwrap(),
+        &["a", "-t7z", "-mx0", "-v60k", archive.to_str().unwrap(), "a.txt", &sub_path("b.bin")],
+        &f.src,
+    );
+    let volumes: Vec<String> = {
+        let mut v: Vec<String> = fs::read_dir(&f.dl)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    };
+    assert!(volumes.len() >= 3, "{volumes:?}");
+    let refs: Vec<&str> = volumes.iter().map(String::as_str).collect();
+    par2_create(&tools, &f.dl, "release.par2", &refs);
+
+    let mut all: Vec<PathBuf> = fs::read_dir(&f.dl).unwrap().map(|e| e.unwrap().path()).collect();
+    all.sort();
+    for (i, p) in all.iter().enumerate() {
+        fs::rename(p, f.dl.join(format!("Qx{i:02}obf9ZkL{}", i * 7))).unwrap();
+    }
+
+    let (r, logs) = run(&f.dl, "Release", &PostOptions::default(), &tools);
+    assert_eq!(r.par2, Verdict::Repaired, "{logs:#?}");
+    assert_eq!(r.extract, Verdict::Ok, "{logs:#?}");
+    // par2 renamed every volume back to its real name (then cleanup removed it).
+    for v in &volumes {
+        assert!(r.removed.contains(&f.dl.join(v)), "{v} should be renamed back: {logs:#?}");
+    }
+    assert_payload_extracted(&f.dl.join("Release"), &f.src);
+    // Cleanup is on by default: only the extracted folder remains.
+    let left: Vec<String> = fs::read_dir(&f.dl).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+    assert_eq!(left, vec!["Release".to_string()], "{logs:#?}");
+}
+
+#[test]
+fn cleanup_removes_sidecars_but_keeps_unarchived_payload() {
+    let tools = detect_tools();
+    require!(tools, par2, sevenz);
+    let _guard = par2_guard();
+    let f = fixture();
+    let zip = f.dl.join("release.zip");
+    sh(tools.sevenz.as_ref().unwrap(), &["a", "-tzip", "-mx0", zip.to_str().unwrap(), "a.txt", &sub_path("b.bin")], &f.src);
+    par2_create(&tools, &f.dl, "release.par2", &["release.zip"]);
+    fs::write(f.dl.join("release.sfv"), b"release.zip 00000000\n").unwrap();
+    fs::write(f.dl.join("GROUP.NFO"), b"info").unwrap();
+    fs::write(f.dl.join("sample.mkv"), b"unarchived payload").unwrap();
+
+    let (r, logs) = run(&f.dl, "Release", &PostOptions::default(), &tools);
+    assert_eq!(r.extract, Verdict::Ok, "{logs:#?}");
+    let mut left: Vec<String> = fs::read_dir(&f.dl).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+    left.sort();
+    assert_eq!(left, vec!["Release".to_string(), "sample.mkv".to_string()], "{logs:#?}");
+    assert!(logs.iter().any(|l| l.contains("kept 1 other file")), "{logs:#?}");
 }
