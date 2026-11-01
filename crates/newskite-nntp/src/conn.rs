@@ -274,14 +274,11 @@ impl NntpConnection {
 
     /// Pipelining, step 1: sends `BODY <id>` without waiting for the reply.
     ///
-    /// Several bodies may be requested back to back; their replies must then be collected
-    /// in the same order with [`begin_body`](Self::begin_body) and
-    /// [`finish_body`](Self::finish_body). Other commands are refused until every
-    /// outstanding reply has been read. Refused while a body block is pending.
+    /// Several bodies may be requested back to back, also while the current body block is
+    /// still being read; their replies must then be collected in the same order with
+    /// [`begin_body`](Self::begin_body) and [`finish_body`](Self::finish_body). Other
+    /// commands are refused until every outstanding reply has been read.
     pub async fn send_body(&mut self, message_id: &str) -> Result<(), NntpError> {
-        if self.in_body {
-            return Err(NntpError::Protocol("a body block is still pending".into()));
-        }
         let id = normalize_message_id(message_id)?;
         self.send_command(&format!("BODY {id}")).await?;
         self.outstanding += 1;

@@ -421,6 +421,31 @@ async fn no_usable_server_is_an_error() {
     assert!(matches!(out.result, Err(EngineError::NoServer)));
 }
 
+/// One connection, six 10 KB articles, 100 ms of simulated one-way latency per reply and a
+/// link that takes ~100 ms per body. Fetched one after another, every article costs a
+/// latency plus a body time (~1.3 s in all); with the next request sent while the current
+/// body streams, the latency is paid only for the first article of a file whose output is
+/// decided (~0.9 s).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pipelining_hides_reply_latency() {
+    let src = TestFile::new("pl", "pipe.bin", random_bytes(60_000, 24), 6);
+    let server = MockServer::start(MockConfig {
+        articles: articles_of([&src]),
+        latency_ms: 100,
+        bandwidth_bps: 100_000,
+        ..Default::default()
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let started = Instant::now();
+    let out = run(nzb_of(vec![src.nzb_file(None)]), dir.path(), vec![server_for(&server, false, 1)], options(1)).await;
+    let elapsed = started.elapsed();
+    out.result.expect("download succeeds");
+    assert_eq!(sha256(&std::fs::read(dir.path().join("pipe.bin")).unwrap()), sha256(&src.data));
+    assert_eq!(server.body_requests(), 6);
+    assert!(elapsed < Duration::from_millis(1100), "{elapsed:?}: articles were not pipelined");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn server_connection_limit_is_respected() {
     let src = TestFile::new("cl", "limit.bin", random_bytes(200_000, 23), 10);
