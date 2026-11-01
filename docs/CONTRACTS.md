@@ -85,7 +85,8 @@ pub async fn test_server(server:&ServerConfig, timeout:Duration) -> Result<Strin
   pub struct MockServer { pub addr: SocketAddr, /* ... */ }
   pub struct MockConfig { pub username: Option<String>, pub password: Option<String>,
                           pub articles: HashMap<String /*msgid no <>*/, Vec<u8> /*raw body, NOT stuffed*/>,
-                          pub fail_first_n_connections: usize, pub delay_ms: u64 }
+                          pub fail_first_n_connections: usize, pub delay_ms: u64 /* per-BODY server work */,
+                          pub latency_ms: u64 /* one-way reply latency, in order */, pub bandwidth_bps: u64 /* paced writes, 0 = unlimited */ }
   impl MockServer { pub async fn start(cfg: MockConfig) -> MockServer; pub fn connections_accepted(&self)->usize;
                     pub fn body_requests(&self)->usize; pub fn shutdown(self) }
 }
@@ -98,6 +99,15 @@ set_read_timeout}`; `pub fn normalize_message_id(&str) -> Result<String,NntpErro
 `<id>`); consts `MAX_ARTICLE_BYTES` (64 MiB cap per body → `Protocol`) and
 `DEFAULT_READ_TIMEOUT` (60 s per-read inactivity timeout → `Timeout`); `Response: Display`
 (`"211 text"`); `testkit::MockConfig: Default + Clone`; `testkit::dot_stuff(&[u8]) -> Vec<u8>`.
+Pipelining (additive): `send_body(&mut self, id) -> Result<(),_>` sends `BODY` without reading
+the reply (allowed while a body block is still being read); `begin_body(&mut self, id) ->
+Result<(),_>` reads the oldest outstanding status line (Ok = 222, errors as `body()`);
+`finish_body(&mut self) -> Result<Vec<u8>,_>` reads the announced block; `outstanding_bodies()
+-> usize`. `body()` is the three in sequence. `command()`/`stat()`/… are refused (`Protocol`,
+connection not broken) while a reply is outstanding; a 480 with other replies outstanding
+breaks the session (`Connect`, transient) instead of replaying. Bodies are read chunk by
+chunk from the socket buffer (no per-line reads or timers); the body buffer is pre-sized from
+the previous body on the connection.
 Semantics: `body()` terminates **every** line with `\r\n` (so a CRLF body round-trips exactly;
 bare-LF lines are normalized). After an I/O error, timeout or malformed reply the connection
 is `is_broken()` and further commands fail with `Protocol` — drop it and reconnect. `connect`'s
@@ -129,7 +139,18 @@ pub struct JobReport { pub files: Vec<FileReport>, pub bytes_written: u64 }
 pub struct Progress { pub bytes_down: AtomicU64 /* decoded bytes, monotonic */, pub segments_done: AtomicU64 }
 pub async fn download(req: DownloadRequest, events: tokio::sync::mpsc::UnboundedSender<EngineEvent>,
                       progress: Arc<Progress>, cancel: tokio_util::sync::CancellationToken) -> Result<JobReport,EngineError>;
+pub struct ConnectionPool; impl ConnectionPool { pub fn new()->Self; pub fn idle_count(&self)->usize; pub fn close_idle(&self) }
+pub const POOL_IDLE_MAX: Duration; // 90 s: older idle connections are closed, not reused
+pub async fn download_with_pool(req, pool: Arc<ConnectionPool>, events, progress, cancel) -> Result<JobReport,EngineError>;
 ```
+Netcode: on the primary (first usable) server a worker sends the next segment's `BODY` as soon
+as the current article's 222 line arrives (one request ahead per connection; never before a
+file's output is decided, so a resumed complete file still costs one article); decode and part
+checks run on the blocking pool; `download()` closes its connections at the end while
+`download_with_pool` hands them to the pool (the service keeps one pool per run and closes it
+when the queue goes idle or at shutdown; a pooled connection the server closed is replaced
+silently). Connect failures (refused, TLS, 400/502 at greeting or login) put the server in a
+cooldown every worker honors (same schedule as the retry backoff, ±25 % jitter).
 Rules (F3): bounded concurrency (`connections` fetches total, pooled connections reused,
 spread across servers up to each server's `connections`); offset writes at `begin-1` via a
 cross-platform positional-write helper (unix `FileExt::write_at`, windows `seek_write`);

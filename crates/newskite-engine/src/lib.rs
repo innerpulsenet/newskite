@@ -10,7 +10,14 @@
 //!   `connections` and by the number of segments) each own at most one NNTP connection at a
 //!   time. A per-server semaphore keeps every server within its own connection limit.
 //!   Workers prefer the first server and spill over to later ones when it is full, on
-//!   fail-over and on retry. Connections are opened lazily and reused across segments.
+//!   fail-over and on retry. Connections are opened lazily, reused across segments and,
+//!   through a [`ConnectionPool`] ([`download_with_pool`]), across jobs.
+//! * **Pipelining.** On the primary server a worker sends the `BODY` request for its next
+//!   segment as soon as the current article's status line arrives, so the request's round
+//!   trip overlaps the current body transfer and the connection never idles between
+//!   articles. At most one request is in flight ahead per connection, so in-flight memory
+//!   stays bounded by one raw article plus one decoded part per connection. Decoding and
+//!   CRC checking run on the blocking thread pool, never on the socket tasks.
 //! * **Naming.** The output name is the yEnc `name=` of the first part decoded for a file,
 //!   sanitized, falling back to [`newskite_nzb::NzbFile::filename`]. It is always a single
 //!   path component inside `dest_dir`. Two files of one job that resolve to the same name
@@ -37,9 +44,13 @@
 //!   aborting with [`EngineError::Connect`].
 //! * **Transient errors** (I/O, timeout, connect, TLS, protocol) drop the connection and are
 //!   retried up to `options.retries` more times per segment with exponential backoff
-//!   (200 ms, 400 ms, ... capped at 5 s), walking the servers in order. When a segment
-//!   exhausts its retries (outside the fail-over case above) the whole job stops with
-//!   [`EngineError::Connect`]; the `.nkpart` files stay so a later run can resume.
+//!   (200 ms, 400 ms, ... capped at 5 s, each ±25 % jitter so workers do not reconnect in
+//!   lockstep), walking the servers in order. A failed connection attempt (refused, TLS,
+//!   `400`/`502` at the greeting or login) also puts the server in a cooldown of the same
+//!   length that every worker honors before its next attempt, so one refusal is not
+//!   followed by twenty more. When a segment exhausts its retries (outside the fail-over
+//!   case above) the whole job stops with [`EngineError::Connect`]; the `.nkpart` files stay
+//!   so a later run can resume.
 //! * **Authentication failure** on a server excludes it for the rest of the job; when every
 //!   server has failed authentication the job stops with [`EngineError::AuthFailed`].
 //! * **CRC mismatches** are counted per file ([`FileReport::crc_errors`]) but the data is
@@ -74,6 +85,7 @@
 
 mod limiter;
 mod naming;
+mod pool;
 mod pwrite;
 mod run;
 
@@ -88,6 +100,8 @@ use newskite_nzb::Nzb;
 use newskite_types::{EngineEvent, ServerConfig};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
+
+pub use pool::{ConnectionPool, POOL_IDLE_MAX};
 
 /// Extension (without the dot) of in-progress output files: `<name>.nkpart`.
 pub const PART_EXTENSION: &str = "nkpart";
@@ -231,14 +245,31 @@ impl Progress {
 /// Downloads one job. See the crate docs for the full behavior.
 ///
 /// Event send failures (receiver dropped) are ignored. Returns the per-file report when
-/// every file completed (or was skipped).
+/// every file completed (or was skipped). Connections are closed when the job ends; use
+/// [`download_with_pool`] to keep them for the next job.
 pub async fn download(
     req: DownloadRequest,
     events: UnboundedSender<EngineEvent>,
     progress: Arc<Progress>,
     cancel: CancellationToken,
 ) -> Result<JobReport, EngineError> {
-    run::run(req, events, progress, cancel).await
+    let pool = Arc::new(ConnectionPool::new());
+    let result = run::run(req, pool.clone(), events, progress, cancel).await;
+    pool.close_idle();
+    result
+}
+
+/// Like [`download`], but takes idle connections from `pool` instead of opening new ones
+/// where it can, and hands the job's connections back to it at the end. The caller decides
+/// when to close them ([`ConnectionPool::close_idle`]), typically when the queue goes idle.
+pub async fn download_with_pool(
+    req: DownloadRequest,
+    pool: Arc<ConnectionPool>,
+    events: UnboundedSender<EngineEvent>,
+    progress: Arc<Progress>,
+    cancel: CancellationToken,
+) -> Result<JobReport, EngineError> {
+    run::run(req, pool, events, progress, cancel).await
 }
 
 /// Retry delay before attempt `attempt` (1-based): 200 ms, 400 ms, 800 ms, ... capped at 5 s.

@@ -21,9 +21,13 @@ pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(60);
 /// Longest single-line (status) response we accept.
 const MAX_STATUS_LINE: usize = 16 * 1024;
 /// Read buffer size for the socket.
-const READ_BUFFER: usize = 64 * 1024;
+const READ_BUFFER: usize = 128 * 1024;
 /// The reusable line buffer is shrunk back to this after an unusually long line.
 const LINE_BUF_KEEP: usize = 64 * 1024;
+/// Initial capacity of a body buffer when the connection has not read a body yet.
+const BODY_INITIAL: usize = 64 * 1024;
+/// Slack added to the previous body's length when sizing the next body buffer.
+const BODY_SLACK: usize = 8 * 1024;
 /// Upper bound for the polite `QUIT` exchange.
 const QUIT_TIMEOUT: Duration = Duration::from_secs(2);
 /// Mask shown in place of credentials in logs and transcripts.
@@ -93,6 +97,14 @@ pub struct NntpConnection {
     credentials: Option<Credentials>,
     read_timeout: Duration,
     line_buf: Vec<u8>,
+    write_buf: Vec<u8>,
+    /// `BODY` commands sent whose status line has not been read yet (pipelining).
+    outstanding: usize,
+    /// A `222` status was read and its multi-line block is still to be read.
+    in_body: bool,
+    /// Length of the last body read; sizes the next body buffer (segments of one job are
+    /// nearly uniform, so this avoids regrowing the buffer for every article).
+    body_hint: usize,
     broken: bool,
     /// When `Some`, every command (masked) and reply is appended (used by [`test_server`]).
     transcript: Option<Vec<String>>,
@@ -146,6 +158,10 @@ impl NntpConnection {
                 credentials,
                 read_timeout: DEFAULT_READ_TIMEOUT,
                 line_buf: Vec::new(),
+                write_buf: Vec::new(),
+                outstanding: 0,
+                in_body: false,
+                body_hint: 0,
                 broken: false,
                 transcript: record.then(Vec::new),
             };
@@ -205,15 +221,36 @@ impl NntpConnection {
     /// Lines containing CR, LF or NUL are refused ([`NntpError::Protocol`]) so callers
     /// cannot smuggle extra commands. The response is returned whatever its code; use the
     /// typed helpers ([`body`](Self::body), [`stat`](Self::stat), ...) for code handling.
+    /// Refused while a pipelined `BODY` is outstanding (see [`send_body`](Self::send_body)).
     pub async fn command(&mut self, line: &str) -> Result<Response, NntpError> {
+        self.check_idle()?;
+        self.send_command(line).await?;
+        self.read_response().await
+    }
+
+    /// Validates and sends a command line without reading the reply.
+    async fn send_command(&mut self, line: &str) -> Result<(), NntpError> {
         if line.bytes().any(|b| matches!(b, b'\r' | b'\n' | 0)) {
             return Err(NntpError::Protocol("refusing to send a command containing CR, LF or NUL".into()));
         }
         if self.broken {
             return Err(NntpError::Protocol("connection is unusable after an earlier error".into()));
         }
-        self.send_line(line).await?;
-        self.read_response().await
+        self.send_line(line).await
+    }
+
+    /// Fails unless no pipelined `BODY` is outstanding and no body block is pending.
+    fn check_idle(&self) -> Result<(), NntpError> {
+        if self.outstanding > 0 || self.in_body {
+            return Err(NntpError::Protocol("a pipelined BODY reply is still pending".into()));
+        }
+        Ok(())
+    }
+
+    /// Number of `BODY` commands sent with [`send_body`](Self::send_body) whose status
+    /// line has not been read yet.
+    pub fn outstanding_bodies(&self) -> usize {
+        self.outstanding
     }
 
     /// Fetches an article body (`BODY <id>`); `message_id` may omit the angle brackets.
@@ -229,15 +266,73 @@ impl NntpConnection {
     /// the account); any other 4xx/5xx (451 takedown, 500/501/503, ...) →
     /// [`NntpError::ArticleMissing`] for this server. Error texts are credential-redacted.
     pub async fn body(&mut self, message_id: &str) -> Result<Vec<u8>, NntpError> {
+        self.check_idle()?;
+        self.send_body(message_id).await?;
+        self.begin_body(message_id).await?;
+        self.finish_body().await
+    }
+
+    /// Pipelining, step 1: sends `BODY <id>` without waiting for the reply.
+    ///
+    /// Several bodies may be requested back to back, also while the current body block is
+    /// still being read; their replies must then be collected in the same order with
+    /// [`begin_body`](Self::begin_body) and [`finish_body`](Self::finish_body). Other
+    /// commands are refused until every outstanding reply has been read.
+    pub async fn send_body(&mut self, message_id: &str) -> Result<(), NntpError> {
         let id = normalize_message_id(message_id)?;
-        let r = self.command_with_reauth(&format!("BODY {id}")).await?;
+        self.send_command(&format!("BODY {id}")).await?;
+        self.outstanding += 1;
+        Ok(())
+    }
+
+    /// Pipelining, step 2: reads the status line of the oldest outstanding `BODY`, which
+    /// must have been for `message_id`. `Ok(())` means the server answered `222` and the
+    /// body block follows ([`finish_body`](Self::finish_body)); the errors are those of
+    /// [`body`](Self::body).
+    ///
+    /// A `480` is handled by re-authenticating and resending only when no other reply is
+    /// outstanding; otherwise the session is given up as broken ([`NntpError::Connect`],
+    /// transient) since replaying the pipeline is not worth the complexity.
+    pub async fn begin_body(&mut self, message_id: &str) -> Result<(), NntpError> {
+        if self.outstanding == 0 || self.in_body {
+            return Err(NntpError::Protocol("no outstanding BODY reply to read".into()));
+        }
+        let id = normalize_message_id(message_id)?;
+        let mut r = self.read_response().await?;
+        self.outstanding -= 1;
+        if r.code == 480 && self.credentials.is_some() {
+            if self.outstanding > 0 {
+                self.broken = true;
+                return Err(NntpError::Connect("session lost its authentication while replies were pipelined".into()));
+            }
+            tracing::debug!(address = %self.address, "server asked for authentication; re-authenticating");
+            self.authenticate().await?;
+            r = self.command(&format!("BODY {id}")).await?;
+        }
         match r.code {
-            222 => self.read_multiline().await,
+            222 => {
+                self.in_body = true;
+                Ok(())
+            }
             430 | 423 => Err(NntpError::ArticleMissing(bare(&id).to_owned())),
             480 => Err(NntpError::AuthRequired),
             400..=599 => Err(self.refusal("BODY", &r, &id)),
             _ => Err(self.unexpected("BODY", &r)),
         }
+    }
+
+    /// Pipelining, step 3: reads the body block announced by a successful
+    /// [`begin_body`](Self::begin_body).
+    pub async fn finish_body(&mut self) -> Result<Vec<u8>, NntpError> {
+        if !self.in_body {
+            return Err(NntpError::Protocol("no body block is pending".into()));
+        }
+        let body = self.read_multiline().await;
+        self.in_body = false;
+        if let Ok(b) = &body {
+            self.body_hint = b.len();
+        }
+        body
     }
 
     /// Checks whether an article exists (`STAT <id>`): 223 → `true`, 430/423 → `false`.
@@ -279,7 +374,7 @@ impl NntpConnection {
     /// Politely ends the session (`QUIT`, bounded to a couple of seconds) and closes the
     /// socket. Errors are ignored: the connection is going away either way.
     pub async fn quit(mut self) {
-        if !self.broken {
+        if !self.broken && self.outstanding == 0 && !self.in_body {
             self.read_timeout = self.read_timeout.min(QUIT_TIMEOUT);
             if let Err(e) = self.command("QUIT").await {
                 tracing::debug!(error = %e, "QUIT failed");
@@ -382,7 +477,8 @@ impl NntpConnection {
         if let Some(t) = self.transcript.as_mut() {
             t.push(format!("-> {masked}"));
         }
-        let mut buf = Vec::with_capacity(line.len() + 2);
+        let mut buf = std::mem::take(&mut self.write_buf);
+        buf.clear();
         buf.extend_from_slice(line.as_bytes());
         buf.extend_from_slice(b"\r\n");
         let stream = self.reader.get_mut();
@@ -390,7 +486,9 @@ impl NntpConnection {
             stream.write_all(&buf).await?;
             stream.flush().await
         };
-        match tokio::time::timeout(self.read_timeout, write).await {
+        let outcome = tokio::time::timeout(self.read_timeout, write).await;
+        self.write_buf = buf;
+        match outcome {
             Ok(Ok(())) => Ok(()),
             Ok(Err(e)) => {
                 self.broken = true;
@@ -430,36 +528,53 @@ impl NntpConnection {
     }
 
     /// Reads a dot-terminated multi-line block, unstuffing leading dots.
+    ///
+    /// Works on the reader's buffer chunk by chunk instead of line by line: runs of body
+    /// bytes are appended in one copy, only line starts (where a stuffed dot or the
+    /// terminator can be) are examined one byte at a time, and the inactivity timeout wraps
+    /// each socket read rather than each line.
     async fn read_multiline(&mut self) -> Result<Vec<u8>, NntpError> {
-        let mut out = Vec::with_capacity(READ_BUFFER);
-        let mut line = std::mem::take(&mut self.line_buf);
-        let result = loop {
-            line.clear();
-            // Room for the remaining budget plus a stuffed dot and CRLF.
-            let limit = MAX_ARTICLE_BYTES.saturating_sub(out.len()) + 3;
-            if let Err(e) = self.read_line(&mut line, limit).await {
-                break Err(e);
-            }
-            let content = strip_eol(&line);
-            if content == b"." {
-                break Ok(());
-            }
-            let content = match content.first() {
-                Some(b'.') => &content[1..],
-                _ => content,
-            };
-            if out.len() + content.len() + 2 > MAX_ARTICLE_BYTES {
-                self.broken = true;
-                break Err(NntpError::Protocol(format!(
-                    "article exceeds the {} MiB limit",
-                    MAX_ARTICLE_BYTES / (1024 * 1024)
-                )));
-            }
-            out.extend_from_slice(content);
-            out.extend_from_slice(b"\r\n");
+        let capacity = match self.body_hint {
+            0 => BODY_INITIAL,
+            n => n.saturating_add(BODY_SLACK).min(MAX_ARTICLE_BYTES),
         };
-        self.restore_line_buf(line);
-        result.map(|()| out)
+        let mut out: Vec<u8> = Vec::with_capacity(capacity);
+        let mut state = Block::LineStart;
+        loop {
+            let chunk = match self.fill_buf().await {
+                Ok(c) => c,
+                Err(e) => {
+                    self.broken = true;
+                    return Err(e);
+                }
+            };
+            let (used, done) = match unstuff_chunk(chunk, &mut out, &mut state) {
+                Ok(step) => step,
+                Err(e) => {
+                    self.broken = true;
+                    return Err(e);
+                }
+            };
+            self.reader.consume(used);
+            if done {
+                return Ok(out);
+            }
+        }
+    }
+
+    /// The reader's buffered bytes, filling it from the socket (bounded by the inactivity
+    /// timeout) when empty. The returned slice is never empty.
+    async fn fill_buf(&mut self) -> Result<&[u8], NntpError> {
+        let reader = &mut self.reader;
+        match tokio::time::timeout(self.read_timeout, reader.fill_buf()).await {
+            Err(_) => Err(NntpError::Timeout),
+            Ok(Err(e)) => Err(NntpError::Io(e)),
+            Ok(Ok([])) => Err(NntpError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "server closed the connection mid-body",
+            ))),
+            Ok(Ok(_)) => Ok(self.reader.buffer()),
+        }
     }
 
     /// Reads one line (through `\n`) into `buf`, failing if it would exceed `limit` bytes.
@@ -517,6 +632,94 @@ impl NntpConnection {
         }
         shown
     }
+}
+
+/// Parser position inside a multi-line block, carried across buffer chunks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Block {
+    /// At the start of a line: a `.` here is either stuffing or the terminator.
+    LineStart,
+    /// Saw `.` at a line start; the next byte decides.
+    AfterDot,
+    /// Saw `.\r` at a line start; a `\n` completes the terminator.
+    AfterDotCr,
+    /// Inside a line: bytes are copied through to the next `\n`.
+    Mid,
+}
+
+/// Feeds one buffer chunk of a multi-line block through the dot-unstuffing parser.
+///
+/// Appends body bytes to `out` with every line ending normalized to `\r\n`, and returns
+/// how many bytes of `chunk` were consumed plus whether the terminating `.` line was seen.
+/// Fails ([`NntpError::Protocol`]) once the body would exceed [`MAX_ARTICLE_BYTES`].
+fn unstuff_chunk(chunk: &[u8], out: &mut Vec<u8>, state: &mut Block) -> Result<(usize, bool), NntpError> {
+    let mut i = 0;
+    while i < chunk.len() {
+        match *state {
+            Block::LineStart => {
+                if chunk[i] == b'.' {
+                    *state = Block::AfterDot;
+                    i += 1;
+                } else {
+                    *state = Block::Mid;
+                }
+            }
+            Block::AfterDot => match chunk[i] {
+                b'\n' => return Ok((i + 1, true)),
+                b'\r' => {
+                    *state = Block::AfterDotCr;
+                    i += 1;
+                }
+                // `..x` is a stuffed `.x`; a lone `.x` from a sloppy server is read the same.
+                _ => *state = Block::Mid,
+            },
+            Block::AfterDotCr => {
+                if chunk[i] == b'\n' {
+                    return Ok((i + 1, true));
+                }
+                // `.\r` followed by more text: a sloppy line; keep the CR as data.
+                out.push(b'\r');
+                *state = Block::Mid;
+            }
+            Block::Mid => {
+                let rest = &chunk[i..];
+                match rest.iter().position(|&b| b == b'\n') {
+                    Some(n) => {
+                        // Normalize the line ending: `\r\n` as is, bare `\n` becomes `\r\n`.
+                        let line = &rest[..n];
+                        if line.is_empty() && out.last() == Some(&b'\r') {
+                            // The CR was already appended from the previous chunk.
+                            check_limit(out.len(), 1)?;
+                            out.push(b'\n');
+                        } else {
+                            let content = line.strip_suffix(b"\r").unwrap_or(line);
+                            check_limit(out.len(), content.len() + 2)?;
+                            out.extend_from_slice(content);
+                            out.extend_from_slice(b"\r\n");
+                        }
+                        i += n + 1;
+                        *state = Block::LineStart;
+                    }
+                    None => {
+                        check_limit(out.len(), rest.len())?;
+                        out.extend_from_slice(rest);
+                        i = chunk.len();
+                    }
+                }
+            }
+        }
+    }
+    Ok((i, false))
+}
+
+fn check_limit(have: usize, add: usize) -> Result<(), NntpError> {
+    if have.saturating_add(add) > MAX_ARTICLE_BYTES {
+        return Err(NntpError::Protocol(format!(
+            "article exceeds the {} MiB limit",
+            MAX_ARTICLE_BYTES / (1024 * 1024)
+        )));
+    }
+    Ok(())
 }
 
 /// Settings "Test" action: connects, authenticates (if a username is set) and issues
@@ -611,6 +814,40 @@ mod tests {
         assert_eq!(strip_eol(b"abc\n"), b"abc");
         assert_eq!(strip_eol(b"abc"), b"abc");
         assert_eq!(strip_eol(b"a\rb\r\n"), b"a\rb");
+    }
+
+    /// Runs the chunk parser over `input` split at every `split` boundary.
+    fn unstuff_split(input: &[u8], split: usize) -> (Vec<u8>, bool, usize) {
+        let mut out = Vec::new();
+        let mut state = Block::LineStart;
+        let mut pos = 0;
+        while pos < input.len() {
+            let end = (pos + split).min(input.len());
+            let (used, done) = unstuff_chunk(&input[pos..end], &mut out, &mut state).unwrap();
+            if done {
+                return (out, true, pos + used);
+            }
+            assert_eq!(used, end - pos, "a chunk is consumed whole unless the block ends");
+            pos += used;
+        }
+        (out, false, pos)
+    }
+
+    #[test]
+    fn unstuffs_and_terminates_at_every_chunk_boundary() {
+        let input = b"..a\r\n.\rb\r\n\r\nline\nbare\r.x\r\n.\r\nTRAILING";
+        let want = b".a\r\n\rb\r\n\r\nline\r\nbare\r.x\r\n";
+        for split in 1..=input.len() {
+            let (out, done, used) = unstuff_split(input, split);
+            assert!(done, "split {split}");
+            assert_eq!(out, want, "split {split}");
+            assert_eq!(&input[used..], b"TRAILING", "split {split}");
+        }
+        // Bare-LF terminator and an empty block.
+        assert_eq!(unstuff_split(b"x\n.\n", 1), (b"x\r\n".to_vec(), true, 4));
+        assert_eq!(unstuff_split(b".\r\n", 2), (Vec::new(), true, 3));
+        // No terminator yet: everything consumed, not done.
+        assert_eq!(unstuff_split(b"abc\r\nde", 3), (b"abc\r\nde".to_vec(), false, 7));
     }
 
     #[test]

@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use newskite_engine::{download, DownloadRequest, EngineError, EngineOptions, JobReport};
+use newskite_engine::{download_with_pool, DownloadRequest, EngineError, EngineOptions, JobReport};
 use newskite_postproc::{detect_tools, PostOptions};
 use newskite_store::{Job, JobFile, JobState, StoreError};
 use newskite_types::{format, EngineEvent, ServerConfig, Settings};
@@ -200,6 +200,8 @@ fn finish_run_locked(inner: &Inner, st: &mut crate::RunState, end: &End, process
     st.active_job = None;
     st.job_cancel = None;
     st.removed_active = false;
+    // The queue is idle: give the server its connection slots back.
+    inner.pool.close_idle();
     // Before the idle signal, so whoever waits for it sees this run's bytes in the totals.
     crate::timers::flush_throughput(inner);
     inner.emit(ServiceEvent::QueueIdle);
@@ -283,7 +285,7 @@ async fn process_job(
 
     let (tx, rx) = mpsc::unbounded_channel();
     let mut forwarder = inner.rt.spawn(forward_events(inner.clone(), job.id, job.bytes_total, base_bytes, rx));
-    let result = download(req, tx, inner.progress.clone(), token).await;
+    let result = download_with_pool(req, inner.pool.clone(), tx, inner.progress.clone(), token).await;
     match tokio::time::timeout(FORWARDER_DRAIN, &mut forwarder).await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => tracing::warn!(target: "newskite_service", "event forwarder failed: {e}"),

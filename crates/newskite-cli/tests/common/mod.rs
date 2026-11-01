@@ -134,8 +134,8 @@ pub async fn mock_for(files: &[&TestFile], omit: &[&str], delay_ms: u64) -> Mock
         username: Some(USER.into()),
         password: Some(PASS.into()),
         articles,
-        fail_first_n_connections: 0,
         delay_ms,
+        ..Default::default()
     })
     .await
 }
