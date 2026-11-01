@@ -16,6 +16,11 @@ where every job can be started, paused or moved on its own, a download history, 
 progress, a filterable log and a live throughput graph, and it follows the desktop's light
 or dark color scheme (KDE Plasma first).
 
+Drop `.nzb` files (or a folder of them) onto the window, or copy them in the file manager
+and press Ctrl+V. On Wayland the window runs through XWayland, because the windowing
+library cannot receive dropped files natively there; set `NEWSKITE_WAYLAND=1` to keep
+native Wayland (Ctrl+V and Add NZB still work).
+
 The same queue engine also runs without a window: `newskite --headless` downloads NZBs from
 a terminal or a script.
 

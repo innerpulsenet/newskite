@@ -27,8 +27,8 @@ use super::widgets::{
 
 /// Width at which the three docks sit side by side (below: one scrolling column).
 pub const THREE_COLUMN_MIN: f32 = 900.0;
-/// Time buckets of the stored history trace (24 h / 160 = 9 min each).
-const HISTORY_POINTS: usize = 160;
+/// Cells of the stored history strip (24 h / 48 = 30 min each).
+const HISTORY_POINTS: usize = 48;
 /// Vertical room a dock card takes beyond its content height: the 12 px inner margin on
 /// both sides and the hairline.
 const CARD_CHROME: f32 = 26.0;
@@ -37,7 +37,7 @@ const PULSE_PERIOD: f64 = 1.2;
 /// Frame interval while something in the docks moves.
 const MOTION_FRAME: std::time::Duration = std::time::Duration::from_millis(40);
 /// Height of the 24 h history strip under the live graph, and the shortest live plot.
-const HISTORY_STRIP_H: f32 = 16.0;
+const HISTORY_STRIP_H: f32 = 10.0;
 const MIN_PLOT_H: f32 = 24.0;
 /// Height of a stat tile (figure over label) and of its one-line inline form.
 const TILE_H: f32 = 38.0;
@@ -256,6 +256,15 @@ impl Motion {
             animate: !reduced_motion,
         }
     }
+}
+
+/// Opacity of a history cell holding `v` bytes/s when the busiest cell holds `peak`:
+/// `None` for an idle cell (drawn as an empty well), otherwise 0.3…1 with the busiest at 1.
+pub fn heat_alpha(v: f32, peak: f32) -> Option<f32> {
+    if !v.is_finite() || !peak.is_finite() || v <= 0.0 || peak <= 0.0 {
+        return None;
+    }
+    Some(0.3 + 0.7 * (v / peak).clamp(0.0, 1.0))
 }
 
 /// Phase of a pulse (0…1) → opacity of its ring: bright as it starts, gone as it ends.
@@ -724,7 +733,7 @@ fn graph(ui: &mut Ui, pal: &Palette, data: &Data, motion: Motion) {
     };
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, &summary));
     resp.on_hover_text(format!(
-        "Live: last {} min, one point per second\nStrip: last 24 h in {}-minute bars, idle time at zero ({} samples)\nPeak: {}",
+        "Live: last {} min, one point per second\nStrip: last 24 h in {}-minute cells, brighter = faster, idle cells empty ({} samples)\nPeak: {}",
         LIVE_WINDOW_SECS / 60,
         HISTORY_SECS / 60 / HISTORY_POINTS as u64,
         data.history.len(),
@@ -737,52 +746,21 @@ fn graph(ui: &mut Ui, pal: &Palette, data: &Data, motion: Motion) {
             Vec2::new(ui.available_width(), HISTORY_STRIP_H),
             Sense::hover(),
         );
+        // The segment-cell motif: one cell per 30 minutes, lit in the live color as
+        // bright as that half hour was fast; idle cells stay empty wells.
         let painter = ui.painter_at(strip);
-        painter.rect_filled(strip, CornerRadius::same(3), pal.sunken);
-        // A stepped area (one step per 9-minute bucket) with its top edge drawn, so the
-        // band reads as a small chart rather than a progress track.
         let n = history.len();
-        let step_w = strip.width() / n as f32;
-        let top_pad = 2.0;
-        let mut edge: Vec<Pos2> = Vec::with_capacity(2 * n);
+        let gap = 2.0;
+        let cell_w = ((strip.width() - gap * (n as f32 - 1.0)) / n as f32).max(1.0);
         for (i, &v) in history.iter().enumerate() {
-            let frac = if history_peak > 0.0 && v.is_finite() {
-                (v / history_peak).clamp(0.0, 1.0)
-            } else {
-                0.0
+            let x = strip.left() + i as f32 * (cell_w + gap);
+            let cell =
+                Rect::from_min_size(Pos2::new(x, strip.top()), Vec2::new(cell_w, strip.height()));
+            let color = match heat_alpha(v, history_peak) {
+                Some(a) => Palette::fade(pal.series, a),
+                None => pal.well,
             };
-            let y = painter.round_to_pixel_center(
-                strip.bottom() - 1.0 - frac * (strip.height() - top_pad - 1.0),
-            );
-            let x0 = strip.left() + i as f32 * step_w;
-            edge.push(Pos2::new(x0, y));
-            edge.push(Pos2::new(x0 + step_w, y));
-        }
-        painter.add(gradient_fill(
-            &edge,
-            strip.bottom(),
-            Palette::fade(pal.muted, 0.45),
-            pal.transparent,
-        ));
-        painter.add(Shape::line(
-            edge,
-            Stroke::new(1.0, Palette::fade(pal.muted, 0.9)),
-        ));
-        // The busiest bucket gets a tick in the live color.
-        if history_peak > 0.0 {
-            let (max_i, _) =
-                history
-                    .iter()
-                    .enumerate()
-                    .fold((0, 0.0_f32), |m, (i, &v)| if v > m.1 { (i, v) } else { m });
-            let x = strip.left() + (max_i as f32 + 0.5) * step_w;
-            painter.line_segment(
-                [
-                    Pos2::new(x, strip.top() + top_pad),
-                    Pos2::new(x, strip.bottom() - 1.0),
-                ],
-                Stroke::new(1.5, pal.series),
-            );
+            painter.rect_filled(cell, CornerRadius::same(1), color);
         }
         sresp.on_hover_text(format!(
             "Last 24 h · peak {}",
@@ -1365,6 +1343,16 @@ mod tests {
         assert_eq!(layout_for(960.0), DockLayout::Row);
         assert_eq!(layout_for(900.0), DockLayout::Row);
         assert_eq!(layout_for(899.0), DockLayout::Stack);
+    }
+
+    #[test]
+    fn history_cells_scale_to_the_busiest() {
+        assert_eq!(heat_alpha(0.0, 10.0), None, "idle stays a well");
+        assert_eq!(heat_alpha(5.0, 0.0), None);
+        assert_eq!(heat_alpha(f32::NAN, 10.0), None);
+        assert_eq!(heat_alpha(10.0, 10.0), Some(1.0));
+        let low = heat_alpha(1.0, 10.0).unwrap();
+        assert!((0.3..0.4).contains(&low), "{low}");
     }
 
     #[test]

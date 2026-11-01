@@ -835,6 +835,45 @@ fn dropped_nzb_is_imported() {
 }
 
 #[test]
+fn dragging_shows_the_drop_overlay_and_non_nzbs_are_refused() {
+    let fx = Fixture::new(seed_populated);
+    let mut h = fx.harness_themed(brand_tokens::ink(), SIZE, true, None, true, 0.25);
+    h.run_steps(2);
+    let one = write_nzb(fx.dir.path(), "one.nzb", VALID_NZB);
+    let two = write_nzb(fx.dir.path(), "two.nzb", VALID_NZB);
+    for p in [&one, &two] {
+        h.input_mut().hovered_files.push(egui::HoveredFile {
+            path: Some(p.clone()),
+            ..Default::default()
+        });
+    }
+    h.run_steps(2);
+    h.get_by_label("Drop to add 2 NZBs");
+    snapshot(&mut h, "drop-overlay-ink");
+    h.input_mut().hovered_files.clear();
+    h.run_steps(2);
+    assert!(
+        h.query_by_label("Drop to add 2 NZBs").is_none(),
+        "gone after the drag"
+    );
+
+    // A dropped file that is not an NZB is skipped, and the window says so.
+    let txt = fx.dir.path().join("readme.txt");
+    std::fs::write(&txt, "hello").expect("write");
+    h.input_mut().dropped_files.push(egui::DroppedFile {
+        path: Some(txt),
+        ..Default::default()
+    });
+    h.run_steps(3);
+    let before = fx.service.jobs().len();
+    assert_eq!(
+        app(&h).view.open_nzb.error.as_deref(),
+        Some("Not an NZB file, skipped: readme.txt")
+    );
+    assert_eq!(fx.service.jobs().len(), before);
+}
+
+#[test]
 fn appearance_switches_on_save_and_persists() {
     let fx = Fixture::new(|_, _| {});
     let file = fx.dir.path().join("prefs").join("appearance.json");
