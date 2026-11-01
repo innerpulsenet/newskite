@@ -57,13 +57,14 @@ pub struct PostProcessSettings {
     pub enabled: bool,
     pub repair: bool,
     pub extract: bool,
-    /// Delete archives and parity files after a successful extraction.
+    /// After every archive set extracts: delete the archives, parity files and release
+    /// sidecars (.sfv, .nfo, ...). On by default.
     pub cleanup: bool,
 }
 
 impl Default for PostProcessSettings {
     fn default() -> Self {
-        Self { enabled: true, repair: true, extract: true, cleanup: false }
+        Self { enabled: true, repair: true, extract: true, cleanup: true }
     }
 }
 

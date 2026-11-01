@@ -4,9 +4,10 @@
 // The icon is the innerpulse app icon (ink tile, the six-bar mark unchanged in one solid ember) with
 // the mark lifted and slightly reduced, and one row of eleven small square "article segment" ticks
 // beneath it in the desktop-family violet: the left seven are solid, the rest dim. Articles arriving
-// and assembling into a file. At 16, 24 and 32 px the row is dropped and the kit's whole-pixel stock
-// icon is used as is; at 48 and 64 px the bars and ticks are laid out on the icon's own pixel grid
+// and assembling into a file. At 16 px the row is dropped and the kit's whole-pixel stock
+// icon is used as is; at 24, 32, 48 and 64 px the bars and ticks are laid out on the icon's own pixel grid
 // (rendered at exactly that size, like the kit's snapped icons); from 128 px up the vector is rendered.
+// Below 48 px the row is six ticks, one under each bar (four filled), so they stay apart.
 //
 // Usage (from anywhere):
 //
@@ -26,7 +27,7 @@
 //   packaging/icons/preview.png                                         contact sheet, dark and light grounds
 //   assets/brand/app-icon-256.png                                       window icon embedded by the GUI
 //
-// The 16/24/32 px dark PNGs are copied from assets/brand/kit/icon/png/icon-{16,24,32}.png; the light
+// The 16 px dark PNG is copied from assets/brand/kit/icon/png/icon-16.png; the light
 // ones are rendered from the kit's own snapped light icon (iconSVG({ snap: true, light: true })).
 
 import { createRequire } from 'node:module';
@@ -52,8 +53,9 @@ try { sharp = require('sharp'); } catch {
 
 const APP_ID = 'net.innerpulse.Newskite';
 const SIZES = [16, 24, 32, 48, 64, 128, 256, 512];
-const STOCK = new Set([16, 24, 32]); // the kit's whole-pixel stock icon, no segment row
-const SNAP = new Set([48, 64]); // whole-pixel layout rendered at exactly that size
+const STOCK = new Set([16]); // the kit's whole-pixel stock icon, no segment row (no room at 16 px)
+const SNAP = new Set([24, 32, 48, 64]); // whole-pixel layout rendered at exactly that size
+const SMALL = 48; // below this, one tick per bar (6, 4 filled): half-pitch ticks would merge
 
 const VIOLET = { dark: '#b38cff', light: '#6a3fd0' }; // desktop & native family accent: ink phosphor, paper step
 const THEME = {
@@ -122,12 +124,15 @@ function snappedSVG(theme, size) {
     return `<rect x="${cx - w / 2}" y="${cy - half}" width="${w}" height="${2 * half}"/>`;
   }).join('');
   const left = centre(first) - w / 2;
-  const tp = pitch / 2;
+  const small = size < SMALL;
+  const tp = small ? pitch : pitch / 2;
+  const count = small ? heights.length : TICKS;
+  const filled = small ? 4 : FILLED;
   const ty = cy + markHalf + gap;
-  const ticks = Array.from({ length: TICKS }, (_, i) => {
+  const ticks = Array.from({ length: count }, (_, i) => {
     // with an even bar width the ticks center under the bars; with an odd one they start at each bar's left edge
     const x = w % 2 ? left + tp * i : left + tp * i + (w - tick) / 2;
-    const op = i < FILLED ? '' : ` fill-opacity="${t.dim}"`;
+    const op = i < filled ? '' : ` fill-opacity="${t.dim}"`;
     return `<rect x="${x}" y="${ty}" width="${tick}" height="${tick}"${op}/>`;
   }).join('');
   const r = f(size * RADIUS);

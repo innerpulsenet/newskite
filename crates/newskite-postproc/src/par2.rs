@@ -1,10 +1,10 @@
 //! PAR2 verify/repair through `par2` (par2cmdline).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::detect::{find_par2_sets, is_par2, Par2Set};
+use crate::detect::{find_par2_sets, is_par2, par2_key, par2_set_id, Par2Set};
 use crate::tools::{ToolCommand, ToolRun};
 use crate::Verdict;
 
@@ -125,6 +125,89 @@ fn new_backups(dir: &Path, before: &BTreeSet<String>, after: &BTreeSet<String>) 
         })
         .map(|n| dir.join(n))
         .collect()
+}
+
+/// Give obfuscated PAR2 files (random names, no `.par2` extension) proper names so
+/// par2cmdline accepts them: it only loads a main file and volumes ending in `.par2`.
+/// Files are found by packet magic and grouped by recovery-set id. A group joins an
+/// already-named `.par2` file of the same set when there is one; otherwise its smallest
+/// file becomes `newskite-<id>.par2` and the rest `.volNNN+01.par2` volumes. par2's
+/// repair then matches the data files by content and renames them back. Never
+/// overwrites an existing file. Returns the number of files renamed.
+pub(crate) fn name_obfuscated_par2(dir: &Path, files: &[PathBuf], log: &mut dyn FnMut(String)) -> usize {
+    let mut named: BTreeMap<[u8; 16], String> = BTreeMap::new();
+    let mut groups: BTreeMap<[u8; 16], Vec<(u64, PathBuf)>> = BTreeMap::new();
+    for f in files {
+        let Some(id) = par2_set_id(f) else { continue };
+        if is_par2(f) {
+            let key = f.file_name().and_then(|n| par2_key(&n.to_string_lossy())).map(|(k, _)| k);
+            if let Some(key) = key {
+                named.entry(id).or_insert(key);
+            }
+        } else {
+            let size = std::fs::metadata(f).map(|m| m.len()).unwrap_or(u64::MAX);
+            groups.entry(id).or_default().push((size, f.clone()));
+        }
+    }
+    let mut renamed = 0;
+    for (id, mut members) in groups {
+        members.sort();
+        let (base, mut need_main) = match named.get(&id) {
+            Some(key) => (key.clone(), false),
+            None => (format!("newskite-{}", id[..4].iter().map(|b| format!("{b:02x}")).collect::<String>()), true),
+        };
+        let mut vol = 0u32;
+        for (_, src) in members {
+            let target = loop {
+                let name = if need_main {
+                    format!("{base}.par2")
+                } else {
+                    vol += 1;
+                    format!("{base}.vol{vol:03}+01.par2")
+                };
+                let candidate = dir.join(&name);
+                if !candidate.exists() {
+                    break candidate;
+                }
+                if need_main {
+                    // The main name is taken by an unrelated file: fall back to volumes only
+                    // under a name that cannot clash.
+                    need_main = false;
+                }
+            };
+            match rename_no_clobber(&src, &target) {
+                Ok(()) => {
+                    log(format!(
+                        "par2: {} is a PAR2 file; named it {}",
+                        src.file_name().unwrap_or_default().to_string_lossy(),
+                        target.file_name().unwrap_or_default().to_string_lossy()
+                    ));
+                    need_main = false;
+                    renamed += 1;
+                }
+                Err(e) => log(format!(
+                    "par2: could not name PAR2 file {}: {e}",
+                    src.file_name().unwrap_or_default().to_string_lossy()
+                )),
+            }
+        }
+    }
+    renamed
+}
+
+/// Rename without replacing an existing file: hard-link then unlink (atomic no-clobber),
+/// falling back to a checked rename on file systems without hard links.
+fn rename_no_clobber(src: &Path, dst: &Path) -> std::io::Result<()> {
+    match std::fs::hard_link(src, dst) {
+        Ok(()) => std::fs::remove_file(src),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(e),
+        Err(_) => {
+            if dst.exists() {
+                return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "target exists"));
+            }
+            std::fs::rename(src, dst)
+        }
+    }
 }
 
 /// Verify (and if allowed, repair) every PAR2 set in `dir`.
