@@ -144,6 +144,68 @@ async fn body_binary_bytes_and_bare_lf_payload() {
 }
 
 #[tokio::test]
+async fn pipelined_bodies_arrive_in_order() {
+    let big: Vec<u8> = (0..200_000u32).map(|i| b'a' + (i % 26) as u8).collect();
+    let mut big_body = Vec::new();
+    for line in big.chunks(128) {
+        big_body.extend_from_slice(line);
+        big_body.extend_from_slice(b"\r\n");
+    }
+    let mock = MockServer::start(MockConfig {
+        articles: articles(&[("one@x", b"first\r\n"), ("big@x", &big_body), ("three@x", b".dot\r\n")]),
+        ..Default::default()
+    })
+    .await;
+    let mut conn = NntpConnection::connect(&server_cfg(mock.addr, "", ""), TIMEOUT).await.unwrap();
+    conn.send_body("one@x").await.unwrap();
+    conn.send_body("gone@x").await.unwrap();
+    conn.send_body("big@x").await.unwrap();
+    conn.send_body("three@x").await.unwrap();
+    assert_eq!(conn.outstanding_bodies(), 4);
+    // Other commands wait until the pipeline is drained.
+    assert!(matches!(conn.date().await, Err(NntpError::Protocol(_))));
+    assert!(!conn.is_broken());
+
+    conn.begin_body("one@x").await.unwrap();
+    assert!(matches!(conn.send_body("x@y").await, Err(NntpError::Protocol(_))), "no send inside a body");
+    assert_eq!(conn.finish_body().await.unwrap(), b"first\r\n");
+    assert!(matches!(conn.begin_body("gone@x").await, Err(NntpError::ArticleMissing(id)) if id == "gone@x"));
+    conn.begin_body("big@x").await.unwrap();
+    assert_eq!(conn.finish_body().await.unwrap(), big_body);
+    conn.begin_body("three@x").await.unwrap();
+    assert_eq!(conn.finish_body().await.unwrap(), b".dot\r\n");
+    assert_eq!(conn.outstanding_bodies(), 0);
+    assert!(matches!(conn.begin_body("one@x").await, Err(NntpError::Protocol(_))));
+    assert!(matches!(conn.finish_body().await, Err(NntpError::Protocol(_))));
+    // Back to normal commands.
+    assert_eq!(conn.date().await.unwrap().code, 111);
+    assert_eq!(conn.body("one@x").await.unwrap(), b"first\r\n");
+    conn.quit().await;
+}
+
+#[tokio::test]
+async fn body_larger_than_the_read_buffer_is_assembled() {
+    // Several hundred KB with stuffed dots and blank lines spread across buffer chunks.
+    let mut payload = Vec::new();
+    for i in 0..6_000u32 {
+        match i % 7 {
+            0 => payload.extend_from_slice(b".\r\n"),
+            1 => payload.extend_from_slice(b"\r\n"),
+            2 => payload.extend_from_slice(b"..x\r\n"),
+            _ => {
+                payload.extend(std::iter::repeat_n(b'q', 100 + (i % 50) as usize));
+                payload.extend_from_slice(b"\r\n");
+            }
+        }
+    }
+    let mock = MockServer::start(MockConfig { articles: articles(&[("huge@x", &payload)]), ..Default::default() }).await;
+    let mut conn = NntpConnection::connect(&server_cfg(mock.addr, "", ""), TIMEOUT).await.unwrap();
+    assert_eq!(conn.body("huge@x").await.unwrap(), payload);
+    assert_eq!(conn.body("huge@x").await.unwrap(), payload);
+    assert!(conn.stat("huge@x").await.unwrap());
+}
+
+#[tokio::test]
 async fn server_using_bare_lf_is_tolerated() {
     let (addr, server) = scripted("200 sloppy\n", vec!["222 0 <a@b>\n..x\nplain\n.\n"]).await;
     let mut conn = NntpConnection::connect(&server_cfg(addr, "", ""), TIMEOUT).await.unwrap();
