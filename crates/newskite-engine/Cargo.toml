@@ -20,3 +20,7 @@ newskite-nntp = { workspace = true, features = ["testkit"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 sha2 = "0.10"
 tempfile = "3.27"
+
+[[bench]]
+name = "throughput"
+harness = false
