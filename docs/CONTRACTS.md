@@ -227,8 +227,10 @@ impl Store {
   pub fn set_job_progress(&self,id:i64,bytes_done:u64)->Result<(),_>;
   pub fn set_job_password(&self,id:i64,pw:Option<&str>)->Result<(),_>;
   pub fn remove_job(&self,id:i64)->Result<(),_> /* also its job_files */;
-  pub fn next_runnable_job(&self)->Result<Option<Job>,_> /* queued|paused, oldest created_at then id */;
+  pub fn next_runnable_job(&self)->Result<Option<Job>,_> /* queued only (paused = held), queue order: position, created_at, id */;
   pub fn next_runnable_job_among(&self,ids:&[i64])->Result<Option<Job>,_> /* additive: same, restricted to ids; empty ids -> None */;
+  pub fn queue_order(&self)->Result<Vec<i64>,_> /* pending ids (queued|downloading|paused) in queue order */;
+  pub fn set_queue_order(&self,ids:&[i64])->Result<(),_> /* positions 1.. in the given order */;
   pub fn reset_interrupted(&self)->Result<usize,_> /* downloading -> queued, at startup (the lock makes the opener the only owner) */;
   pub fn upsert_job_file(&self,f:&JobFile)->Result<(),_>; pub fn job_files(&self,job_id:i64)->Result<Vec<JobFile>,_>;
   // bookmarks
@@ -362,10 +364,11 @@ impl Service {
   pub fn shutdown(&self);               // stop timers, cancel active job (job left resumable)
 }
 ```
-Queue rules (F4): run processes `queued`/`paused` oldest first; `pause()` = stop after the
-current job finishes (cooperative) — set state of the next jobs untouched; `resume()` clears
-pause and starts a run if none active. Pausing mid-job is NOT done (outline allows the
-simplification); `remove_job` on the active job cancels it. Progress persisted at most every
+Queue rules (F4): run processes `queued` jobs in queue order (`paused` = held by the user,
+skipped); `pause()` = stop after the current job finishes (cooperative) — set state of the
+next jobs untouched; `pause_now()` also interrupts the current job back to `queued`;
+`resume()` clears pause and starts a run if none active; `remove_job` on the active job
+cancels it. See "NZB-focus pass" below for the per-job commands. Progress persisted at most every
 second and at file end. Restart resume: `reset_interrupted` + JobFile rows with state "done"
 become `skip_files`, except a row whose file is missing or whose on-disk length differs from
 `bytes_total` (a shorter one, as lost writes leave it, is deleted so it is fetched again under its
@@ -555,3 +558,33 @@ summary line. Theme: with the portal in use, `ThemeWatcher` re-resolves on a hel
 keeps a portal theme through up to two unanswered refreshes. GUI snapshot tests compare against
 the PNGs in `tests/snapshots/` (kittest, threshold 0.6, a small pixel allowance for clock
 text); `UPDATE_SNAPSHOTS=1` rewrites them, and failures leave `*.new.png`/`*.diff.png` (ignored by git).
+
+NZB-focus pass (UX overhaul). Search, browsing and bookmarks are out of the product: the GUI
+has no sidebar, no Search/Latest tabs and no My List/Newsgroups/Auto Search buttons (the
+store keeps its bookmark table and API for database compatibility; nothing in the GUI uses
+them). Store: schema v3 adds `jobs.position` (0 until the user reorders; new jobs go last
+after a reorder); `next_runnable_job*` take `queued` only, in queue order; `queue_order`,
+`set_queue_order`. Service (additive): `pause_now()`; `pause_job(id)` (queued -> paused; the
+active job is interrupted and becomes paused, the run moves on; done/failed refused);
+`start_job(id)` (paused/queued -> queued, failed retried first; starts a run limited to that
+job, or adds it to an active limited run; clears a pause); `move_job(id, JobMove::{Top, Up,
+Down, Bottom})`; `queue_order()`; `clear_history() -> usize` (removes done/failed rows, NZBs
+marked seen); `Status::run_scope: Option<Vec<i64>>` (the ids an active limited run takes).
+An interrupted job is not counted as processed (no "queue finished" or auto-shutdown for a
+run that only interrupted). GUI: toolbar = masthead, Add NZB, the queue control (Start /
+Pause / Resume by state; Pause is `pause_now`), Scan Folder (only with a watch folder),
+Downloads, Settings. Center = tabs `Queue (n)` (pending jobs in queue order: #, name, state,
+size, progress, controls) and `History (n)` (done/failed, newest first, Clear history with
+inline confirmation), a name filter (Ctrl+F). Row controls: a start/pause toggle
+(`queue::toggle_action`: downloading -> pause; queued in the active run -> hold; queued
+outside any run or held -> start on its own; failed -> retry), move up, a row menu (also on
+right click: pause/hold/resume/download now, move to top/up/down/bottom, open folder,
+archive password, remove) and remove. A click selects a row; keys act on the selection
+(Space toggle, Delete asks to remove, Alt+Up/Down move, Esc clears). Docks = Throughput
+(speed, bytes left and time left from the measured speed only, live + 24 h graph), Details
+(the selected job's facts and per-file progress from `job_files`, or with no selection the
+server, connection slots and `Articles`/`Missing`/`Downloaded` tiles) and Log (All /
+Warnings / Errors filter); three across from 900 px, one scrolling column below. Status
+bar: free space on the download folder's filesystem (`gui::disk::free_bytes`, statvfs via
+rustix; warning color below 2 GiB or below what the queue still needs) and the lifetime
+total at the left, the state pill and credit at the right.

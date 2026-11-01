@@ -37,6 +37,9 @@ const DOWNLOADED_BYTES_KEY: &str = "downloaded_bytes";
 const JOB_COLUMNS: &str =
     "id, name, state, bytes_total, bytes_done, dest_dir, source_path, created_at, error, password";
 
+/// Queue order: explicit position, then age, then id.
+const QUEUE_ORDER: &str = "position ASC, created_at ASC, id ASC";
+
 const BOOKMARK_COLUMNS: &str = "id, parent_id, name, newsgroup, color, expanded, ord";
 
 /// Thread-safe handle to the Newskite database.
@@ -282,9 +285,12 @@ impl Store {
     /// importing history and by tests of queue ordering.
     pub fn insert_job_at(&self, j: &NewJob, created_at: i64) -> Result<Job, StoreError> {
         let conn = self.conn();
+        // Position 0 while the queue was never reordered (created_at order applies);
+        // after a move every pending job has a position and a new one goes last.
         conn.execute(
-            "INSERT INTO jobs (name, state, bytes_total, bytes_done, dest_dir, source_path, created_at, error, password)
-             VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6, NULL, ?7)",
+            "INSERT INTO jobs (name, state, bytes_total, bytes_done, dest_dir, source_path, created_at, error, password, position)
+             VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6, NULL, ?7,
+                     (SELECT CASE WHEN MAX(position) > 0 THEN MAX(position) + 1 ELSE 0 END FROM jobs))",
             params![
                 j.name,
                 JobState::Queued.as_str(),
@@ -387,15 +393,16 @@ impl Store {
         Ok(())
     }
 
-    /// The next job a queue run should process: state `queued` or `paused`, oldest
-    /// `created_at` first, ties broken by id.
+    /// The next job a queue run should process: state `queued` (a `paused` job is held by
+    /// the user and skipped), in queue order: `position`, then oldest `created_at`, ties
+    /// broken by id.
     pub fn next_runnable_job(&self) -> Result<Option<Job>, StoreError> {
         let conn = self.conn();
         Ok(conn
             .query_row(
                 &format!(
-                    "SELECT {JOB_COLUMNS} FROM jobs WHERE state IN ('queued', 'paused')
-                     ORDER BY created_at ASC, id ASC LIMIT 1"
+                    "SELECT {JOB_COLUMNS} FROM jobs WHERE state = 'queued'
+                     ORDER BY {QUEUE_ORDER} LIMIT 1"
                 ),
                 [],
                 job_from_row,
@@ -404,8 +411,8 @@ impl Store {
     }
 
     /// Like [`Store::next_runnable_job`], restricted to the jobs whose id is in `ids`
-    /// (same order: oldest `created_at` first, ties broken by id). Ids that do not exist
-    /// or are not `queued`/`paused` are ignored; an empty `ids` yields `None`.
+    /// (same queue order). Ids that do not exist or are not `queued` are ignored; an
+    /// empty `ids` yields `None`.
     pub fn next_runnable_job_among(&self, ids: &[i64]) -> Result<Option<Job>, StoreError> {
         if ids.is_empty() {
             return Ok(None);
@@ -415,14 +422,36 @@ impl Store {
         Ok(conn
             .query_row(
                 &format!(
-                    "SELECT {JOB_COLUMNS} FROM jobs WHERE state IN ('queued', 'paused')
+                    "SELECT {JOB_COLUMNS} FROM jobs WHERE state = 'queued'
                      AND id IN ({placeholders})
-                     ORDER BY created_at ASC, id ASC LIMIT 1"
+                     ORDER BY {QUEUE_ORDER} LIMIT 1"
                 ),
                 rusqlite::params_from_iter(ids.iter()),
                 job_from_row,
             )
             .optional()?)
+    }
+
+    /// Ids of the pending jobs (`queued`, `downloading`, `paused`) in queue order.
+    pub fn queue_order(&self) -> Result<Vec<i64>, StoreError> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id FROM jobs WHERE state IN ('queued', 'downloading', 'paused') ORDER BY {QUEUE_ORDER}"
+        ))?;
+        let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Gives the jobs in `ids` the queue positions 1, 2, 3… in that order (one
+    /// transaction). Ids that do not exist are ignored.
+    pub fn set_queue_order(&self, ids: &[i64]) -> Result<(), StoreError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        for (i, id) in ids.iter().enumerate() {
+            tx.execute("UPDATE jobs SET position = ?2 WHERE id = ?1", params![id, i as i64 + 1])?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Startup recovery: every job left `downloading` by a previous process becomes

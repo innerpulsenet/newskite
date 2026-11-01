@@ -1,32 +1,32 @@
-//! Bottom docks (outline §6.3): Connection Graph, NNTP Activity, Messages, Your Account.
+//! Bottom docks: Throughput, Details and Log.
 //!
-//! Each dock is a card under a mono eyebrow. Readings are **stat tiles** (a large mono
-//! figure over a small label) rather than key/value rows. The graph keeps the live trace
-//! and the 24 h history on separate bands so two time axes never share one plot; the
-//! activity dock draws the connections as a row of slots; the account dock adds a segment
-//! track of the queue's completion; the message log keeps fixed level and time columns so
-//! long lines wrap under their own text. Motion (the live marker's pulse, the slot shimmer,
-//! a new message's fade) runs only while bytes move and stops under reduced motion.
+//! Each dock is a card under a mono eyebrow. **Throughput** keeps the live trace and the
+//! 24 h history on separate bands so two time axes never share one plot, under the speed
+//! and what is left to download. **Details** follows the selection: the selected job's
+//! facts and per-file progress, or, with nothing selected, the server (connection slots,
+//! articles this session) and lifetime totals as stat tiles. **Log** keeps fixed level and
+//! time columns so long lines wrap under their own text, with a level filter. Motion (the
+//! live marker's pulse, the slot shimmer, a new message's fade) runs only while bytes move
+//! and stops under reduced motion.
 
 use eframe::egui::{
     self, epaint, Color32, CornerRadius, FontId, Id, Pos2, Rect, RichText, Sense, Shape, Stroke,
     StrokeKind, Ui, Vec2,
 };
-use newskite_service::{LogLevel, LogLine};
+use newskite_service::{Job, JobState, LogLevel, LogLine};
 use newskite_types::format;
 
 use super::app::{Action, Data, HISTORY_SECS, LIVE_WINDOW_SECS};
 use super::fonts;
+use super::queue::eta_secs;
 use super::theme::Palette;
 use super::widgets::{
-    card, kit_button, paint_icon, section_title, segment_track, spaced, status_chip, ButtonKind,
-    Icon, Status,
+    card, icon_button, kit_button, paint_icon, section_title, segment_track, spaced, state_badge,
+    status_chip, ButtonKind, Icon, Status,
 };
 
-/// Width at which the four docks sit side by side.
-pub const FOUR_COLUMN_MIN: f32 = 1100.0;
-/// Width at which the docks form a 2×2 grid (below: one column).
-pub const TWO_COLUMN_MIN: f32 = 960.0;
+/// Width at which the three docks sit side by side (below: one scrolling column).
+pub const THREE_COLUMN_MIN: f32 = 900.0;
 /// Time buckets of the stored history trace (24 h / 160 = 9 min each).
 const HISTORY_POINTS: usize = 160;
 /// Vertical room a dock card takes beyond its content height: the 12 px inner margin on
@@ -56,23 +56,59 @@ const MESSAGE_FADE_SECS: f32 = 1.6;
 /// Dock arrangement for a given window width.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DockLayout {
-    /// Four side by side.
+    /// Three side by side.
     Row,
-    /// Two by two.
-    Grid,
     /// One column (scrolls).
     Stack,
 }
 
 /// Picks the arrangement for `width` (logical pixels).
 pub fn layout_for(width: f32) -> DockLayout {
-    if width >= FOUR_COLUMN_MIN {
+    if width >= THREE_COLUMN_MIN {
         DockLayout::Row
-    } else if width >= TWO_COLUMN_MIN {
-        DockLayout::Grid
     } else {
         DockLayout::Stack
     }
+}
+
+/// Which log lines the Log dock shows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LogFilter {
+    /// Every line.
+    #[default]
+    All,
+    /// Warnings and errors.
+    Problems,
+    /// Errors only.
+    Errors,
+}
+
+impl LogFilter {
+    const ALL: [LogFilter; 3] = [LogFilter::All, LogFilter::Problems, LogFilter::Errors];
+
+    /// Whether a line of `level` is shown.
+    pub fn admits(self, level: LogLevel) -> bool {
+        match self {
+            LogFilter::All => true,
+            LogFilter::Problems => level != LogLevel::Info,
+            LogFilter::Errors => level == LogLevel::Error,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            LogFilter::All => "All",
+            LogFilter::Problems => "Warnings",
+            LogFilter::Errors => "Errors",
+        }
+    }
+}
+
+/// Dock UI state.
+#[derive(Default)]
+pub struct DockState {
+    /// The Log dock's level filter.
+    pub log_filter: LogFilter,
 }
 
 /// Mean of each of at most `max_points` equal chunks of `values` (keeps the shape of a
@@ -186,23 +222,13 @@ pub fn time_points(
 
 #[derive(Clone, Copy)]
 enum Dock {
-    Graph,
-    Activity,
-    Messages,
-    Account,
+    Throughput,
+    Details,
+    Log,
 }
 
 impl Dock {
-    const ALL: [Dock; 4] = [Dock::Graph, Dock::Activity, Dock::Messages, Dock::Account];
-
-    fn title(self) -> &'static str {
-        match self {
-            Dock::Graph => "Connection Graph",
-            Dock::Activity => "NNTP Activity",
-            Dock::Messages => "Messages",
-            Dock::Account => "Your Account",
-        }
-    }
+    const ALL: [Dock; 3] = [Dock::Throughput, Dock::Details, Dock::Log];
 }
 
 /// What moves this frame: the clock phase of the busy beat (0…1) and whether anything
@@ -267,60 +293,78 @@ pub fn slot_shimmer(i: usize, n: usize, phase: f32) -> f32 {
     0.72 + 0.28 * (0.5 + 0.5 * wave)
 }
 
-/// A card's content height and whether width is plentiful but height short (the 2×2
-/// grid), where tiles pack more per row.
-#[derive(Clone, Copy)]
-struct Fit {
-    height: f32,
-    compact: bool,
+/// Everything a dock needs to draw.
+struct Ctx<'a> {
+    pal: &'a Palette,
+    data: &'a Data,
+    selected: Option<&'a Job>,
+    motion: Motion,
 }
 
 fn dock(
     ui: &mut Ui,
-    pal: &Palette,
-    data: &Data,
-    motion: Motion,
+    c: &Ctx<'_>,
     which: Dock,
-    fit: Fit,
+    height: f32,
+    state: &mut DockState,
     actions: &mut Vec<Action>,
 ) {
-    let Fit { height, compact } = fit;
+    let pal = c.pal;
     card(pal).show(ui, |ui| {
         // An exact height: every card of a row lines up, and content that does not fit
         // scrolls inside its card instead of pushing the next row down.
         ui.set_min_height(height);
         ui.set_max_height(height.max(60.0));
         ui.set_width(ui.available_width());
-        section_title(ui, pal, which.title());
+        ui.horizontal(|ui| {
+            ui.set_min_height(18.0);
+            let title = match which {
+                Dock::Throughput => "Throughput",
+                Dock::Details if c.selected.is_some() => "Details",
+                Dock::Details => "Server",
+                Dock::Log => "Log",
+            };
+            section_title(ui, pal, title);
+            ui.with_layout(
+                egui::Layout::right_to_left(egui::Align::Center),
+                |ui| match which {
+                    Dock::Log => log_filter_chips(ui, pal, &mut state.log_filter),
+                    Dock::Details if c.selected.is_some() => {
+                        if icon_button(ui, pal, Icon::Close, pal.muted, "Clear the selection (Esc)")
+                            .clicked()
+                        {
+                            actions.push(Action::Select(None));
+                        }
+                    }
+                    _ => {}
+                },
+            );
+        });
         ui.add_space(6.0);
         match which {
-            Dock::Graph => graph(ui, pal, data, motion),
-            Dock::Messages => messages(ui, pal, &data.logs, motion.animate),
-            Dock::Activity | Dock::Account => {
+            Dock::Throughput => graph(ui, pal, c.data, c.motion),
+            Dock::Log => messages(ui, pal, &c.data.logs, state.log_filter, c.motion.animate),
+            Dock::Details => {
                 egui::ScrollArea::vertical()
-                    .id_salt(("dock-body", which.title()))
+                    .id_salt("dock-details")
                     .auto_shrink([false, false])
                     .max_height(ui.available_height().max(20.0))
-                    .show(ui, |ui| match which {
-                        Dock::Activity => activity(ui, pal, data, motion, compact, actions),
-                        _ => account(ui, pal, data, compact),
+                    .show(ui, |ui| match c.selected {
+                        Some(job) => details(ui, pal, c.data, job, actions),
+                        None => activity(ui, pal, c.data, c.motion, actions),
                     });
             }
         }
     });
 }
 
-/// Content height of each dock card in the 2×2 grid for a dock panel `available`
-/// tall: two rows of cards (each with its [`CARD_CHROME`]) and the gap between them.
-pub fn grid_card_height(available: f32, gap: f32) -> f32 {
-    ((available - 2.0 * CARD_CHROME - gap) / 2.0).max(80.0)
-}
-
-/// Draws the four docks in the arrangement that fits the available width.
+/// Draws the three docks in the arrangement that fits the available width.
 pub fn show(
     ui: &mut Ui,
     pal: &Palette,
     data: &Data,
+    selected: Option<i64>,
+    state: &mut DockState,
     reduced_motion: bool,
     actions: &mut Vec<Action>,
 ) {
@@ -328,72 +372,45 @@ pub fn show(
     if motion.moving {
         ui.ctx().request_repaint_after(MOTION_FRAME);
     }
+    let c = Ctx {
+        pal,
+        data,
+        selected: selected.and_then(|id| data.jobs.iter().find(|j| j.id == id)),
+        motion,
+    };
     let width = ui.ctx().content_rect().width();
     match layout_for(width) {
         DockLayout::Row => {
             let h = (ui.available_height() - CARD_CHROME).max(80.0);
-            ui.columns(4, |cols| {
+            ui.columns(3, |cols| {
                 for (col, which) in cols.iter_mut().zip(Dock::ALL) {
-                    dock(
-                        col,
-                        pal,
-                        data,
-                        motion,
-                        which,
-                        Fit {
-                            height: h,
-                            compact: false,
-                        },
-                        actions,
-                    );
+                    dock(col, &c, which, h, state, actions);
                 }
             });
-        }
-        DockLayout::Grid => {
-            let gap = ui.spacing().item_spacing.y;
-            let h = grid_card_height(ui.available_height(), gap);
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    for pair in Dock::ALL.chunks(2) {
-                        ui.columns(2, |cols| {
-                            for (col, which) in cols.iter_mut().zip(pair.iter().copied()) {
-                                dock(
-                                    col,
-                                    pal,
-                                    data,
-                                    motion,
-                                    which,
-                                    Fit {
-                                        height: h,
-                                        compact: true,
-                                    },
-                                    actions,
-                                );
-                            }
-                        });
-                    }
-                });
         }
         DockLayout::Stack => {
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     for which in Dock::ALL {
-                        dock(
-                            ui,
-                            pal,
-                            data,
-                            motion,
-                            which,
-                            Fit {
-                                height: 120.0,
-                                compact: false,
-                            },
-                            actions,
-                        );
+                        dock(ui, &c, which, 150.0, state, actions);
                     }
                 });
+        }
+    }
+}
+
+fn log_filter_chips(ui: &mut Ui, pal: &Palette, filter: &mut LogFilter) {
+    ui.spacing_mut().item_spacing.x = 2.0;
+    // Right to left: the last chip is drawn first.
+    for f in LogFilter::ALL.iter().rev() {
+        let on = *filter == *f;
+        let text = RichText::new(f.label())
+            .font(fonts::mono_id(10.5))
+            .color(if on { pal.text } else { pal.faint });
+        let resp = ui.add(egui::Button::selectable(on, text).corner_radius(CornerRadius::same(4)));
+        if resp.clicked() {
+            *filter = *f;
         }
     }
 }
@@ -548,9 +565,8 @@ fn gradient_fill(points: &[Pos2], bottom: f32, top: Color32, clear: Color32) -> 
 fn graph(ui: &mut Ui, pal: &Palette, data: &Data, motion: Motion) {
     // Every gap below is explicit, so the bands fit the card's budget exactly.
     ui.spacing_mut().item_spacing.y = 0.0;
-    let pending = data.totals.jobs_pending;
-    let total = data.jobs.len();
     let speed = data.speed();
+    let left = data.bytes_left();
     ui.horizontal(|ui| {
         ui.label(
             RichText::new(format::speed(speed))
@@ -569,8 +585,17 @@ fn graph(ui: &mut Ui, pal: &Palette, data: &Data, motion: Motion) {
                 .circle_filled(r.center(), 3.0, Palette::fade(pal.series, alpha));
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let text = match eta_secs(left, speed) {
+                _ if left == 0 => "Nothing left".to_owned(),
+                Some(eta) if data.status.running => format!(
+                    "{} left · {}",
+                    format::bytes(left),
+                    format::duration_secs(eta)
+                ),
+                _ => format!("{} left", format::bytes(left)),
+            };
             ui.label(
-                RichText::new(format!("Remaining: {pending} / {total} jobs"))
+                RichText::new(text)
                     .font(fonts::mono_id(11.0))
                     .color(pal.muted),
             );
@@ -820,14 +845,7 @@ fn slots(ui: &mut Ui, pal: &Palette, max: usize, effective: usize, active: bool,
     ));
 }
 
-fn activity(
-    ui: &mut Ui,
-    pal: &Palette,
-    data: &Data,
-    motion: Motion,
-    compact: bool,
-    actions: &mut Vec<Action>,
-) {
+fn activity(ui: &mut Ui, pal: &Palette, data: &Data, motion: Motion, actions: &mut Vec<Action>) {
     let s = &data.settings;
     match s.first_usable_server() {
         None => {
@@ -850,6 +868,8 @@ fn activity(
             {
                 actions.push(Action::OpenSettings);
             }
+            ui.add_space(10.0);
+            account(ui, pal, data);
         }
         Some(server) => {
             let others = s.usable_servers().len().saturating_sub(1);
@@ -886,41 +906,12 @@ fn activity(
             let address = RichText::new(server.address())
                 .font(fonts::mono_id(12.5))
                 .color(pal.text);
-            // Real counts from this session's engine events, never estimates.
-            let mut stats = vec![
-                Stat::new(
-                    data.articles_fetched.to_string(),
-                    "Articles fetched",
-                    pal.text,
-                ),
-                Stat::new(
-                    data.articles_missing.to_string(),
-                    "Missing",
-                    if data.articles_missing > 0 {
-                        pal.warning
-                    } else {
-                        pal.text
-                    },
-                ),
-            ];
-            if compact {
-                // Short and wide: identity on one line, three tiles, the slot row last.
+            {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(address);
+                    ui.add_space(4.0);
                     identity(ui);
                 });
-                ui.add_space(4.0);
-                stats.push(Stat::new(
-                    format!("{effective} / {max}"),
-                    "Connections",
-                    pal.text,
-                ));
-                tiles(ui, pal, &stats, 3, true);
-                slots(ui, pal, max, effective, active, motion);
-            } else {
-                ui.label(address);
-                ui.add_space(2.0);
-                ui.horizontal_wrapped(identity);
                 ui.add_space(6.0);
                 eyebrow_row(
                     ui,
@@ -931,8 +922,8 @@ fn activity(
                 );
                 ui.add_space(3.0);
                 slots(ui, pal, max, effective, active, motion);
-                ui.add_space(8.0);
-                tiles(ui, pal, &stats, 2, false);
+                ui.add_space(10.0);
+                account(ui, pal, data);
             }
         }
     }
@@ -959,9 +950,20 @@ fn level_color(pal: &Palette, level: LogLevel) -> Color32 {
 /// Messages, newest first, in three columns: a level mark, the clock, the text (which
 /// wraps under itself, never under the clock). A line seen for the first time after the
 /// dock's first frame carries an accent band that fades out.
-fn messages(ui: &mut Ui, pal: &Palette, logs: &[LogLine], animate: bool) {
+fn messages(ui: &mut Ui, pal: &Palette, logs: &[LogLine], filter: LogFilter, animate: bool) {
     if logs.is_empty() {
         ui.label(RichText::new("No messages yet").color(pal.muted));
+        return;
+    }
+    let shown: Vec<&LogLine> = logs.iter().filter(|l| filter.admits(l.level)).collect();
+    if shown.is_empty() {
+        ui.label(
+            RichText::new(match filter {
+                LogFilter::Errors => "No errors",
+                _ => "No warnings or errors",
+            })
+            .color(pal.muted),
+        );
         return;
     }
     let ctx = ui.ctx().clone();
@@ -973,7 +975,7 @@ fn messages(ui: &mut Ui, pal: &Palette, logs: &[LogLine], animate: bool) {
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 3.0;
             let text_w = (ui.available_width() - LEVEL_COL_W - TIME_COL_W - 10.0).max(40.0);
-            for line in logs {
+            for line in shown {
                 let id = Id::new(("logline", line.ts, &line.text));
                 let seen = ctx.data(|d| d.get_temp::<bool>(id)).unwrap_or(false);
                 if !seen {
@@ -1045,42 +1047,190 @@ fn messages(ui: &mut Ui, pal: &Palette, logs: &[LogLine], animate: bool) {
     }
 }
 
-fn account(ui: &mut Ui, pal: &Palette, data: &Data, compact: bool) {
-    let t = &data.totals;
-    let mut stats = vec![
-        Stat::new(format::bytes(t.downloaded_bytes), "Downloaded", pal.text),
-        Stat::new(t.jobs_done.to_string(), "Jobs done", pal.text),
-        Stat::new(t.jobs_pending.to_string(), "Jobs pending", pal.text),
+/// One row of stat tiles: this session's articles (real counts from engine events,
+/// never estimates) and the lifetime download total. Job counts live on the History tab.
+fn account(ui: &mut Ui, pal: &Palette, data: &Data) {
+    let stats = [
+        Stat::new(data.articles_fetched.to_string(), "Articles", pal.text),
+        Stat::new(
+            data.articles_missing.to_string(),
+            "Missing",
+            if data.articles_missing > 0 {
+                pal.warning
+            } else {
+                pal.text
+            },
+        ),
+        Stat::new(
+            format::bytes(data.totals.downloaded_bytes),
+            "Downloaded",
+            pal.text,
+        ),
     ];
-    if t.jobs_failed > 0 {
-        stats.push(Stat::new(
-            t.jobs_failed.to_string(),
-            "Jobs failed",
-            pal.negative,
-        ));
-    }
-    stats.push(Stat::new(
-        data.settings.max_connections.to_string(),
-        "Max connections",
-        pal.text,
-    ));
-    tiles(ui, pal, &stats, if compact { 3 } else { 2 }, compact);
+    tiles(ui, pal, &stats, 3, false);
+}
 
-    // The queue's completion: done over everything queued that is still known. The
-    // short cards of the 2×2 grid have no room for it.
-    let known = t.jobs_done + t.jobs_pending + t.jobs_failed;
-    if known > 0 && !compact {
-        ui.add_space(2.0);
-        eyebrow_row(
+/// The selected job: its facts and per-file progress.
+fn details(ui: &mut Ui, pal: &Palette, data: &Data, job: &Job, actions: &mut Vec<Action>) {
+    // Nothing in here may widen the card (long paths and names truncate instead).
+    ui.set_max_width(ui.available_width());
+    ui.horizontal(|ui| {
+        state_badge(ui, pal, job.state);
+        ui.add(egui::Label::new(RichText::new(&job.name).strong().color(pal.text)).truncate())
+            .on_hover_text(&job.name);
+    });
+    ui.add_space(6.0);
+    let done = data.shown_done(job);
+    // Key/value rows; each value truncates to the card (full text on hover).
+    let fact = |ui: &mut Ui, key: &str, value: RichText, tip: Option<String>| {
+        ui.horizontal(|ui| {
+            let (r, _) = ui.allocate_exact_size(Vec2::new(64.0, 16.0), Sense::hover());
+            ui.painter().text(
+                r.left_center(),
+                egui::Align2::LEFT_CENTER,
+                key,
+                FontId::proportional(11.5),
+                pal.muted,
+            );
+            let resp = ui.add(egui::Label::new(value).truncate().sense(Sense::click()));
+            match tip {
+                Some(t) => resp.on_hover_text(t),
+                None => resp,
+            }
+        })
+        .inner
+    };
+    fact(
+        ui,
+        "Progress",
+        RichText::new(format!(
+            "{} of {} ({}%)",
+            format::bytes(done),
+            format::bytes(job.bytes_total),
+            format::percent(done, job.bytes_total)
+        ))
+        .font(fonts::mono_id(11.5))
+        .color(pal.text),
+        None,
+    );
+    if job.state == JobState::Downloading {
+        if let Some(eta) = eta_secs(job.bytes_total.saturating_sub(done), data.speed()) {
+            fact(
+                ui,
+                "Time left",
+                RichText::new(format!(
+                    "{} at {}",
+                    format::duration_secs(eta),
+                    format::speed(data.speed())
+                ))
+                .font(fonts::mono_id(11.5))
+                .color(pal.accent_fg),
+                None,
+            );
+        }
+    }
+    let folder = job.dest_dir.display().to_string();
+    let open = fact(
+        ui,
+        "Folder",
+        RichText::new(&folder).small().color(pal.accent_fg),
+        Some(format!("{folder}\nClick to open in the file manager")),
+    );
+    if open
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .clicked()
+    {
+        actions.push(Action::OpenJobFolder(job.id));
+    }
+    let nzb = job
+        .source_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    fact(
+        ui,
+        "NZB",
+        RichText::new(nzb).small().color(pal.text),
+        Some(job.source_path.display().to_string()),
+    );
+    if job.password.is_some() {
+        fact(
+            ui,
+            "Password",
+            RichText::new("set").small().color(pal.text),
+            None,
+        );
+    }
+    if let (JobState::Failed, Some(e)) = (job.state, &job.error) {
+        ui.add_space(4.0);
+        ui.add(egui::Label::new(RichText::new(e).small().color(pal.negative)).wrap());
+    }
+    ui.add_space(8.0);
+    let files = &data.selected_files;
+    let finished = files.iter().filter(|f| f.state == "done").count();
+    eyebrow_row(
+        ui,
+        pal,
+        "Files",
+        &if files.is_empty() {
+            String::new()
+        } else {
+            format!("{finished} of {} done", files.len())
+        },
+        pal.muted,
+    );
+    ui.add_space(4.0);
+    if files.is_empty() {
+        let text = match job.state {
+            JobState::Queued | JobState::Paused => {
+                "Per-file progress appears once the download starts."
+            }
+            _ => "No per-file progress was recorded.",
+        };
+        ui.label(RichText::new(text).small().color(pal.muted));
+        return;
+    }
+    for f in files {
+        let color = match f.state.as_str() {
+            "done" => pal.positive,
+            "failed" => pal.negative,
+            _ => pal.accent,
+        };
+        ui.horizontal(|ui| {
+            let right = format!(
+                "{} / {}",
+                format::bytes(f.bytes_done),
+                format::bytes(f.bytes_total)
+            );
+            let name_w = (ui.available_width() - 128.0).max(40.0);
+            ui.scope(|ui| {
+                ui.set_width(name_w);
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(&f.name)
+                            .font(fonts::mono_id(11.0))
+                            .color(pal.text),
+                    )
+                    .truncate(),
+                )
+                .on_hover_text(format!("{} · {}", f.name, f.state));
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(
+                    RichText::new(right)
+                        .font(fonts::mono_id(10.5))
+                        .color(pal.muted),
+                );
+            });
+        });
+        segment_track(
             ui,
             pal,
-            "Queue",
-            &format!("{} of {known} finished", t.jobs_done),
-            pal.muted,
+            format::fraction(f.bytes_done, f.bytes_total),
+            color,
+            ui.available_width(),
         );
-        ui.add_space(3.0);
-        let fraction = format::fraction(t.jobs_done, known);
-        segment_track(ui, pal, fraction, pal.positive, ui.available_width());
+        ui.add_space(5.0);
     }
 }
 
@@ -1178,15 +1328,6 @@ mod tests {
     }
 
     #[test]
-    fn grid_cards_fit_the_panel() {
-        // Two rows of cards plus the gap never exceed the panel.
-        for avail in [240.0_f32, 290.0, 320.0] {
-            let h = grid_card_height(avail, 8.0);
-            assert!(2.0 * (h + CARD_CHROME) + 8.0 <= avail + 0.5, "{avail}: {h}");
-        }
-    }
-
-    #[test]
     fn slot_row_fits_and_keeps_proportion() {
         // Every connection gets a cell while they fit.
         assert_eq!(slot_cells(20, 12, 300.0), (20, 12));
@@ -1221,9 +1362,18 @@ mod tests {
     #[test]
     fn dock_layout_breakpoints() {
         assert_eq!(layout_for(1280.0), DockLayout::Row);
-        assert_eq!(layout_for(1100.0), DockLayout::Row);
-        assert_eq!(layout_for(1000.0), DockLayout::Grid);
-        assert_eq!(layout_for(960.0), DockLayout::Grid);
-        assert_eq!(layout_for(900.0), DockLayout::Stack);
+        assert_eq!(layout_for(960.0), DockLayout::Row);
+        assert_eq!(layout_for(900.0), DockLayout::Row);
+        assert_eq!(layout_for(899.0), DockLayout::Stack);
+    }
+
+    #[test]
+    fn log_filter_levels() {
+        assert!(LogFilter::All.admits(LogLevel::Info));
+        assert!(!LogFilter::Problems.admits(LogLevel::Info));
+        assert!(LogFilter::Problems.admits(LogLevel::Warn));
+        assert!(LogFilter::Problems.admits(LogLevel::Error));
+        assert!(!LogFilter::Errors.admits(LogLevel::Warn));
+        assert!(LogFilter::Errors.admits(LogLevel::Error));
     }
 }

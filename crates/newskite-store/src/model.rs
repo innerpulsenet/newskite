@@ -18,7 +18,7 @@ pub enum JobState {
     Done,
     /// Failed; `Job::error` carries the reason (history, can be retried).
     Failed,
-    /// Paused by the user; still runnable.
+    /// Held by the user: kept in the queue but skipped by queue runs until started again.
     Paused,
 }
 

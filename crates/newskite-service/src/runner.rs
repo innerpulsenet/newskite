@@ -43,7 +43,8 @@ pub(crate) fn start(inner: &Arc<Inner>) -> bool {
 }
 
 /// Starts a run unless one is active; with `only`, the run processes just those job ids.
-/// See [`crate::Service::start_jobs`].
+/// An active run limited to some jobs is widened instead: to the whole queue (`None`) or
+/// by the listed ids. See [`crate::Service::start_jobs`].
 pub(crate) fn start_with(inner: &Arc<Inner>, only: Option<Vec<i64>>) -> bool {
     if inner.shutdown.is_cancelled() {
         inner.log(LogLevel::Warn, "the queue cannot start: the service is stopping");
@@ -52,9 +53,22 @@ pub(crate) fn start_with(inner: &Arc<Inner>, only: Option<Vec<i64>>) -> bool {
     let (was_paused, countdown) = {
         let mut st = inner.lock_state();
         if st.running {
+            if let Some(scope) = st.only.as_mut() {
+                match only {
+                    None => st.only = None,
+                    Some(ids) => {
+                        for id in ids {
+                            if !scope.contains(&id) {
+                                scope.push(id);
+                            }
+                        }
+                    }
+                }
+            }
             return false;
         }
         st.running = true;
+        st.only = only;
         st.last_error = None;
         st.removed_active = false;
         inner.running_tx.send_replace(true);
@@ -71,7 +85,7 @@ pub(crate) fn start_with(inner: &Arc<Inner>, only: Option<Vec<i64>>) -> bool {
     let task_inner = inner.clone();
     inner.rt.spawn(async move {
         let mut guard = RunGuard { inner: task_inner.clone(), armed: true };
-        run_queue(&task_inner, &mut guard, only.as_deref()).await;
+        run_queue(&task_inner, &mut guard).await;
     });
     true
 }
@@ -93,6 +107,8 @@ impl Drop for RunGuard {
             st.running = false;
             st.active_job = None;
             st.job_cancel = None;
+            st.stop_active = None;
+            st.only = None;
             st.last_error = Some("the queue run stopped unexpectedly".into());
         }
         self.inner.log(LogLevel::Error, "the queue run stopped unexpectedly");
@@ -107,11 +123,13 @@ enum Pick {
     End(End),
 }
 
-/// Runs the queue until nothing runnable is left. With `only`, just the jobs whose id is
-/// listed are considered; every other queued job is left alone.
-async fn run_queue(inner: &Arc<Inner>, guard: &mut RunGuard, only: Option<&[i64]>) {
+/// Runs the queue until nothing runnable is left. While the run is limited
+/// (`RunState::only`), just the jobs whose id is listed are considered; every other queued
+/// job is left alone. The scope is re-read for every pick, so it can widen mid-run.
+async fn run_queue(inner: &Arc<Inner>, guard: &mut RunGuard) {
     let mut processed = 0usize;
     let mut attempted: HashSet<i64> = HashSet::new();
+    let mut requeued: HashSet<i64> = HashSet::new();
     let mut forced_end: Option<End> = None;
     let mut last_settings;
 
@@ -130,14 +148,16 @@ async fn run_queue(inner: &Arc<Inner>, guard: &mut RunGuard, only: Option<&[i64]
             } else if st.paused {
                 Pick::End(End::Paused)
             } else {
-                let next = match only {
+                let next = match st.only.as_deref() {
                     Some(ids) => inner.store.next_runnable_job_among(ids),
                     None => inner.store.next_runnable_job(),
                 };
                 match next {
                     Err(e) => Pick::End(End::Store(format!("could not read the queue: {e}"))),
                     Ok(None) => Pick::End(End::Drained),
-                    Ok(Some(job)) if attempted.contains(&job.id) => {
+                    // A job interrupted and started again in this run (pause, then start)
+                    // may be picked again; anything else coming back means it is stuck.
+                    Ok(Some(job)) if attempted.contains(&job.id) && !requeued.contains(&job.id) => {
                         Pick::End(End::Store(format!("job {} could not leave the queue; stopping", job.name)))
                     }
                     Ok(Some(_)) if servers.is_empty() => Pick::End(End::NoServer),
@@ -146,6 +166,7 @@ async fn run_queue(inner: &Arc<Inner>, guard: &mut RunGuard, only: Option<&[i64]
                         st.active_job = Some(job.id);
                         st.job_cancel = Some(token.clone());
                         st.removed_active = false;
+                        st.stop_active = None;
                         Pick::Job(job, token)
                     }
                 }
@@ -160,13 +181,21 @@ async fn run_queue(inner: &Arc<Inner>, guard: &mut RunGuard, only: Option<&[i64]
         match pick {
             Pick::End(end) => break end,
             Pick::Job(job, token) => {
-                attempted.insert(job.id);
-                forced_end = process_job(inner, job, servers, &settings, token).await;
-                processed += 1;
+                let id = job.id;
+                requeued.remove(&id);
+                attempted.insert(id);
+                let outcome = process_job(inner, job, servers, &settings, token).await;
+                if outcome.interrupted {
+                    requeued.insert(id);
+                } else {
+                    processed += 1;
+                }
+                forced_end = outcome.end;
                 let mut st = inner.lock_state();
                 st.active_job = None;
                 st.job_cancel = None;
                 st.removed_active = false;
+                st.stop_active = None;
             }
         }
     };
@@ -200,6 +229,8 @@ fn finish_run_locked(inner: &Inner, st: &mut crate::RunState, end: &End, process
     st.active_job = None;
     st.job_cancel = None;
     st.removed_active = false;
+    st.stop_active = None;
+    st.only = None;
     // The queue is idle: give the server its connection slots back.
     inner.pool.close_idle();
     // Before the idle signal, so whoever waits for it sees this run's bytes in the totals.
@@ -208,13 +239,36 @@ fn finish_run_locked(inner: &Inner, st: &mut crate::RunState, end: &End, process
     inner.running_tx.send_replace(false);
 }
 
-/// Downloads (and post-processes) one job. Returns `Some(end)` when the run must stop.
+/// How one job's turn in a run ended.
+struct Outcome {
+    /// `Some(end)` when the run must stop.
+    end: Option<End>,
+    /// The user interrupted the job (held it or paused the queue); it was not finished.
+    interrupted: bool,
+}
+
+/// Downloads (and post-processes) one job.
 async fn process_job(
     inner: &Arc<Inner>,
     job: Job,
     servers: Vec<ServerConfig>,
     settings: &Settings,
     token: CancellationToken,
+) -> Outcome {
+    let mut interrupted = false;
+    let end = download_job(inner, job, servers, settings, token, &mut interrupted).await;
+    Outcome { end, interrupted }
+}
+
+/// [`process_job`]'s body. Returns `Some(end)` when the run must stop; sets `interrupted`
+/// when the user stopped the job.
+async fn download_job(
+    inner: &Arc<Inner>,
+    job: Job,
+    servers: Vec<ServerConfig>,
+    settings: &Settings,
+    token: CancellationToken,
+    interrupted: &mut bool,
 ) -> Option<End> {
     match inner.store.set_job_state(job.id, JobState::Downloading, None) {
         Ok(()) => {}
@@ -295,7 +349,21 @@ async fn process_job(
         }
     }
 
-    if inner.lock_state().removed_active {
+    let stop = {
+        let mut st = inner.lock_state();
+        if st.removed_active {
+            return None;
+        }
+        st.stop_active.take()
+    };
+    // Interrupted by the user (hold or pause): the download stopped, whatever error it
+    // reported for that. A download that finished anyway goes on to post-processing.
+    if let (Some(state), Err(_)) = (stop, &result) {
+        *interrupted = true;
+        let _ = inner.store.set_job_state(job.id, state, None);
+        inner.emit(ServiceEvent::JobsChanged);
+        let what = if state == JobState::Paused { "paused" } else { "interrupted" };
+        inner.log(LogLevel::Info, format!("{what} {}; completed files are kept", job.name));
         return None;
     }
 

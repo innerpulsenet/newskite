@@ -7,7 +7,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eframe::egui::{self, Key, KeyboardShortcut, Modifiers};
 use newskite_service::{
-    Bookmark, Job, JobState, LogLevel, LogLine, NewBookmark, Service, ServiceEvent, Status,
+    Job, JobFile, JobMove, JobState, LogLevel, LogLine, Service, ServiceEvent, Status,
     ThroughputSample, Totals,
 };
 use newskite_theme::{Theme, ThemeWatcher};
@@ -20,7 +20,7 @@ use super::brand::{self, MarkClock};
 use super::events::{Pending, SharedPending};
 use super::settings::{FolderTarget, SettingsDraft};
 use super::theme::{self, Palette};
-use super::{about, docks, fonts, icons, motion, queue, settings, sidebar, statusbar, toolbar};
+use super::{about, disk, docks, fonts, icons, motion, queue, settings, statusbar, toolbar};
 
 /// How often the job list is re-read while a job is downloading (outline §7).
 pub const JOBS_REFRESH: Duration = Duration::from_millis(1500);
@@ -28,8 +28,6 @@ pub const JOBS_REFRESH: Duration = Duration::from_millis(1500);
 pub const LIVE_WINDOW_SECS: usize = 600;
 /// Stored history shown in the graph (seconds).
 pub const HISTORY_SECS: u64 = 24 * 3600;
-/// Share of the window height the 2×2 dock grid starts at (clamped to 260–320 px).
-const GRID_DOCK_SHARE: f32 = 0.46;
 /// How often the stored throughput history is re-read (also after each queue run).
 pub const HISTORY_REFRESH: Duration = Duration::from_secs(60);
 /// Theme watcher poll interval.
@@ -77,12 +75,10 @@ impl Default for AppConfig {
 /// Center-area tabs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tab {
-    /// Indexer search (placeholder).
-    Search,
-    /// Latest file groups (placeholder).
-    Latest,
-    /// The download queue (default tab).
+    /// The download queue: queued, downloading and paused jobs (default tab).
     Queue,
+    /// Finished jobs: done and failed.
+    History,
 }
 
 /// Messages delivered to the UI thread.
@@ -126,26 +122,32 @@ pub enum Action {
     BrowseNzb,
     /// Open a folder picker for a settings field.
     BrowseFolder(FolderTarget),
-    /// Start the queue.
+    /// Start the whole queue.
     Start,
-    /// Pause after the current job.
+    /// Pause the whole queue now (the current job is interrupted and resumes first).
     Pause,
     /// Resume.
     Resume,
+    /// Download one job (resuming it if held), leaving the rest of the queue alone.
+    StartJob(i64),
+    /// Hold one job (interrupting it if it is downloading).
+    PauseJob(i64),
+    /// Move a job within the queue.
+    MoveJob(i64, JobMove),
+    /// Remove every finished job from the list.
+    ClearHistory,
+    /// Open a job's download folder in the file manager.
+    OpenJobFolder(i64),
+    /// Select a job (its details show in the Details dock) or clear the selection.
+    Select(Option<i64>),
     /// Scan the watch folder now.
     ScanWatch,
     /// Remove a job.
     RemoveJob(i64),
-    /// Failed → queued.
+    /// Failed → queued, and download it.
     RetryJob(i64),
     /// Set or clear a job's archive password.
     SetJobPassword(i64, Option<String>),
-    /// Add a bookmark.
-    AddBookmark(NewBookmark),
-    /// Remove a bookmark (and its children).
-    RemoveBookmark(i64),
-    /// Expand/collapse a bookmark.
-    ToggleBookmark(i64),
     /// Show the settings modal.
     OpenSettings,
     /// Persist the settings draft.
@@ -162,8 +164,6 @@ pub enum Action {
     SetTab(Tab),
     /// Reveal (and focus) the Open NZB field.
     ShowOpenNzb,
-    /// Focus the search box.
-    FocusSearch,
     /// Write an info line to the message log (harmless placeholder actions).
     Note(String),
     /// Show the About dialog.
@@ -183,8 +183,12 @@ pub struct Data {
     pub jobs: Vec<Job>,
     /// Totals for the account dock.
     pub totals: Totals,
-    /// Bookmarks in tree order.
-    pub bookmarks: Vec<Bookmark>,
+    /// Pending job ids in queue order (the order a run downloads them).
+    pub queue_order: Vec<i64>,
+    /// File rows of the selected job.
+    pub selected_files: Vec<JobFile>,
+    /// Free bytes on the download folder's filesystem, when it can be read.
+    pub disk_free: Option<u64>,
     /// Log lines, newest first.
     pub logs: Vec<LogLine>,
     /// Current saved settings.
@@ -226,6 +230,45 @@ impl Data {
         }
     }
 
+    /// Pending jobs in queue order (jobs missing from the stored order go last, by id).
+    pub fn queue(&self) -> Vec<&Job> {
+        let mut v: Vec<&Job> = self.jobs.iter().filter(|j| j.state.is_pending()).collect();
+        let rank = |id: i64| {
+            self.queue_order
+                .iter()
+                .position(|&o| o == id)
+                .unwrap_or(usize::MAX)
+        };
+        v.sort_by_key(|j| (rank(j.id), j.id));
+        v
+    }
+
+    /// Finished jobs (done and failed), newest first.
+    pub fn history(&self) -> Vec<&Job> {
+        let mut v: Vec<&Job> = self.jobs.iter().filter(|j| !j.state.is_pending()).collect();
+        v.sort_by(|a, b| b.id.cmp(&a.id));
+        v
+    }
+
+    /// Bytes still to download over every queued, downloading and paused job.
+    pub fn bytes_left(&self) -> u64 {
+        self.jobs
+            .iter()
+            .filter(|j| j.state.is_pending())
+            .map(|j| j.bytes_total.saturating_sub(self.shown_done(j)))
+            .fold(0u64, u64::saturating_add)
+    }
+
+    /// Whether the active run will download `job` (a run of the whole queue takes every
+    /// queued job; a run started for single jobs only those).
+    pub fn in_run(&self, job: &Job) -> bool {
+        self.status.running
+            && match &self.status.run_scope {
+                None => true,
+                Some(ids) => ids.contains(&job.id),
+            }
+    }
+
     /// Current speed: the latest live sample, else the service's figure.
     pub fn speed(&self) -> u64 {
         self.live
@@ -239,14 +282,12 @@ impl Data {
 pub struct ViewState {
     /// Selected center tab.
     pub tab: Tab,
-    /// Toolbar search text.
-    pub search_text: String,
-    /// Focus the search box next frame.
-    pub focus_search: bool,
+    /// The name filter above the job tables.
+    pub filter: String,
     /// Open NZB inline field.
     pub open_nzb: OpenNzbState,
-    /// Bookmarks sidebar state.
-    pub sidebar: sidebar::SidebarState,
+    /// Bottom dock state.
+    pub docks: docks::DockState,
     /// Queue tab state.
     pub queue: queue::QueueState,
     /// Settings modal (open when `Some`).
@@ -261,6 +302,8 @@ pub struct ViewState {
     pub about_mark: [f64; 6],
     /// Reduced motion is in effect this frame (copied from the app so views can rest).
     pub reduced_motion: bool,
+    /// A manual watch-folder scan is running.
+    pub scanning: bool,
 }
 
 /// The toolbar's inline Open NZB field.
@@ -321,8 +364,6 @@ pub struct NewskiteApp {
     pub last_notice: Option<String>,
     /// Frequent events folded by the forwarder thread (see [`super::events`]).
     pending: SharedPending,
-    /// A manual watch-folder scan is running.
-    scanning: bool,
     last_history_reload: Instant,
 }
 
@@ -385,10 +426,9 @@ impl NewskiteApp {
             data: Data::default(),
             view: ViewState {
                 tab: Tab::Queue,
-                search_text: String::new(),
-                focus_search: false,
+                filter: String::new(),
                 open_nzb: OpenNzbState::default(),
-                sidebar: sidebar::SidebarState::default(),
+                docks: docks::DockState::default(),
                 queue: queue::QueueState::default(),
                 settings: None,
                 dialog_open: false,
@@ -396,6 +436,7 @@ impl NewskiteApp {
                 masthead_mark: brand::rest_heights(),
                 about_mark: brand::rest_heights(),
                 reduced_motion,
+                scanning: false,
             },
             actions: Vec::new(),
             last_jobs_reload: Instant::now(),
@@ -403,7 +444,6 @@ impl NewskiteApp {
             finished_seen: HashSet::new(),
             last_notice: None,
             pending,
-            scanning: false,
             last_history_reload: Instant::now(),
         };
         app.reload_all();
@@ -437,20 +477,20 @@ impl NewskiteApp {
 
     /// Re-reads everything from the service (start-up and after a lagged stream).
     pub fn reload_all(&mut self) {
-        self.reload_jobs();
-        self.data.bookmarks = self.service.bookmarks();
         // Settings first: reading them logs an unreadable document once, and the log
         // read after it then includes that line.
         self.data.settings = self.service.settings();
         self.data.settings_load_error = self.service.settings_load_error();
         self.data.logs = self.service.logs();
         self.data.status = self.service.status();
+        self.reload_jobs();
         self.reload_history();
     }
 
     /// Re-reads the stored throughput history (the last [`HISTORY_SECS`]).
     pub fn reload_history(&mut self) {
         self.data.history = self.service.throughput_history(HISTORY_SECS);
+        self.data.disk_free = disk::free_bytes(&self.data.settings.download_dir);
         self.last_history_reload = Instant::now();
     }
 
@@ -458,6 +498,17 @@ impl NewskiteApp {
     pub fn reload_jobs(&mut self) {
         self.data.jobs = self.service.jobs();
         self.data.totals = self.service.totals();
+        self.data.queue_order = self.service.queue_order();
+        // A selection whose job is gone is dropped.
+        if let Some(id) = self.view.queue.selected {
+            if !self.data.jobs.iter().any(|j| j.id == id) {
+                self.view.queue.selected = None;
+            }
+        }
+        self.data.selected_files = match self.view.queue.selected {
+            Some(id) => self.service.job_files(id),
+            None => Vec::new(),
+        };
         let downloading: HashSet<i64> = self
             .data
             .jobs
@@ -532,6 +583,7 @@ impl NewskiteApp {
                             }
                             self.view.tab = Tab::Queue;
                             self.view.queue.highlight = Some(job.id);
+                            self.view.queue.selected = Some(job.id);
                             reload_jobs = true;
                         }
                         Err(e) => {
@@ -543,7 +595,7 @@ impl NewskiteApp {
                     }
                 }
                 UiMsg::WatchScanned => {
-                    self.scanning = false;
+                    self.view.scanning = false;
                     reload_jobs = true;
                     reload_logs = true;
                 }
@@ -659,13 +711,44 @@ impl NewskiteApp {
             Action::Start => {
                 self.service.start();
             }
-            Action::Pause => self.service.pause(),
+            Action::Pause => self.service.pause_now(),
             Action::Resume => self.service.resume(),
+            Action::StartJob(id) => {
+                if self.service.start_job(id).is_ok() {
+                    self.finished_seen.remove(&id);
+                }
+                self.reload_jobs();
+                self.data.logs = self.service.logs();
+            }
+            Action::PauseJob(id) => {
+                let _ = self.service.pause_job(id);
+                self.reload_jobs();
+                self.data.logs = self.service.logs();
+            }
+            Action::MoveJob(id, to) => {
+                let _ = self.service.move_job(id, to);
+                self.reload_jobs();
+            }
+            Action::ClearHistory => {
+                self.service.clear_history();
+                self.reload_jobs();
+                self.data.logs = self.service.logs();
+            }
+            Action::OpenJobFolder(id) => self.open_job_folder(id),
+            Action::Select(id) => {
+                if self.view.queue.selected != id {
+                    self.view.queue.selected = id;
+                    self.data.selected_files = match id {
+                        Some(id) => self.service.job_files(id),
+                        None => Vec::new(),
+                    };
+                }
+            }
             Action::ScanWatch => {
                 // Directory reads and NZB parsing (possibly on a slow network mount) run
                 // off the UI thread. Errors are logged by the service.
-                if !self.scanning {
-                    self.scanning = true;
+                if !self.view.scanning {
+                    self.view.scanning = true;
                     let svc = self.service.clone();
                     let tx = self.tx.clone();
                     let ctx = self.ctx.clone();
@@ -681,39 +764,18 @@ impl NewskiteApp {
                 self.reload_jobs();
             }
             Action::RetryJob(id) => {
-                if self.service.retry_job(id).is_ok() {
+                // Requeue and download it (start_job retries a failed job first).
+                if self.service.start_job(id).is_ok() {
                     // Its next completion is news again.
                     self.finished_seen.remove(&id);
+                    self.view.tab = Tab::Queue;
                 }
                 self.reload_jobs();
+                self.data.logs = self.service.logs();
             }
             Action::SetJobPassword(id, pw) => {
                 let _ = self.service.set_job_password(id, pw);
                 self.reload_jobs();
-            }
-            Action::AddBookmark(b) => {
-                match self.service.add_bookmark(b) {
-                    Ok(_) => self.view.sidebar.form = None,
-                    Err(e) => {
-                        if let Some(form) = self.view.sidebar.form.as_mut() {
-                            form.error = Some(format!("Could not add the bookmark: {e}"));
-                        }
-                        self.data.logs = self.service.logs();
-                    }
-                }
-                self.reload_bookmarks();
-            }
-            Action::RemoveBookmark(id) => {
-                let _ = self.service.remove_bookmark(id);
-                self.reload_bookmarks();
-            }
-            Action::ToggleBookmark(id) => {
-                if let Some(b) = self.data.bookmarks.iter().find(|b| b.id == id) {
-                    let mut b = b.clone();
-                    b.expanded = !b.expanded;
-                    let _ = self.service.update_bookmark(&b);
-                }
-                self.reload_bookmarks();
             }
             Action::OpenSettings => {
                 if self.view.settings.is_none() {
@@ -765,10 +827,6 @@ impl NewskiteApp {
                 self.view.open_nzb.visible = true;
                 self.view.open_nzb.focus = true;
             }
-            Action::FocusSearch => {
-                self.view.tab = Tab::Search;
-                self.view.focus_search = true;
-            }
             Action::Note(text) => {
                 self.service.log(LogLevel::Info, text);
                 self.data.logs = self.service.logs();
@@ -790,20 +848,6 @@ impl NewskiteApp {
                 }
             }
             Action::SetAppearance(a) => self.set_appearance(a),
-        }
-    }
-
-    /// Re-reads the bookmarks; an add form whose parent no longer exists falls back to
-    /// the top level (what its picker already shows).
-    fn reload_bookmarks(&mut self) {
-        self.data.bookmarks = self.service.bookmarks();
-        if let Some(form) = self.view.sidebar.form.as_mut() {
-            if form
-                .parent
-                .is_some_and(|p| !self.data.bookmarks.iter().any(|b| b.id == p))
-            {
-                form.parent = None;
-            }
         }
     }
 
@@ -882,6 +926,31 @@ impl NewskiteApp {
             let _ = tx.send(msg);
             ctx.request_repaint();
         });
+    }
+
+    fn open_job_folder(&mut self, id: i64) {
+        let Some(dir) = self
+            .data
+            .jobs
+            .iter()
+            .find(|j| j.id == id)
+            .map(|j| j.dest_dir.clone())
+        else {
+            return;
+        };
+        // Before the first file is written the folder may not exist: show its parent.
+        let target = if dir.is_dir() {
+            dir
+        } else {
+            dir.parent().map(PathBuf::from).unwrap_or(dir)
+        };
+        if let Err(e) = open::that_detached(&target) {
+            self.service.log(
+                LogLevel::Error,
+                format!("cannot open {} in the file manager: {e}", target.display()),
+            );
+            self.data.logs = self.service.logs();
+        }
     }
 
     fn open_download_folder(&mut self) {
@@ -981,10 +1050,12 @@ impl NewskiteApp {
     fn shortcuts(&mut self, ctx: &egui::Context) {
         let open = KeyboardShortcut::new(Modifiers::COMMAND, Key::O);
         let prefs = KeyboardShortcut::new(Modifiers::COMMAND, Key::Comma);
-        let (o, p, esc) = ctx.input_mut(|i| {
+        let find = KeyboardShortcut::new(Modifiers::COMMAND, Key::F);
+        let (o, p, f, esc) = ctx.input_mut(|i| {
             (
                 i.consume_shortcut(&open),
                 i.consume_shortcut(&prefs),
+                i.consume_shortcut(&find),
                 i.key_pressed(Key::Escape),
             )
         });
@@ -994,6 +1065,9 @@ impl NewskiteApp {
         if p {
             self.actions.push(Action::OpenSettings);
         }
+        if f {
+            self.view.queue.focus_filter = true;
+        }
         if esc {
             if self.view.settings.is_some() {
                 self.actions.push(Action::CloseSettings);
@@ -1002,6 +1076,42 @@ impl NewskiteApp {
             } else if self.view.open_nzb.visible {
                 self.view.open_nzb.visible = false;
                 self.view.open_nzb.error = None;
+            } else if self.view.queue.confirm_remove.is_some() {
+                self.view.queue.confirm_remove = None;
+            } else if self.view.queue.selected.is_some() {
+                self.actions.push(Action::Select(None));
+            }
+        }
+        // Keys for the selected job, unless a text field or dialog has the keyboard.
+        let typing = ctx.memory(|m| m.focused().is_some()) && ctx.wants_keyboard_input();
+        let modal = self.view.settings.is_some() || self.view.about_open;
+        if let (Some(id), false, false) = (self.view.queue.selected, typing, modal) {
+            let Some(job) = self.data.jobs.iter().find(|j| j.id == id) else {
+                return;
+            };
+            let (space, delete, up, down) = ctx.input_mut(|i| {
+                (
+                    i.consume_key(Modifiers::NONE, Key::Space),
+                    i.consume_key(Modifiers::NONE, Key::Delete),
+                    i.consume_key(Modifiers::ALT, Key::ArrowUp),
+                    i.consume_key(Modifiers::ALT, Key::ArrowDown),
+                )
+            });
+            if space {
+                if let Some(a) = queue::toggle_action(&self.data, job) {
+                    self.actions.push(a);
+                }
+            }
+            if delete {
+                self.view.queue.confirm_remove = Some(id);
+            }
+            if job.state.is_pending() {
+                if up {
+                    self.actions.push(Action::MoveJob(id, JobMove::Up));
+                }
+                if down {
+                    self.actions.push(Action::MoveJob(id, JobMove::Down));
+                }
             }
         }
     }
@@ -1067,14 +1177,9 @@ impl NewskiteApp {
         // One panel id per arrangement so each keeps its own (user-resizable) height. The
         // 2×2 grid starts at a share of the window height, so a 600 px window still leaves
         // the queue a few rows.
-        let window_h = ctx.content_rect().height();
         let (dock_id, dock_h) = match docks::layout_for(width) {
-            docks::DockLayout::Row => ("docks-row", 240.0),
-            docks::DockLayout::Grid => (
-                "docks-grid",
-                (window_h * GRID_DOCK_SHARE).clamp(260.0, 320.0),
-            ),
-            docks::DockLayout::Stack => ("docks-stack", 260.0),
+            docks::DockLayout::Row => ("docks-row", 236.0),
+            docks::DockLayout::Stack => ("docks-stack", 250.0),
         };
         egui::TopBottomPanel::bottom(dock_id)
             .resizable(true)
@@ -1087,28 +1192,22 @@ impl NewskiteApp {
                     .inner_margin(egui::Margin::same(8)),
             )
             .show(ctx, |ui| {
-                docks::show(ui, &pal, &self.data, self.reduced_motion, &mut actions)
-            });
-
-        egui::SidePanel::left("bookmarks")
-            .resizable(true)
-            .default_width(220.0)
-            .width_range(170.0..=360.0)
-            .frame(
-                egui::Frame::new()
-                    .fill(pal.surface)
-                    .inner_margin(egui::Margin::same(10))
-                    .stroke(egui::Stroke::new(1.0, pal.border)),
-            )
-            .show(ctx, |ui| {
-                sidebar::show(ui, &pal, &self.data, &mut self.view.sidebar, &mut actions)
+                docks::show(
+                    ui,
+                    &pal,
+                    &self.data,
+                    self.view.queue.selected,
+                    &mut self.view.docks,
+                    self.reduced_motion,
+                    &mut actions,
+                )
             });
 
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
                     .fill(pal.surface)
-                    .inner_margin(egui::Margin::same(10)),
+                    .inner_margin(egui::Margin::symmetric(14, 10)),
             )
             .show(ctx, |ui| {
                 if let Some(secs) = self.data.shutdown_secs {

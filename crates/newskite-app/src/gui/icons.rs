@@ -2,7 +2,7 @@
 //!
 //! The icon set is the innerpulse kit's (`assets/brand/kit/ui-icons/`): a 24 grid, one 2 px
 //! stroke with round caps and joins, no fills, `currentColor`. Where the kit has no
-//! matching icon (Back, Home, My List, Newsgroups, Open NZB, folder, key, chevron up) the
+//! matching icon (Open NZB, folder, key, chevron up, more, move to top/bottom, scan) the
 //! icon below is drawn in the same grammar. Every SVG is registered with its
 //! `currentColor` replaced by white, so painting it with a tint gives exactly the tint;
 //! each paint rasterizes at the target's physical pixel size, so icons stay crisp at any
@@ -16,23 +16,21 @@ use eframe::egui::{
 /// Every icon the GUI paints.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Icon {
-    /// Left arrow (drawn here).
-    Back,
-    /// House (drawn here).
-    Home,
-    /// Magnifier (kit `search`).
+    /// Magnifier (kit `search`), for the queue filter.
     Search,
-    /// Bulleted list (drawn here).
-    List,
-    /// Two speech bubbles (drawn here).
-    Newsgroups,
-    /// Circular arrow (kit `refresh`), for Auto Search.
-    AutoSearch,
+    /// Folder with an inbound arrow (drawn here), for Scan watch folder.
+    Scan,
+    /// Three dots (drawn here): the row menu.
+    More,
+    /// Bar over an up chevron (drawn here): move to top.
+    ToTop,
+    /// Down chevron over a bar (drawn here): move to bottom.
+    ToBottom,
     /// Document with a plus (drawn here).
     OpenNzb,
     /// Folder (drawn here).
     Folder,
-    /// Arrow into a tray (kit `download`).
+    /// Arrow into a tray (kit `download`): the queue.
     Transfers,
     /// Two bars (kit `pause`).
     Pause,
@@ -72,13 +70,12 @@ pub enum Icon {
 
 impl Icon {
     /// Every icon (for registration and tests).
-    pub const ALL: [Icon; 26] = [
-        Icon::Back,
-        Icon::Home,
+    pub const ALL: [Icon; 25] = [
         Icon::Search,
-        Icon::List,
-        Icon::Newsgroups,
-        Icon::AutoSearch,
+        Icon::Scan,
+        Icon::More,
+        Icon::ToTop,
+        Icon::ToBottom,
         Icon::OpenNzb,
         Icon::Folder,
         Icon::Transfers,
@@ -104,12 +101,12 @@ impl Icon {
     /// The `bytes://` URI the icon is registered under.
     pub fn uri(self) -> &'static str {
         match self {
-            Icon::Back => "bytes://newskite/icon/back.svg",
-            Icon::Home => "bytes://newskite/icon/home.svg",
             Icon::Search => "bytes://newskite/icon/search.svg",
-            Icon::List => "bytes://newskite/icon/list.svg",
-            Icon::Newsgroups => "bytes://newskite/icon/newsgroups.svg",
-            Icon::AutoSearch | Icon::Retry => "bytes://newskite/icon/refresh.svg",
+            Icon::Scan => "bytes://newskite/icon/scan.svg",
+            Icon::More => "bytes://newskite/icon/more.svg",
+            Icon::ToTop => "bytes://newskite/icon/to-top.svg",
+            Icon::ToBottom => "bytes://newskite/icon/to-bottom.svg",
+            Icon::Retry => "bytes://newskite/icon/refresh.svg",
             Icon::OpenNzb => "bytes://newskite/icon/open-nzb.svg",
             Icon::Folder => "bytes://newskite/icon/folder.svg",
             Icon::Transfers => "bytes://newskite/icon/download.svg",
@@ -145,14 +142,10 @@ impl Icon {
             };
         }
         match self {
-            Icon::Back => drawn("M19.5 12h-15M10.5 6l-6 6 6 6"),
-            Icon::Home => drawn("M3.5 11.5L12 4l8.5 7.5M6 9.5V20h12V9.5M10 20v-5.5h4V20"),
-            Icon::List => {
-                drawn("M9.5 6.5h10.5M9.5 12h10.5M9.5 17.5h10.5M4.5 6.5v.1M4.5 12v.1M4.5 17.5v.1")
-            }
-            Icon::Newsgroups => {
-                drawn("M3.5 4.5h11v8.5h-6l-3 3v-3h-2zM14.5 8.5h6v9h-2v2.5l-3-2.5h-5V13")
-            }
+            Icon::Scan => drawn("M3.5 5.5h6l2 2.5h9v11.5h-17zM12 10.5v6M9 13.5l3 3 3-3"),
+            Icon::More => drawn("M5.5 12h.1M12 12h.1M18.5 12h.1"),
+            Icon::ToTop => drawn("M5.5 4.5h13M6.5 15l5.5-5.5 5.5 5.5M12 9.5v10"),
+            Icon::ToBottom => drawn("M5.5 19.5h13M6.5 9l5.5 5.5 5.5-5.5M12 14.5v-10"),
             Icon::OpenNzb => drawn("M13.5 3.5H6v17h12V8zM13.5 3.5V8H18M12 11.5v6M9 14.5h6"),
             Icon::Folder => drawn("M3.5 5.5h6l2 2.5h9v11.5h-17z"),
             Icon::Key => drawn(
@@ -160,7 +153,7 @@ impl Icon {
             ),
             Icon::ChevronUp => drawn("M6 14.5l6-6 6 6"),
             Icon::Search => kit!("search"),
-            Icon::AutoSearch | Icon::Retry => kit!("refresh"),
+            Icon::Retry => kit!("refresh"),
             Icon::Transfers => kit!("download"),
             Icon::Pause => kit!("pause"),
             Icon::Play => kit!("run"),

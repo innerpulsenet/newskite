@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use common::*;
 use newskite_service::{
-    JobFile, JobState, LogLevel, NewBookmark, ServiceError, ServiceEvent, Store, NO_SERVER_MESSAGE,
+    JobFile, JobMove, JobState, LogLevel, NewBookmark, ServiceError, ServiceEvent, Store, NO_SERVER_MESSAGE,
 };
 use newskite_types::{EngineEvent, ServerConfig};
 use tempfile::TempDir;
@@ -213,6 +213,128 @@ async fn pause_stops_before_next_job_and_resume_finishes() {
     assert_eq!(svc.jobs()[1].state, JobState::Done);
     assert_eq!(sha256(&read(&j2.dest_dir.join("two.bin"))), sha256(&f2.data));
     assert!(!svc.status().paused);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn holding_the_active_job_moves_on_and_start_job_brings_it_back() {
+    let tmp = TempDir::new().unwrap();
+    let slow = TestFile::random("h1", "slow.bin", 80 * 1024, 8, 61);
+    let next = TestFile::random("h2", "next.bin", 8 * 1024, 1, 62);
+    let mock = mock_for(&[&slow, &next], &[], 300).await;
+    let svc = open_service(tmp.path(), test_settings(tmp.path(), vec![server_for(&mock, 1)]));
+    let dir = tmp.path().join("n");
+    let j1 = svc.add_nzb(&write_nzb(&dir, "slow.nzb", None, &[&slow])).unwrap();
+    let j2 = svc.add_nzb(&write_nzb(&dir, "next.nzb", None, &[&next])).unwrap();
+    let mut rx = svc.subscribe();
+    let state = |id| svc.jobs().into_iter().find(|j| j.id == id).unwrap().state;
+
+    assert!(svc.start());
+    wait_event(&mut rx, 10, |e| {
+        matches!(e, ServiceEvent::Engine { job_id, event: EngineEvent::FileStarted { .. } } if *job_id == j1.id)
+    })
+    .await;
+    svc.pause_job(j1.id).unwrap();
+    wait_idle(&svc, 10).await;
+    assert_eq!(state(j1.id), JobState::Paused, "held, not failed");
+    assert_eq!(state(j2.id), JobState::Done, "the run moved on");
+    assert_eq!(svc.status().last_error, None);
+
+    // A plain start skips the held job; start_job runs just it.
+    assert!(svc.start());
+    wait_idle(&svc, 5).await;
+    assert_eq!(state(j1.id), JobState::Paused);
+    svc.start_job(j1.id).unwrap();
+    wait_idle(&svc, 20).await;
+    assert_eq!(state(j1.id), JobState::Done);
+    assert_eq!(sha256(&read(&j1.dest_dir.join("slow.bin"))), sha256(&slow.data));
+    assert!(svc.pause_job(j1.id).is_err(), "finished jobs cannot be held");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn start_job_leaves_the_rest_and_widens_an_active_run() {
+    let tmp = TempDir::new().unwrap();
+    let f1 = TestFile::random("s1", "one.bin", 40 * 1024, 4, 71);
+    let f2 = TestFile::random("s2", "two.bin", 8 * 1024, 1, 72);
+    let f3 = TestFile::random("s3", "three.bin", 8 * 1024, 1, 73);
+    let mock = mock_for(&[&f1, &f2, &f3], &[], 150).await;
+    let svc = open_service(tmp.path(), test_settings(tmp.path(), vec![server_for(&mock, 1)]));
+    let dir = tmp.path().join("n");
+    let j1 = svc.add_nzb(&write_nzb(&dir, "one.nzb", None, &[&f1])).unwrap();
+    let j2 = svc.add_nzb(&write_nzb(&dir, "two.nzb", None, &[&f2])).unwrap();
+    let j3 = svc.add_nzb(&write_nzb(&dir, "three.nzb", None, &[&f3])).unwrap();
+    let mut rx = svc.subscribe();
+    let state = |id| svc.jobs().into_iter().find(|j| j.id == id).unwrap().state;
+
+    svc.start_job(j1.id).unwrap();
+    wait_event(&mut rx, 10, |e| matches!(e, ServiceEvent::Engine { job_id, .. } if *job_id == j1.id)).await;
+    assert_eq!(svc.status().run_scope, Some(vec![j1.id]));
+    // Starting another job while the limited run is active adds it to the run.
+    svc.start_job(j3.id).unwrap();
+    wait_idle(&svc, 20).await;
+    assert_eq!(state(j1.id), JobState::Done);
+    assert_eq!(state(j3.id), JobState::Done);
+    assert_eq!(state(j2.id), JobState::Queued, "never started");
+    assert_eq!(svc.status().run_scope, None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pause_now_interrupts_and_resume_continues_the_same_job_first() {
+    let tmp = TempDir::new().unwrap();
+    let slow = TestFile::random("n1", "slow.bin", 80 * 1024, 8, 81);
+    let next = TestFile::random("n2", "next.bin", 8 * 1024, 1, 82);
+    let mock = mock_for(&[&slow, &next], &[], 300).await;
+    let svc = open_service(tmp.path(), test_settings(tmp.path(), vec![server_for(&mock, 1)]));
+    let dir = tmp.path().join("n");
+    let j1 = svc.add_nzb(&write_nzb(&dir, "slow.nzb", None, &[&slow])).unwrap();
+    let j2 = svc.add_nzb(&write_nzb(&dir, "next.nzb", None, &[&next])).unwrap();
+    let mut rx = svc.subscribe();
+    let state = |id| svc.jobs().into_iter().find(|j| j.id == id).unwrap().state;
+
+    assert!(svc.start());
+    wait_event(&mut rx, 10, |e| {
+        matches!(e, ServiceEvent::Engine { job_id, event: EngineEvent::FileStarted { .. } } if *job_id == j1.id)
+    })
+    .await;
+    let t0 = std::time::Instant::now();
+    svc.pause_now();
+    wait_idle(&svc, 10).await;
+    assert!(t0.elapsed() < Duration::from_secs(4), "pause took {:?}", t0.elapsed());
+    assert_eq!(state(j1.id), JobState::Queued, "interrupted, resumable");
+    assert_eq!(state(j2.id), JobState::Queued, "the next job did not start");
+    assert!(svc.status().paused);
+
+    svc.resume();
+    wait_idle(&svc, 30).await;
+    assert_eq!(state(j1.id), JobState::Done);
+    assert_eq!(state(j2.id), JobState::Done);
+    assert_eq!(sha256(&read(&j1.dest_dir.join("slow.bin"))), sha256(&slow.data));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn move_job_reorders_the_queue_and_clear_history_keeps_pending_jobs() {
+    let tmp = TempDir::new().unwrap();
+    let svc = open_service(tmp.path(), test_settings(tmp.path(), vec![]));
+    let dir = tmp.path().join("n");
+    let f = |tag: &str, seed| TestFile::random(tag, &format!("{tag}.bin"), 1024, 1, seed);
+    let (fa, fb, fc) = (f("a", 1), f("b", 2), f("c", 3));
+    let a = svc.add_nzb(&write_nzb(&dir, "a.nzb", None, &[&fa])).unwrap();
+    let b = svc.add_nzb(&write_nzb(&dir, "b.nzb", None, &[&fb])).unwrap();
+    let c = svc.add_nzb(&write_nzb(&dir, "c.nzb", None, &[&fc])).unwrap();
+    assert_eq!(svc.queue_order(), vec![a.id, b.id, c.id]);
+
+    svc.move_job(c.id, JobMove::Top).unwrap();
+    assert_eq!(svc.queue_order(), vec![c.id, a.id, b.id]);
+    svc.move_job(c.id, JobMove::Down).unwrap();
+    assert_eq!(svc.queue_order(), vec![a.id, c.id, b.id]);
+    svc.move_job(a.id, JobMove::Up).unwrap();
+    assert_eq!(svc.queue_order(), vec![a.id, c.id, b.id], "already first");
+    svc.move_job(a.id, JobMove::Bottom).unwrap();
+    assert_eq!(svc.queue_order(), vec![c.id, b.id, a.id]);
+
+    svc.pause_job(b.id).unwrap();
+    assert_eq!(svc.queue_order(), vec![c.id, b.id, a.id], "held jobs keep their place");
+    assert_eq!(svc.clear_history(), 0);
+    assert_eq!(svc.jobs().len(), 3);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

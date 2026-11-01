@@ -16,7 +16,7 @@ build order (§11), acceptance criteria (§12).
 
 Newskite is a **desktop Usenet (NZB) download client**: the user gives it an NZB file, it downloads
 the binary articles from an NNTP server over TLS, decodes them, writes the exact original file(s)
-to disk, repairs/extracts as needed, and keeps a queue, history, bookmarks and live throughput
+to disk, repairs/extracts as needed, and keeps a reorderable queue, history and live throughput
 stats. It is a background-work application: long-running transfers, precise progress reporting,
 and a UI that stays responsive and theme-correct on a Linux desktop (KDE Plasma primarily).
 
@@ -53,7 +53,7 @@ CLI that drives the same queue engine.
 Three concerns, cleanly separated:
 
 1. **Engine** — NZB parsing, article fetch, yEnc decode, assembly, progress events. No UI code.
-2. **Persistence** — queue/history/settings/bookmarks/throughput. Durable across restarts.
+2. **Persistence** — queue/history/settings/throughput. Durable across restarts.
 3. **Presentation** — window/CLI, theming, event rendering.
 
 The same engine+persistence must be drivable from both the GUI and a CLI. Progress is emitted as
@@ -91,13 +91,20 @@ Each feature lists: what it does, rules, and edge cases the implementation must 
 - Per-segment progress must be surfaced frequently enough for a smooth graph (≥1 update/second).
 
 ### F4. Queue management
-- Job states: `queued`, `downloading`, `done`, `failed`, `paused` (persisted strings).
-- Start the queue (processes all `queued`/`paused` jobs, oldest first); Pause halts before the next
-  job; Resume continues; jobs can be removed from the queue.
-- Pause is cooperative at job boundaries (acceptable simplification; mid-file pause is optional).
+- Job states: `queued`, `downloading`, `done`, `failed`, `paused` (persisted strings). `paused`
+  means **held by the user**: the job keeps its place but queue runs skip it.
+- The queue has an explicit order (a position per job); jobs can be moved to the top, up, down
+  or to the bottom. Runs download `queued` jobs in that order.
+- Whole queue: Start (every queued job), Pause (immediate: the current job is interrupted,
+  goes back to `queued` and resumes first), Resume.
+- Per job: start one job on its own (a run limited to it, or added to an active limited run;
+  the rest of the queue stays put), pause/hold one job (a downloading job is interrupted and
+  held; the run moves on), retry a failed job, remove a job.
+- Interrupting keeps completed files; a partial file is downloaded again.
 - Progress is persisted per job (`bytes_done` / `bytes_total`) so the UI shows position after
   restart, and a crashed/interrupted run resumes rather than restarting.
 - Only one queue run at a time (idempotent start).
+- Finished jobs (done/failed) form the history; it can be cleared (files stay on disk).
 - When the queue empties, emit an "idle" event (used by notifications / auto-shutdown).
 
 ### F5. Post-processing (planned/optional)
@@ -112,11 +119,9 @@ Each feature lists: what it does, rules, and edge cases the implementation must 
 - Show live speed, historical sparkline, and "remaining jobs" in the UI.
 - History survives restart and is the backing store for the graph.
 
-### F7. Bookmarks (newsgroup shortcuts)
-- Flat list with optional nesting (`parent_id`), a name, an optional newsgroup, a colour, an
-  expanded flag and an explicit order.
-- CRUD from the UI (add with name/group/colour, remove), persisted.
-- They are navigation shortcuts only — clicking one is a no-op until browse/search exists.
+### F7. (Removed) Bookmarks
+- Newsgroup bookmarks, search and browse are out of scope: NZB downloading is the product.
+  The bookmark table may stay in the database for compatibility; no UI uses it.
 
 ### F8. Settings
 - **Connection**: a list of servers {host, port, TLS, username, password, connections, enabled};
@@ -145,7 +150,7 @@ Each feature lists: what it does, rules, and edge cases the implementation must 
   AccentColor`), convert `r,g,b` to hex, derive the rest by mixing, and pick light/dark from
   background luminance. (A portal-based reader for `org.freedesktop.appearance` is a fine
   alternative; support both if cheap.)
-- Every colour in the UI must come from tokens; no literal colours in component code.
+- Every color in the UI must come from tokens; no literal colors in component code.
 - Re-theme without restart when the scheme changes (nice-to-have).
 
 ### F11. Packaging & CLI
@@ -160,98 +165,84 @@ Each feature lists: what it does, rules, and edge cases the implementation must 
 
 ## 5. Interface overview — window
 
-Single window, three vertical bands plus a status bar. The intent is "the original client's
-information density, modernised": a toolbar of actions, a left navigation sidebar, a centre work
-area with tabs, and a strip of four live monitors at the bottom.
+Single window: a toolbar, the job tables, a strip of three docks, and a status bar. The
+intent is a focused NZB downloader: everything on screen is about the queue.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────────┐
-│ TOOLBAR: Back Home Search MyList Newsgroups AutoSearch OpenNZB DownloadFolder │
-│          Transfers Pause                                    [search input] ⚙ │
-├───────────────┬──────────────────────────────────────────────────────────────┤
-│ BOOKMARKS     │ TABS:  Search | Latest File Groups | Queue          [Sort By] │
-│ (tree, colours│                                                              │
-│  add / remove)│  work area for the selected tab (table or placeholder)       │
-│               │                                                              │
-├───────────────┴──────────────────────────────────────────────────────────────┤
-│ Connection Graph │ NNTP Activity │ Messages │ Your Account                    │
+│ MASTHEAD │ Add NZB  Start/Pause/Resume  Scan Folder  Downloads       Settings │
 ├──────────────────────────────────────────────────────────────────────────────┤
-│ STATUS BAR: "Support Issues?"                         connection pill: Online │
+│ TABS: Queue (n) | History (n)                              [Filter by name]  │
+│ summary: 3 jobs · 4.2 GB to go · about 21 min at 3.4 MB/s · 1 held           │
+│ #  Name / folder or live speed   State   Size   Progress   ▶/⏸ ↑ ⋯ ×          │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ Throughput             │ Details (selection) / Server  │ Log  [All|Warn|Err]  │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ STATUS BAR: 128 GB free · 2.2 GB downloaded           N in queue  [Online]   │
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
 Rules:
-- The window resizes gracefully down to ~960×600; docks stop being side-by-side below that width.
+- The window resizes gracefully down to ~960×600; docks stack in one column below 900 px.
 - Empty states everywhere (no server, no jobs, no history) must render as readable text, never
   `NaN`, `Infinity`, `undefined`, or a blank panel.
-- All colours from theme tokens; all numbers formatted (e.g. `1.4 MB`, `0 B/s`).
+- All colors from theme tokens; all numbers formatted (e.g. `1.4 MB`, `0 B/s`).
+- Time left is shown only from a measured speed, never guessed.
 
 ---
 
 ## 6. Interface overview — controls
 
 ### 6.1 Toolbar (left→right)
-| Control | Behaviour |
+| Control | Behavior |
 |---|---|
-| Back | History back within the centre area (no-op until browse exists) |
-| Home | Return to the default tab |
-| Search | Focus the search input / open the Search tab |
-| My List | Saved/downloaded items (placeholder) |
-| Newsgroups | Newsgroup list (placeholder) |
-| Auto Search | Saved searches (placeholder) |
-| **Open NZB** | Reveals an inline path field + Add button; on success: queue reload + switch to Queue tab |
-| Download Folder | Opens the configured download folder in the OS file manager |
-| Transfers | Focus the Queue tab |
-| Pause | Pause/resume the queue (icon reflects state) |
-| Search box (right) | Usenet text search — placeholder unless an indexer is configured |
-| Gear (far right) | Opens the Settings sheet |
+| Masthead | Mark, wordmark and server readout; opens About |
+| **Add NZB** | Reveals an inline path field (Browse…, Add); on success: queue reload, Queue tab, the new job selected |
+| Start / Pause / Resume | The whole queue; label and icon follow the state; Start is disabled with nothing queued |
+| Scan Folder | Import new `.nzb` files from the watch folder now (shown only when one is set) |
+| Downloads | Opens the download folder in the file manager |
+| Settings | Opens the Settings sheet |
 
-Disabled/unimplemented actions must still be visible (parity of layout) but must not throw.
+### 6.2 Queue tab
+- Summary line: job count, bytes to go, time left at the measured speed, held count; a
+  `Start all` button when a run limited to single jobs leaves others queued.
+- Columns: `#` (queue position), `Name` (subline: folder, live speed + time left while
+  downloading, or the error), `State` badge, `Size`, `Progress` (segment track + `NN%` +
+  `done / total`), controls.
+- Controls per row: start/pause toggle (downloading → pause; queued in the active run → hold;
+  queued outside any run or held → start on its own; failed → retry), move up, a `⋯` menu,
+  remove (inline `Remove?` Yes/No). Right click opens the same menu: pause/hold/resume/download
+  now, move to top/up/down/bottom, open download folder, archive password, remove.
+- Click selects a row (Details dock). Keys on the selection: Space toggles, Delete asks to
+  remove, Alt+↑/↓ move, Esc clears. Ctrl+F focuses the filter.
+- Empty state: "The queue is empty. Add an NZB to begin." with an Add NZB button.
 
-### 6.2 Bookmarks sidebar
-- Header "Bookmarks" with a `+` add affordance.
-- Rows: colour swatch (falls back to a neutral dot), name, indentation for nested rows, `×` to
-  remove (confirm in place, no modal).
-- Inline add form: name (required), optional newsgroup, colour (free text or a small palette).
-- Empty state: "No bookmarks yet".
+### 6.2b History tab
+Done and failed jobs, newest first: `Name`, `Result`, `Size`, actions (open folder, retry and
+archive password for failed jobs, remove). Double-click opens the folder. `Clear history`
+with inline confirmation removes the rows (files stay on disk).
 
-### 6.2b Queue tab
-Above the table: `Start`, `Pause`, `Resume`, `Scan watch folder`, and a connection pill
-(`Connected`/`No server` + `host:port · N conn`).
+### 6.3 Bottom docks (three, equal width)
+1. **Throughput** — current speed (live dot while bytes move), bytes left and time left;
+   a live plot of the last 10 min over a 24 h history strip (two time axes never share one
+   plot). One stored sample must still draw a visible (flat) trace.
+2. **Details** — with a selected job: state, name, progress, time left, folder (click opens),
+   NZB, password set, the error, and per-file progress rows. With no selection: **Server** —
+   `host:port`, TLS/Plain chip, username, fail-over count, connection slots (`effective /
+   max`), and tiles for articles fetched and missing this session and the lifetime total.
+3. **Log** — last ~50 lines, newest first, level filter (All / Warnings / Errors); three
+   columns (level mark, clock, text) so long lines wrap under their own text.
 
-Table columns: `#` (numeric id), `Name`, `State` (badge: queued/downloading/done/failed/paused),
-`Size` (formatted total), `Progress` (bar + `NN%` + `done / total`), `Remove` (confirm, then delete).
-
-Empty state: "No jobs. Import an NZB to begin."
-
-Other tabs: `Search` and `Latest File Groups` are placeholders that explain themselves
-("indexer-agnostic search; NZB import is the primary input").
-
-### 6.3 Bottom docks (four, equal-ish width)
-1. **Connection Graph** — current speed (with a live dot that breathes while bytes move) and
-   `Remaining: pending / total jobs`; a live plot of the last 10 min (gradient fill, pulsing end
-   marker, scale and time-span corner labels) over a separate 24 h history strip (stepped area,
-   busiest bucket ticked in the live color), so the two time axes never share one plot. One
-   stored sample must still draw a visible (flat) trace.
-2. **NNTP Activity** — `host:port`, a TLS/Plain chip, username, fail-over count; a row of
-   connection slots (one cell per configured connection, the effective ones lit; they shimmer
-   while downloading) under an `effective / max` figure; stat tiles for articles fetched and
-   missing this session.
-3. **Messages** — last ~50 lines, newest first, one line per meaningful event (never one per
-   segment); local errors included. Three columns (level mark, clock, text) so long lines wrap
-   under their own text; a line that arrives after the first frame fades in.
-4. **Your Account** — stat tiles: downloaded total, jobs done, jobs pending, jobs failed (when
-   any), configured max connections; a segment track of jobs finished over jobs known.
-
-Readings are stat tiles (a large mono figure over a small eyebrow label); the 2×2 grid uses
-their one-line inline form. All dock motion stops under reduced motion.
+All dock motion stops under reduced motion.
 
 ### 6.4 Status bar
-Left: "Support Issues?" (help link placeholder). Right: a state pill — `Online` when connected and
-idle, `Downloading`/speed while active, `Error` after a failure.
+Left: free space on the download folder's filesystem (warning color when low or smaller
+than what the queue still needs) and the lifetime downloaded total. Right: jobs in queue, a
+state pill — `Online` when connected and idle, `Downloading`/speed while active, `Paused`,
+`No server`, or the error cause — and the innerpulse credit.
 
 ### 6.5 Settings sheet (modal)
-Sections, each a labelled group; footer `Cancel` / `Save`:
+Sections, each a labeled group; footer `Cancel` / `Save`:
 
 - **Connection**
   - List of server rows. Per row: `Host`, `Port`, `TLS` (checkbox), `Username`, `Password`,
@@ -260,12 +251,10 @@ Sections, each a labelled group; footer `Cancel` / `Save`:
 - **Downloads**: `Download folder`, `Watch folder`, `Watch folder enabled`.
 - **Performance**: `Max connections`, `Speed limit (KiB/s, 0 = unlimited)`.
 - **Automation**: `Shut down when queue finishes`.
-Paths are plain text inputs in a rewrite without a file-dialog dependency (a native picker is
-better if available).
 
 ### 6.6 Dialogs
-Only one modal today: the Settings sheet. Destructive actions (remove job, remove bookmark) use
-inline confirmation, not a modal.
+Modals: Settings and About. Destructive actions (remove job, clear history) use inline
+confirmation, not a modal.
 
 ---
 
@@ -280,7 +269,7 @@ The UI is event-driven; it does not poll the engine:
 - `engine://paused` — pause acknowledged.
 - `engine://watch-imported` — names of NZBs auto-enqueued.
 
-On mount: load theme, settings, jobs, bookmarks, throughput history. While a job is downloading,
+On mount: load theme, settings, jobs, queue order, throughput history. While a job is downloading,
 refresh the job list on a short interval (~1.5 s) *in addition to* event-driven updates.
 
 ---
@@ -293,7 +282,7 @@ Implement these entities (a relational DB is natural; any durable store is accep
 `bytes_done`, `dest_dir`, `source_path` (NZB), `created_at`.
 **JobFile** (optional) — `job_id`, `name`, `bytes_total`, `bytes_done`, `state`.
 **Server** — `host`, `port`, `tls`, `username`, `password`, `connections`, `priority`, `enabled`.
-**Bookmark** — `id`, `parent_id?`, `name`, `newsgroup?`, `colour?`, `expanded`, `order`.
+**Job** also carries a queue `position` (0 until the user reorders).
 **ThroughputSample** — `timestamp` (or date+hour), `bytes_up`, `bytes_down`.
 **Setting** — `key`, `value` (JSON for the settings document).
 
@@ -321,7 +310,7 @@ download every file, update `bytes_done`, mark `done` (or `failed` with reason).
 
 **Restart**
 - Queue rows with `queued`/`downloading`/`paused` are resumed; `done`/`failed` are history.
-- Throughput history and bookmarks persist; theme is re-resolved from the desktop.
+- Throughput history and the queue order persist; theme is re-resolved from the desktop.
 
 **Watch folder**
 - Scan → enqueue new `*.nzb` → notify UI → user presses Start (or auto-start if configured).
@@ -331,7 +320,7 @@ download every file, update `bytes_done`, mark `done` (or `failed` with reason).
 ## 10. Explicit non-goals
 
 - Any vendor **search/browse/account/billing API** (the original client's private endpoints).
-  Do not reverse these. Search surfaces in the UI must be labelled as indexer-driven or
+  Do not reverse these. Search surfaces in the UI must be labeled as indexer-driven or
   "not configured".
 - Content ratings, DMCA/content-report dialogs, vendor "messages" from a remote account service.
 - Windows/macOS parity. Linux desktop first.
@@ -351,7 +340,7 @@ download NZB → existing import path). Keep it optional and pluggable; never ha
 3. **Window shell**: layout, toolbar, tabs, docks, status bar, theme tokens from the desktop.
 4. **Queue UI**: table, Start/Pause/Resume/Remove, inline import, connection pill.
 5. **Settings sheet**: server editor with Test, paths, performance, automation.
-6. **Bookmarks**: DB-backed list + add/remove.
+6. **Per-job control**: hold/start one job, reorder, history tab.
 7. **Throughput history + graph**, messages log, account summary.
 8. **Post-process**: PAR2 verify/repair, archive extraction, cleanup.
 9. **Automation**: speed limit, scheduler window, auto-shutdown with countdown, notifications.
@@ -371,7 +360,7 @@ download NZB → existing import path). Keep it optional and pluggable; never ha
 - Settings round-trip through the store; the first enabled server with a host is used for runs;
   Test shows a real protocol reply.
 - Throughput history persists and renders after restart (a single sample still draws a trace).
-- UI contains **no literal colours**; switching the desktop scheme changes every surface/text
-  colour used.
+- UI contains **no literal colors**; switching the desktop scheme changes every surface/text
+  color used.
 - Empty state (no server, no jobs, no history) renders cleanly — no `NaN`, no blank panels.
 - Bundles install and launch; the window opens themed to the desktop.
