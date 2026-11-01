@@ -348,12 +348,12 @@ fn populated_window_renders() {
         h.get_by_label("Online");
         h.get_by_label("news.example.net:563");
         h.get_by_label("reader");
-        h.get_by_label("12 · max 20 · using 12");
+        h.get_by_label("12 / 20");
         h.get_by_label_contains("Throughput graph, 600 stored samples");
         h.get_by_label("Remaining: 2 / 4 jobs");
         h.get_by_label("100%  ·  658 MB / 658 MB");
         h.get_by_label("Newskite · NNTP · NEWS.EXAMPLE.NET:563 TLS · 12 CONN");
-        h.get_by_label("0 this session");
+        h.get_by_label("Articles fetched: 0");
         assert!(
             h.query_by_label_contains("not-shown").is_none(),
             "password must never be displayed"
@@ -527,8 +527,12 @@ fn bookmarks_add_and_remove_inline() {
 
 #[test]
 fn messages_dock_shows_logs_newest_first() {
-    let fx = Fixture::new(|_, _| {});
+    let fx = Fixture::new(seed_populated);
     fx.service.log(LogLevel::Info, "first line");
+    fx.service.log(
+        LogLevel::Warn,
+        "Open.Movie.Project.2160p: par2 repaired 3 blocks, extract ok",
+    );
     fx.service.log(LogLevel::Error, "second line");
     let mut h = fx.harness(true, SIZE);
     h.run_steps(3);
@@ -536,6 +540,18 @@ fn messages_dock_shows_logs_newest_first() {
     assert_eq!(logs[0].text, "second line");
     h.get_by_label("second line");
     h.get_by_label("first line");
+    // A long line wraps under its own text, inside the card.
+    let long = h
+        .get_by_label("Open.Movie.Project.2160p: par2 repaired 3 blocks, extract ok")
+        .rect();
+    let title = h.get_by_label("MESSAGES").rect();
+    assert!(
+        long.left() > title.left() + 60.0,
+        "text sits right of the clock column"
+    );
+    assert!(long.right() <= SIZE.x, "{long:?}");
+    assert_no_bad_numbers(&h);
+    snapshot(&mut h, "messages-dark");
 }
 
 #[test]
@@ -592,6 +608,7 @@ fn single_stored_sample_and_live_series_draw() {
     h.get_by_label_contains("Throughput graph, 1 stored samples, 4 live");
     h.get_by_label("1.0 MB/s");
     assert_no_bad_numbers(&h);
+    snapshot(&mut h, "live-series-dark");
 }
 
 #[test]
@@ -761,7 +778,7 @@ fn nntp_activity_counts_articles_and_missing() {
     let fx = Fixture::new(seed_populated);
     let mut h = fx.harness_with(true, SIZE, false);
     h.run_steps(2);
-    h.get_by_label("0 this session");
+    h.get_by_label("Articles fetched: 0");
     let tx = app(&h).sender();
     let job_id = app(&h).data.jobs[1].id;
     for done in 1..=3 {
@@ -789,7 +806,7 @@ fn nntp_activity_counts_articles_and_missing() {
     ))
     .expect("send");
     h.run_steps(2);
-    h.get_by_label("3 this session");
+    h.get_by_label("Articles fetched: 3");
     assert_eq!(app(&h).data.articles_missing, 2);
     assert_no_bad_numbers(&h);
 }

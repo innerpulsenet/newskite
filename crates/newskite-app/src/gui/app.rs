@@ -1065,7 +1065,7 @@ impl NewskiteApp {
         // the queue a few rows.
         let window_h = ctx.content_rect().height();
         let (dock_id, dock_h) = match docks::layout_for(width) {
-            docks::DockLayout::Row => ("docks-row", 210.0),
+            docks::DockLayout::Row => ("docks-row", 240.0),
             docks::DockLayout::Grid => (
                 "docks-grid",
                 (window_h * GRID_DOCK_SHARE).clamp(260.0, 320.0),
@@ -1082,7 +1082,9 @@ impl NewskiteApp {
                     .fill(pal.surface)
                     .inner_margin(egui::Margin::same(8)),
             )
-            .show(ctx, |ui| docks::show(ui, &pal, &self.data, &mut actions));
+            .show(ctx, |ui| {
+                docks::show(ui, &pal, &self.data, self.reduced_motion, &mut actions)
+            });
 
         egui::SidePanel::left("bookmarks")
             .resizable(true)
