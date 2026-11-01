@@ -10,3 +10,7 @@ newskite-types.workspace = true
 thiserror.workspace = true
 quick-xml = "0.42"
 crc32fast = "1.5"
+
+[[bench]]
+name = "yenc"
+harness = false
