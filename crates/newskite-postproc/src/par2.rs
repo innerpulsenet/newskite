@@ -99,6 +99,43 @@ pub(crate) fn reported_targets(out: &str) -> BTreeSet<String> {
         .collect()
 }
 
+/// Create the folders that targets in subfolders (e.g. `Sample/x-sample.mkv`) need:
+/// par2cmdline does not create them, so renaming an obfuscated file into one fails with
+/// an I/O error and aborts every rename after it. Only plain relative paths are honored,
+/// and an existing component must be a real folder (never a symlink), so a hostile PAR2
+/// file cannot make par2 write outside `dir`.
+pub(crate) fn prepare_target_dirs(dir: &Path, targets: &BTreeSet<String>, log: &mut dyn FnMut(String)) {
+    use std::path::Component;
+    for target in targets {
+        let Some(parent) = Path::new(target).parent().filter(|p| !p.as_os_str().is_empty()) else { continue };
+        if !parent.components().all(|c| matches!(c, Component::Normal(_))) {
+            log(format!("par2: ignoring unsafe target path {target:?}"));
+            continue;
+        }
+        let mut current = dir.to_path_buf();
+        for comp in parent.components() {
+            current.push(comp);
+            match std::fs::symlink_metadata(&current) {
+                Ok(m) if m.is_dir() => {}
+                Ok(_) => {
+                    log(format!("par2: {} is in the way of target {target:?}", current.display()));
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    if let Err(e) = std::fs::create_dir(&current) {
+                        log(format!("par2: could not create {}: {e}", current.display()));
+                        break;
+                    }
+                }
+                Err(e) => {
+                    log(format!("par2: could not inspect {}: {e}", current.display()));
+                    break;
+                }
+            }
+        }
+    }
+}
+
 fn rel(name: &Path) -> PathBuf {
     Path::new(".").join(name)
 }
@@ -283,6 +320,7 @@ fn run_set(
     // Files that par2 did not recognize as targets may be renamed (obfuscated) copies of
     // missing targets; hand them to the repair so it can match them by content.
     let targets = reported_targets(&vrun.combined());
+    prepare_target_dirs(dir, &targets, log);
     let set_files: BTreeSet<&PathBuf> = set.files.iter().collect();
     let mut extras = Vec::new();
     let mut budget = MAX_EXTRA_ARG_BYTES;
@@ -354,6 +392,38 @@ mod tests {
         assert_eq!(classify_repair(&run(Some(0), "All files are correct, repair is not required.")), Ok(false));
         assert!(classify_repair(&run(Some(2), "Repair is not possible.")).is_err());
         assert!(classify_repair(&run(Some(5), "")).unwrap_err().contains("repair failed"));
+    }
+
+    #[test]
+    fn target_dirs_created_only_for_safe_relative_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("job");
+        std::fs::create_dir(&dir).unwrap();
+        let targets: BTreeSet<String> =
+            ["Sample/x.mkv", "a/b/c.bin", "plain.rar", "../escape/x", "/abs/x", "./dot/x"].iter().map(|s| s.to_string()).collect();
+        let mut logs = Vec::new();
+        prepare_target_dirs(&dir, &targets, &mut |l| logs.push(l));
+        assert!(dir.join("Sample").is_dir());
+        assert!(dir.join("a/b").is_dir());
+        assert!(!tmp.path().join("escape").exists());
+        assert!(!dir.join("dot").exists());
+        assert_eq!(logs.iter().filter(|l| l.contains("unsafe")).count(), 3, "{logs:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn target_dirs_never_follow_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("job");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("Sample")).unwrap();
+        let targets: BTreeSet<String> = ["Sample/deeper/x.mkv".to_string()].into_iter().collect();
+        let mut logs = Vec::new();
+        prepare_target_dirs(&dir, &targets, &mut |l| logs.push(l));
+        assert!(!outside.join("deeper").exists());
+        assert!(logs.iter().any(|l| l.contains("in the way")), "{logs:?}");
     }
 
     #[test]
