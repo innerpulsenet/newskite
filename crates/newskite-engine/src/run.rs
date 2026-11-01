@@ -4,9 +4,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use newskite_nntp::{NntpConnection, NntpError};
 use newskite_nzb::nzb::{sanitize_filename, Segment};
@@ -19,11 +19,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::limiter::RateLimiter;
 use crate::naming::{claim_key, part_path, suffix_number, with_suffix};
+use crate::pool::ConnectionPool;
 use crate::pwrite::{read_exact_at, write_all_at};
 use crate::{backoff_delay, DownloadRequest, EngineError, FileReport, JobReport, Progress};
 
-/// How long a polite `QUIT` may take at the end of a run.
-const QUIT_TIMEOUT: Duration = Duration::from_secs(2);
 /// Message ids listed in a missing-article summary line.
 const MISSING_PREVIEW: usize = 3;
 /// Individual fail-over log lines per job before going quiet.
@@ -50,6 +49,34 @@ struct ServerSlot {
     permits: Arc<Semaphore>,
     /// Set after an authentication failure; the server is not used again in this job.
     unusable: AtomicBool,
+    /// Consecutive failed connection attempts; reset by a successful connect.
+    strikes: AtomicU32,
+    /// No worker opens a connection to this server before this instant (set after a failed
+    /// attempt, growing with `strikes`), so one refusal does not trigger a reconnect storm.
+    cooldown: Mutex<Option<Instant>>,
+}
+
+impl ServerSlot {
+    fn new(cfg: ServerConfig) -> Self {
+        Self {
+            address: cfg.address(),
+            permits: Arc::new(Semaphore::new(usize::from(cfg.connections.max(1)))),
+            unusable: AtomicBool::new(false),
+            strikes: AtomicU32::new(0),
+            cooldown: Mutex::new(None),
+            cfg,
+        }
+    }
+
+    fn note_connected(&self) {
+        self.strikes.store(0, Ordering::SeqCst);
+        *lock(&self.cooldown) = None;
+    }
+
+    fn note_connect_failure(&self) {
+        let strikes = self.strikes.fetch_add(1, Ordering::SeqCst).saturating_add(1);
+        *lock(&self.cooldown) = Some(Instant::now() + jittered(backoff_delay(strikes)));
+    }
 }
 
 /// The decided output for a file (set exactly once per file).
@@ -145,6 +172,7 @@ impl FileJob {
 struct Shared {
     dest_dir: PathBuf,
     servers: Vec<ServerSlot>,
+    pool: Arc<ConnectionPool>,
     /// Notified whenever a connection slot is released or a server becomes unusable.
     released: Notify,
     files: Vec<FileJob>,
@@ -206,6 +234,23 @@ impl Shared {
         lock(&self.queue).pop_front()
     }
 
+    /// Puts a segment back at the head of the queue (its pipelined request was lost with
+    /// the connection it was sent on).
+    fn requeue(&self, item: (usize, usize)) {
+        lock(&self.queue).push_front(item);
+    }
+
+    /// The top-ranked usable server: the only one requests are pipelined on, so workers
+    /// never drift onto a fallback server while the primary has free capacity.
+    fn primary_server(&self) -> Option<usize> {
+        self.servers.iter().position(|s| !s.unusable.load(Ordering::SeqCst))
+    }
+
+    /// Whether `server` may still be asked for a segment with the given `tried` set.
+    fn can_serve(&self, server: usize, tried: &[bool]) -> bool {
+        !tried[server] && !self.servers[server].unusable.load(Ordering::SeqCst)
+    }
+
     /// Usable, not-yet-tried servers, starting at `prefer` and wrapping around.
     fn order(&self, tried: &[bool], prefer: usize) -> Vec<usize> {
         let n = self.servers.len();
@@ -247,8 +292,33 @@ impl Drop for Slot {
 
 struct Held {
     conn: NntpConnection,
+    /// Segment whose `BODY` request is already on the wire (the next reply on `conn`).
+    prefetched: Option<(usize, usize)>,
+    /// Taken from the pool and not yet proven alive: a first failure is silently replaced
+    /// by a fresh connection instead of counting as a retry.
+    untested: bool,
     // Declared after `conn` so the socket closes before the slot is handed on.
     slot: Slot,
+}
+
+/// Per-segment fetch state; lives across [`Flow::Yield`]s.
+struct SegmentState {
+    fi: usize,
+    si: usize,
+    tried: Vec<bool>,
+    failures: u32,
+    prefer: usize,
+    reason: Option<String>,
+    /// Set once a server answered "missing", "undecodable" or "foreign" for this segment:
+    /// from then on a fallback that keeps failing transiently is given up on for this
+    /// article instead of aborting the job.
+    failover: bool,
+}
+
+impl SegmentState {
+    fn new(shared: &Shared, (fi, si): (usize, usize)) -> Self {
+        Self { fi, si, tried: vec![false; shared.servers.len()], failures: 0, prefer: 0, reason: None, failover: false }
+    }
 }
 
 enum ConnFail {
@@ -259,12 +329,18 @@ enum ConnFail {
 }
 
 enum Flow {
+    /// The segment is done (stored, missing or skipped).
     Continue,
+    /// The job is over (aborted or cancelled).
     Stop,
+    /// The segment must move to another server but the held connection has a pipelined
+    /// reply pending: process that segment first, then come back to this one.
+    Yield,
 }
 
 pub(crate) async fn run(
     req: DownloadRequest,
+    pool: Arc<ConnectionPool>,
     events: UnboundedSender<EngineEvent>,
     progress: Arc<Progress>,
     cancel: CancellationToken,
@@ -341,21 +417,14 @@ pub(crate) async fn run(
     }
 
     let total_segments = queue.len();
-    let slots: Vec<ServerSlot> = servers
-        .into_iter()
-        .map(|cfg| ServerSlot {
-            address: cfg.address(),
-            permits: Arc::new(Semaphore::new(usize::from(cfg.connections.max(1)))),
-            unusable: AtomicBool::new(false),
-            cfg,
-        })
-        .collect();
+    let slots: Vec<ServerSlot> = servers.into_iter().map(ServerSlot::new).collect();
     let capacity: usize = slots.iter().map(|s| usize::from(s.cfg.connections.max(1))).sum();
     let workers = options.connections.max(1).min(capacity).min(total_segments);
 
     let shared = Arc::new(Shared {
         dest_dir,
         servers: slots,
+        pool,
         released: Notify::new(),
         files,
         queue: Mutex::new(queue),
@@ -457,19 +526,41 @@ fn skipped_report(shared: &Shared, file: &FileJob) -> FileReport {
 
 async fn worker(shared: Arc<Shared>) {
     let mut held: Option<Held> = None;
+    // Segments that stepped aside for a pipelined reply (see `Flow::Yield`).
+    let mut deferred: Vec<SegmentState> = Vec::new();
     while !shared.abort.is_cancelled() {
-        let Some((fi, si)) = shared.next_item() else { break };
-        if let Flow::Stop = process_segment(&shared, &mut held, fi, si).await {
+        // A pipelined reply must be read before anything else happens on its connection,
+        // so its segment goes first; then the ones that stepped aside; then new work.
+        let mut state = if let Some(item) = held.as_mut().and_then(|h| h.prefetched.take()) {
+            SegmentState::new(&shared, item)
+        } else if let Some(state) = deferred.pop() {
+            state
+        } else if let Some(item) = shared.next_item() {
+            SegmentState::new(&shared, item)
+        } else {
             break;
+        };
+        match process_segment(&shared, &mut held, &mut state).await {
+            Flow::Continue => {}
+            Flow::Yield => deferred.push(state),
+            Flow::Stop => break,
         }
     }
-    if let Some(h) = held.take() {
-        if shared.abort.is_cancelled() {
-            return; // Just drop the socket.
-        }
-        let Held { conn, slot } = h;
-        let _ = tokio::time::timeout(QUIT_TIMEOUT, conn.quit()).await;
-        drop(slot);
+    if shared.abort.is_cancelled() {
+        return; // Just drop the socket.
+    }
+    drop_conn(&shared, &mut held);
+}
+
+/// Gives the worker's connection up: a pending pipelined segment goes back to the queue,
+/// a healthy idle connection goes to the pool for the next worker or job, anything else is
+/// closed. The slot is released either way.
+fn drop_conn(shared: &Shared, held: &mut Option<Held>) {
+    let Some(h) = held.take() else { return };
+    if let Some(item) = h.prefetched {
+        shared.requeue(item);
+    } else {
+        shared.pool.put(&shared.servers[h.slot.server].cfg, h.conn);
     }
 }
 
@@ -504,15 +595,17 @@ async fn ensure_conn(
 ) -> Result<(), ConnFail> {
     let order = shared.order(tried, prefer);
     if order.is_empty() {
-        *held = None;
+        drop_conn(shared, held);
         return Err(ConnFail::NoEligible);
     }
     let mut upgrade = None;
     if let Some(h) = held.as_ref() {
         match order.iter().position(|&s| s == h.slot.server) {
-            Some(_) if h.conn.is_broken() => *held = None,
-            None => *held = None,
+            Some(_) if h.conn.is_broken() => drop_conn(shared, held),
+            None => drop_conn(shared, held),
             Some(0) => return Ok(()),
+            // A pipelined reply pins the segment to this connection.
+            Some(_) if h.prefetched.is_some() => return Ok(()),
             Some(pos) => {
                 // Prefer a higher-ranked server if it has a free slot right now.
                 upgrade = order[..pos].iter().find_map(|&server| {
@@ -526,7 +619,7 @@ async fn ensure_conn(
                 if upgrade.is_none() {
                     return Ok(());
                 }
-                *held = None;
+                drop_conn(shared, held);
             }
         }
     }
@@ -535,14 +628,20 @@ async fn ensure_conn(
         None => acquire_slot(shared, tried, prefer).await?,
     };
     let server = slot.server;
-    let cfg = &shared.servers[server].cfg;
+    let slot_info = &shared.servers[server];
+    if let Some(conn) = shared.pool.take(&slot_info.cfg) {
+        *held = Some(Held { conn, prefetched: None, untested: true, slot });
+        return Ok(());
+    }
+    wait_cooldown(shared, server).await?;
     let res = tokio::select! {
         _ = shared.abort.cancelled() => return Err(ConnFail::Stopped),
-        r = NntpConnection::connect(cfg, shared.connect_timeout) => r,
+        r = NntpConnection::connect(&slot_info.cfg, shared.connect_timeout) => r,
     };
     match res {
         Ok(conn) => {
-            *held = Some(Held { conn, slot });
+            slot_info.note_connected();
+            *held = Some(Held { conn, prefetched: None, untested: false, slot });
             Ok(())
         }
         Err(NntpError::AuthFailed(msg)) => Err(ConnFail::Auth { server, msg }),
@@ -550,48 +649,66 @@ async fn ensure_conn(
             server,
             msg: "server requires authentication but no username is configured".into(),
         }),
-        Err(err) => Err(ConnFail::Transient { server, err }),
+        Err(err) => {
+            slot_info.note_connect_failure();
+            Err(ConnFail::Transient { server, err })
+        }
     }
 }
 
+/// Sleeps out the server's connect cooldown, if one is active.
+async fn wait_cooldown(shared: &Shared, server: usize) -> Result<(), ConnFail> {
+    let until = *lock(&shared.servers[server].cooldown);
+    if let Some(until) = until {
+        let now = Instant::now();
+        if until > now {
+            tokio::select! {
+                _ = shared.abort.cancelled() => return Err(ConnFail::Stopped),
+                _ = tokio::time::sleep(until - now) => {}
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Fetches, decodes and stores one segment, walking servers as needed.
-async fn process_segment(shared: &Arc<Shared>, held: &mut Option<Held>, fi: usize, si: usize) -> Flow {
+async fn process_segment(shared: &Arc<Shared>, held: &mut Option<Held>, st: &mut SegmentState) -> Flow {
+    let (fi, si) = (st.fi, st.si);
     let file = &shared.files[fi];
     if file.is_skipped() {
         return finish_segment(shared, fi, None).await;
     }
     let seg = &file.segments[si];
-    let mut tried = vec![false; shared.servers.len()];
-    let mut failures = 0u32;
-    let mut prefer = 0usize;
-    let mut reason: Option<String> = None;
-    // Set once a server answered "missing", "undecodable" or "foreign" for this segment:
-    // from then on a fallback that keeps failing transiently is given up on for this
-    // article instead of aborting the job.
-    let mut failover = false;
 
     loop {
         if shared.abort.is_cancelled() {
             return Flow::Stop;
         }
-        match ensure_conn(shared, held, &tried, prefer).await {
+        // A connection with a pipelined reply pending can only be used for that reply:
+        // step aside when it cannot serve this segment any more.
+        if let Some(h) = held.as_ref() {
+            if h.prefetched.is_some() && !h.conn.is_broken() && !shared.can_serve(h.slot.server, &st.tried) {
+                return Flow::Yield;
+            }
+        }
+        match ensure_conn(shared, held, &st.tried, st.prefer).await {
             Ok(()) => {}
             Err(ConnFail::Stopped) => return Flow::Stop,
             Err(ConnFail::NoEligible) => {
                 if shared.servers.iter().all(|s| s.unusable.load(Ordering::SeqCst)) {
                     return Flow::Stop; // mark_unusable already recorded AuthFailed.
                 }
-                return record_missing(shared, fi, si, reason).await;
+                return record_missing(shared, fi, si, st.reason.take()).await;
             }
             Err(ConnFail::Auth { server, msg }) => {
                 shared.mark_unusable(server, &msg);
                 continue;
             }
             Err(ConnFail::Transient { server, err }) => {
-                match retry_wait(shared, &mut failures, &mut prefer, server, &err, failover).await {
+                match retry_wait(shared, &mut st.failures, &mut st.prefer, server, &err, st.failover).await {
                     Retry::Again => continue,
                     Retry::SkipServer => {
-                        reason = Some(skip_server(shared, &mut tried, server, &seg.message_id, &err));
+                        st.reason = Some(skip_server(shared, &mut st.tried, server, &seg.message_id, &err));
                         continue;
                     }
                     Retry::Stop => return Flow::Stop,
@@ -600,13 +717,14 @@ async fn process_segment(shared: &Arc<Shared>, held: &mut Option<Held>, fi: usiz
         }
         let Some(h) = held.as_mut() else { continue };
         let server = h.slot.server;
+        let untested = h.untested;
         let res = tokio::select! {
             biased;
             _ = shared.abort.cancelled() => {
-                *held = None;
+                drop_conn(shared, held);
                 return Flow::Stop;
             }
-            r = h.conn.body(&seg.message_id) => r,
+            r = fetch(shared, h, &seg.message_id) => r,
         };
         match res {
             Ok(raw) => {
@@ -616,28 +734,42 @@ async fn process_segment(shared: &Arc<Shared>, held: &mut Option<Held>, fi: usiz
                         _ = limiter.acquire(raw.len()) => {}
                     }
                 }
-                let checked = yenc::decode(&raw).map_err(|e| format!("could not be decoded: {e}")).and_then(|part| {
-                    file.check_part(&part).map(|()| part).map_err(|why| format!("does not belong to this file: {why}"))
-                });
-                drop(raw);
+                let checked = {
+                    // Decode and verify on the blocking pool so a slow decode never
+                    // stalls another connection's socket task.
+                    let shared = shared.clone();
+                    tokio::task::spawn_blocking(move || {
+                        yenc::decode(&raw).map_err(|e| format!("could not be decoded: {e}")).and_then(|part| {
+                            shared.files[fi]
+                                .check_part(&part)
+                                .map(|()| part)
+                                .map_err(|why| format!("does not belong to this file: {why}"))
+                        })
+                    })
+                    .await
+                };
                 match checked {
-                    Ok(part) => return store_part(shared, fi, part).await,
-                    Err(why) => {
+                    Ok(Ok(part)) => return store_part(shared, fi, part).await,
+                    Ok(Err(why)) => {
                         let msg = format!(
                             "{}: article <{}> from {} {why}",
                             file.label, seg.message_id, shared.servers[server].address
                         );
                         shared.log_bad_article(&msg);
-                        reason = Some(msg);
-                        tried[server] = true;
-                        failover = true;
+                        st.reason = Some(msg);
+                        st.tried[server] = true;
+                        st.failover = true;
+                    }
+                    Err(e) => {
+                        shared.fail(EngineError::Io(io::Error::other(format!("decode task failed: {e}"))));
+                        return Flow::Stop;
                     }
                 }
             }
             Err(NntpError::ArticleMissing(_)) => {
-                tried[server] = true;
-                failover = true;
-                if let Some(&next) = shared.order(&tried, server).first() {
+                st.tried[server] = true;
+                st.failover = true;
+                if let Some(&next) = shared.order(&st.tried, server).first() {
                     let n = shared.failovers.fetch_add(1, Ordering::Relaxed);
                     if n < FAILOVER_LOG_LIMIT {
                         shared.log(format!(
@@ -648,11 +780,11 @@ async fn process_segment(shared: &Arc<Shared>, held: &mut Option<Held>, fi: usiz
                 }
             }
             Err(NntpError::AuthFailed(msg)) => {
-                *held = None;
+                drop_conn(shared, held);
                 shared.mark_unusable(server, &msg);
             }
             Err(NntpError::AuthRequired) => {
-                *held = None;
+                drop_conn(shared, held);
                 shared.mark_unusable(server, "server requires authentication");
             }
             Err(NntpError::InvalidMessageId(id)) => {
@@ -661,17 +793,78 @@ async fn process_segment(shared: &Arc<Shared>, held: &mut Option<Held>, fi: usiz
                 return record_missing(shared, fi, si, Some(msg)).await;
             }
             Err(err) => {
-                *held = None;
-                match retry_wait(shared, &mut failures, &mut prefer, server, &err, failover).await {
+                drop_conn(shared, held);
+                if untested {
+                    // A pooled connection the server had already closed: not a failure of
+                    // the server or the segment, just open a fresh one.
+                    tracing::debug!(target: "newskite_engine", address = %shared.servers[server].address, error = %err, "pooled connection was dead; reconnecting");
+                    continue;
+                }
+                match retry_wait(shared, &mut st.failures, &mut st.prefer, server, &err, st.failover).await {
                     Retry::Again => {}
                     Retry::SkipServer => {
-                        reason = Some(skip_server(shared, &mut tried, server, &seg.message_id, &err));
+                        st.reason = Some(skip_server(shared, &mut st.tried, server, &seg.message_id, &err));
                     }
                     Retry::Stop => return Flow::Stop,
                 }
             }
         }
     }
+}
+
+/// Fetches one body on `h`, pipelining the request for the worker's next segment behind
+/// it. The request for `message_id` is already on the wire when this segment was itself
+/// prefetched.
+async fn fetch(shared: &Arc<Shared>, h: &mut Held, message_id: &str) -> Result<Vec<u8>, NntpError> {
+    if h.conn.outstanding_bodies() == 0 {
+        h.conn.send_body(message_id).await?;
+    }
+    h.conn.begin_body(message_id).await?;
+    h.untested = false;
+    prefetch_next(shared, h).await;
+    h.conn.finish_body().await
+}
+
+/// Sends the `BODY` request for the next queued segment while the current body is still
+/// streaming. Only on the primary server, so a worker that spilled over to a fallback
+/// returns to the primary as soon as it has room, and only for files whose output is
+/// already decided: the first decoded part of a file may reveal it as complete from an
+/// earlier run, and then no second part should have been requested. Segments of skipped
+/// files are completed on the spot instead.
+async fn prefetch_next(shared: &Arc<Shared>, h: &mut Held) {
+    if shared.primary_server() != Some(h.slot.server) {
+        return;
+    }
+    while let Some(item) = shared.next_item() {
+        let file = &shared.files[item.0];
+        if file.is_skipped() {
+            if let Flow::Stop = finish_segment(shared, item.0, None).await {
+                return;
+            }
+            continue;
+        }
+        if file.output.get().is_none() {
+            shared.requeue(item);
+            return;
+        }
+        match h.conn.send_body(&file.segments[item.1].message_id).await {
+            Ok(()) => h.prefetched = Some(item),
+            // A bad id or a dead socket: the segment is handled, and the error reported,
+            // when it is processed the ordinary way.
+            Err(_) => shared.requeue(item),
+        }
+        return;
+    }
+}
+
+/// `delay` with ±25 % random jitter, so workers that failed together do not retry together.
+fn jittered(delay: Duration) -> Duration {
+    use std::hash::{BuildHasher, RandomState};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    // RandomState is randomly seeded per thread; hashing a counter gives fresh values.
+    let r = RandomState::new().hash_one(n) % 51;
+    delay.mul_f64(0.75 + r as f64 / 100.0)
 }
 
 /// Outcome of [`retry_wait`].
@@ -1038,6 +1231,7 @@ mod tests {
         let shared = Shared {
             dest_dir: PathBuf::from("."),
             servers: Vec::new(),
+            pool: Arc::new(ConnectionPool::new()),
             released: Notify::new(),
             files: Vec::new(),
             queue: Mutex::new(VecDeque::new()),
@@ -1069,6 +1263,7 @@ mod tests {
         let shared = Shared {
             dest_dir: PathBuf::from("."),
             servers: Vec::new(),
+            pool: Arc::new(ConnectionPool::new()),
             released: Notify::new(),
             files: Vec::new(),
             queue: Mutex::new(VecDeque::new()),
@@ -1103,15 +1298,11 @@ mod tests {
     #[test]
     fn order_rotates_and_filters() {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let mk = |h: &str| ServerSlot {
-            cfg: ServerConfig { host: h.into(), ..Default::default() },
-            address: h.into(),
-            permits: Arc::new(Semaphore::new(1)),
-            unusable: AtomicBool::new(false),
-        };
+        let mk = |h: &str| ServerSlot::new(ServerConfig { host: h.into(), connections: 1, ..Default::default() });
         let shared = Shared {
             dest_dir: PathBuf::from("."),
             servers: vec![mk("a"), mk("b"), mk("c")],
+            pool: Arc::new(ConnectionPool::new()),
             released: Notify::new(),
             files: Vec::new(),
             queue: Mutex::new(VecDeque::new()),
@@ -1131,7 +1322,35 @@ mod tests {
         assert_eq!(shared.order(&[false, false, false], 0), vec![0, 1, 2]);
         assert_eq!(shared.order(&[false, false, false], 2), vec![2, 0, 1]);
         assert_eq!(shared.order(&[true, false, false], 0), vec![1, 2]);
+        assert_eq!(shared.primary_server(), Some(0));
+        assert!(shared.can_serve(1, &[true, false, false]));
         shared.servers[1].unusable.store(true, Ordering::SeqCst);
         assert_eq!(shared.order(&[true, false, false], 0), vec![2]);
+        assert!(!shared.can_serve(1, &[true, false, false]));
+        shared.servers[0].unusable.store(true, Ordering::SeqCst);
+        assert_eq!(shared.primary_server(), Some(2));
+    }
+
+    #[test]
+    fn jitter_stays_within_a_quarter() {
+        for _ in 0..200 {
+            let d = jittered(Duration::from_millis(1000));
+            assert!(d >= Duration::from_millis(750) && d <= Duration::from_millis(1250), "{d:?}");
+        }
+    }
+
+    #[test]
+    fn connect_failures_set_a_growing_cooldown() {
+        let slot = ServerSlot::new(ServerConfig { host: "a".into(), ..Default::default() });
+        assert!(lock(&slot.cooldown).is_none());
+        slot.note_connect_failure();
+        let first = lock(&slot.cooldown).expect("cooldown set");
+        slot.note_connect_failure();
+        let second = lock(&slot.cooldown).expect("cooldown set");
+        assert!(second > first);
+        assert_eq!(slot.strikes.load(Ordering::SeqCst), 2);
+        slot.note_connected();
+        assert!(lock(&slot.cooldown).is_none());
+        assert_eq!(slot.strikes.load(Ordering::SeqCst), 0);
     }
 }
