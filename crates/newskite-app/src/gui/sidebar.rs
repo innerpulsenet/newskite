@@ -212,6 +212,18 @@ fn row(
     actions: &mut Vec<Action>,
 ) {
     let confirming = state.confirm_remove == Some(b.id);
+    // A quiet hover wash under the whole row (painted first, so the text sits on it).
+    let row_rect = {
+        let r = ui.available_rect_before_wrap();
+        egui::Rect::from_min_size(r.min, egui::vec2(r.width(), 24.0))
+    };
+    if ui.rect_contains_pointer(row_rect) && !confirming {
+        ui.painter().rect_filled(
+            row_rect.expand2(egui::vec2(4.0, 0.0)),
+            egui::CornerRadius::same(4),
+            pal.hover,
+        );
+    }
     ui.horizontal(|ui| {
         ui.set_min_height(24.0);
         ui.add_space(depth as f32 * INDENT);

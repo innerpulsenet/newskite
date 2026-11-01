@@ -1,19 +1,37 @@
 //! Center area: tab strip, the Queue tab (outline §6.2b) and the placeholder tabs.
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
 
-use eframe::egui::{self, Align, Layout, RichText, Sense, TextEdit, Ui};
+use eframe::egui::{self, Align, Id, Layout, RichText, Sense, TextEdit, Ui};
 use egui_extras::{Column, TableBuilder};
 use newskite_service::{Job, JobState};
 use newskite_types::{format, Settings};
 
 use super::app::{Action, Data, Tab, ViewState};
+use super::brand;
 use super::fonts;
+use super::motion::Beat;
 use super::theme::Palette;
 use super::widgets::{
-    article_grid, icon_button, kit_button, segment_track, spaced, state_badge, status_chip,
+    article_grid, icon_button, kit_button, segment_track_live, spaced, state_badge, status_chip,
     status_chip_width, ButtonKind, Icon, Status, EYEBROW_TRACKING,
 };
+
+/// Seconds the just-imported job's name stays in the accent before settling.
+const HIGHLIGHT_SECS: f64 = 2.5;
+/// Seconds a row's finish (done or failed) wash takes to fade.
+const FLASH_SECS: f64 = 1.6;
+/// Seconds the tab underline takes to slide to a newly selected tab.
+const TAB_SLIDE_SECS: f32 = 0.18;
+
+/// Seconds left at the current speed for `remaining` bytes, if a speed is known.
+pub fn eta_secs(remaining: u64, speed_bps: u64) -> Option<u64> {
+    if speed_bps == 0 {
+        return None;
+    }
+    Some(remaining.div_ceil(speed_bps))
+}
 
 /// Exact empty-state text of the Queue table.
 pub const EMPTY_QUEUE: &str = "No jobs. Import an NZB to begin.";
@@ -22,7 +40,7 @@ pub const EMPTY_QUEUE: &str = "No jobs. Import an NZB to begin.";
 /// windows; Actions keeps room for the "Remove?" Yes/No confirmation and the inline
 /// archive-password field.
 const ID_W: f32 = 44.0;
-const STATE_W: f32 = 100.0;
+const STATE_W: f32 = 112.0;
 const SIZE_W: f32 = 84.0;
 const ACTIONS_W: f32 = 168.0;
 const NAME_MIN: f32 = 140.0;
@@ -78,6 +96,38 @@ pub struct QueueState {
     pub password_edit: Option<(i64, String)>,
     /// Most recently imported job (briefly highlighted).
     pub highlight: Option<i64>,
+    /// When the highlight began (egui time), set on its first frame.
+    pub highlight_at: Option<f64>,
+    /// Each job's state as last drawn, to notice finishes.
+    pub last_states: HashMap<i64, JobState>,
+    /// Rows that just finished: the state reached and when (egui time).
+    pub flashes: HashMap<i64, (JobState, f64)>,
+}
+
+impl QueueState {
+    /// Notices jobs that reached done or failed since the last frame and starts their
+    /// wash; forgets rows that are gone. Pure bookkeeping, so tests can drive it.
+    pub fn note_finishes(&mut self, jobs: &[Job], now: f64) {
+        for j in jobs {
+            let was = self.last_states.insert(j.id, j.state);
+            if let Some(was) = was {
+                if was != j.state && matches!(j.state, JobState::Done | JobState::Failed) {
+                    self.flashes.insert(j.id, (j.state, now));
+                }
+            }
+        }
+        self.last_states
+            .retain(|id, _| jobs.iter().any(|j| j.id == *id));
+        self.flashes
+            .retain(|id, (_, at)| jobs.iter().any(|j| j.id == *id) && now - *at < FLASH_SECS);
+    }
+
+    /// 1 → 0 over [`FLASH_SECS`] for a row that just finished, with its state.
+    pub fn flash(&self, id: i64, now: f64) -> Option<(JobState, f32)> {
+        let (state, at) = self.flashes.get(&id)?;
+        let t = ((now - at) / FLASH_SECS).clamp(0.0, 1.0) as f32;
+        Some((*state, 1.0 - t))
+    }
 }
 
 fn state_rank(s: JobState) -> u8 {
@@ -140,15 +190,19 @@ pub fn show_center(
     view: &mut ViewState,
     actions: &mut Vec<Action>,
 ) {
+    let mut selected_rect = None;
     ui.horizontal(|ui| {
         for (tab, label) in [
             (Tab::Search, "Search"),
             (Tab::Latest, "Latest File Groups"),
             (Tab::Queue, "Queue"),
         ] {
-            tab_button(ui, pal, label, view.tab == tab, || {
+            let rect = tab_button(ui, pal, label, view.tab == tab, || {
                 actions.push(Action::SetTab(tab))
             });
+            if view.tab == tab {
+                selected_rect = Some(rect);
+            }
         }
         if view.tab == Tab::Queue {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -171,6 +225,31 @@ pub fn show_center(
             });
         }
     });
+    if let Some(rect) = selected_rect {
+        // The accent rule slides from the previous tab to the new one.
+        let (left, right) = if view.reduced_motion {
+            (rect.left() + 6.0, rect.right() - 6.0)
+        } else {
+            let ctx = ui.ctx();
+            (
+                ctx.animate_value_with_time(
+                    Id::new("tab-rule-left"),
+                    rect.left() + 6.0,
+                    TAB_SLIDE_SECS,
+                ),
+                ctx.animate_value_with_time(
+                    Id::new("tab-rule-right"),
+                    rect.right() - 6.0,
+                    TAB_SLIDE_SECS,
+                ),
+            )
+        };
+        let y = rect.bottom() - 1.5;
+        ui.painter().line_segment(
+            [egui::pos2(left, y), egui::pos2(right, y)],
+            egui::Stroke::new(3.0, pal.accent),
+        );
+    }
     let r = ui.available_rect_before_wrap();
     ui.painter().line_segment(
         [r.left_top(), r.right_top()],
@@ -210,7 +289,13 @@ pub fn show_center(
     }
 }
 
-fn tab_button(ui: &mut Ui, pal: &Palette, label: &str, selected: bool, mut on_click: impl FnMut()) {
+fn tab_button(
+    ui: &mut Ui,
+    pal: &Palette,
+    label: &str,
+    selected: bool,
+    mut on_click: impl FnMut(),
+) -> egui::Rect {
     let font = egui::TextStyle::Button.resolve(ui.style());
     let color = if selected { pal.text } else { pal.muted };
     let galley = ui.painter().layout_no_wrap(label.to_owned(), font, color);
@@ -222,16 +307,6 @@ fn tab_button(ui: &mut Ui, pal: &Palette, label: &str, selected: bool, mut on_cl
     }
     ui.painter()
         .galley(rect.center() - galley.size() / 2.0, galley, color);
-    if selected {
-        let y = rect.bottom() - 1.5;
-        ui.painter().line_segment(
-            [
-                egui::pos2(rect.left() + 6.0, y),
-                egui::pos2(rect.right() - 6.0, y),
-            ],
-            egui::Stroke::new(3.0, pal.accent),
-        );
-    }
     resp.widget_info(|| {
         egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, selected, label)
     });
@@ -241,6 +316,7 @@ fn tab_button(ui: &mut Ui, pal: &Palette, label: &str, selected: bool, mut on_cl
     {
         on_click();
     }
+    rect
 }
 
 fn placeholder(ui: &mut Ui, pal: &Palette, title: &str, text: &str, actions: &mut Vec<Action>) {
@@ -359,9 +435,15 @@ fn queue_tab(
     ui.add_space(10.0);
 
     if data.jobs.is_empty() {
+        let ambient = Beat::new(
+            ui.ctx(),
+            true,
+            view.reduced_motion,
+            brand::PERIOD_AMBIENT * 2.0,
+        );
         ui.add_space(36.0);
         ui.vertical_centered(|ui| {
-            article_grid(ui, pal);
+            article_grid(ui, pal, ambient.moving.then_some(ambient.phase));
             ui.add_space(18.0);
             ui.label(RichText::new(EMPTY_QUEUE).size(14.0).color(pal.muted));
             ui.add_space(12.0);
@@ -403,7 +485,28 @@ fn queue_table(
     actions: &mut Vec<Action>,
     progress_w: f32,
 ) {
+    let now = ui.input(|i| i.time);
+    view.queue.note_finishes(&data.jobs, now);
+    if view.queue.highlight.is_some() && view.queue.highlight_at.is_none() {
+        view.queue.highlight_at = Some(now);
+    }
+    if let (Some(_), Some(at)) = (view.queue.highlight, view.queue.highlight_at) {
+        if now - at >= HIGHLIGHT_SECS {
+            view.queue.highlight = None;
+            view.queue.highlight_at = None;
+        }
+    }
+    let busy = Beat::new(
+        ui.ctx(),
+        data.status.running && data.speed() > 0,
+        view.reduced_motion,
+        brand::PERIOD_BUSY * 2.0,
+    );
+    if !view.queue.flashes.is_empty() || view.queue.highlight.is_some() {
+        ui.ctx().request_repaint_after(super::motion::FRAME);
+    }
     let jobs = sorted(&data.jobs, view.queue.sort, view.queue.descending);
+    let reduced = view.reduced_motion;
     TableBuilder::new(ui)
         .id_salt("queue-table")
         .striped(true)
@@ -438,7 +541,23 @@ fn queue_table(
                                 .color(pal.faint),
                         );
                     });
-                    row.col(|ui| name_cell(ui, pal, job, view.queue.highlight == Some(job.id)));
+                    row.col(|ui| {
+                        let highlight = if view.queue.highlight == Some(job.id) {
+                            // Accent at first, settling to the text color over the span.
+                            let at = view.queue.highlight_at.unwrap_or(now);
+                            let t = ((now - at) / HIGHLIGHT_SECS).clamp(0.0, 1.0) as f32;
+                            Some(if reduced { 0.0 } else { t })
+                        } else {
+                            None
+                        };
+                        let flash = if reduced {
+                            None
+                        } else {
+                            view.queue.flash(job.id, now)
+                        };
+                        let live = live_subline(job, data.shown_done(job), data.speed());
+                        name_cell(ui, pal, job, highlight, flash, live);
+                    });
                     row.col(|ui| {
                         let r = state_badge(ui, pal, job.state);
                         if let Some(e) = &job.error {
@@ -452,42 +571,72 @@ fn queue_table(
                                 .color(pal.text),
                         );
                     });
-                    row.col(|ui| progress_cell(ui, pal, data, job, progress_w - 8.0));
+                    row.col(|ui| progress_cell(ui, pal, data, job, progress_w - 8.0, busy));
                     row.col(|ui| actions_cell(ui, pal, job, &mut view.queue, actions));
                 });
             }
         });
 }
 
-fn name_cell(ui: &mut Ui, pal: &Palette, job: &Job, highlight: bool) {
+/// The name and its subline. `highlight` is the just-imported fade (0 = full accent, 1 =
+/// settled); `flash` a finish wash (state, 1 → 0) painted under the cell.
+fn name_cell(
+    ui: &mut Ui,
+    pal: &Palette,
+    job: &Job,
+    highlight: Option<f32>,
+    flash: Option<(JobState, f32)>,
+    live: Option<String>,
+) {
+    if let Some((state, strength)) = flash {
+        let tint = match state {
+            JobState::Failed => pal.negative_soft,
+            _ => pal.positive_soft,
+        };
+        let r = ui.available_rect_before_wrap();
+        ui.painter().rect_filled(
+            r.expand2(egui::vec2(6.0, 2.0)),
+            egui::CornerRadius::same(4),
+            Palette::fade(tint, strength),
+        );
+    }
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing.y = 1.0;
-        let color = if highlight { pal.accent_fg } else { pal.text };
+        let color = match highlight {
+            Some(t) => pal.accent_fg.lerp_to_gamma(pal.text, t),
+            None => pal.text,
+        };
         ui.add(egui::Label::new(RichText::new(&job.name).color(color)).truncate())
             .on_hover_text(job.source_path.display().to_string());
-        let (sub, color) = match (&job.error, job.state) {
-            (Some(e), JobState::Failed) => (e.clone(), pal.negative),
+        // While downloading at a measured speed the subline is the live figure (the
+        // destination stays on hover); a failed job's subline is its error.
+        let (sub, color) = match (&job.error, job.state, live) {
+            (Some(e), JobState::Failed, _) => (e.clone(), pal.negative),
+            (_, _, Some(l)) => (l, pal.accent_fg),
             _ => (job.dest_dir.display().to_string(), pal.muted),
         };
         ui.add(egui::Label::new(RichText::new(sub).small().color(color)).truncate());
     });
 }
 
-fn progress_cell(ui: &mut Ui, pal: &Palette, data: &Data, job: &Job, width: f32) {
+fn progress_cell(ui: &mut Ui, pal: &Palette, data: &Data, job: &Job, width: f32, busy: Beat) {
     let done = data.shown_done(job);
     // Segment cells fill in the accent; a failed job's cells take the error color.
     let color = match job.state {
         JobState::Failed => pal.negative,
         _ => pal.accent,
     };
+    let downloading = job.state == JobState::Downloading;
+    let sweep = (downloading && busy.moving).then_some(busy.phase);
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing.y = 4.0;
-        segment_track(
+        segment_track_live(
             ui,
             pal,
             format::fraction(done, job.bytes_total),
             color,
             width,
+            sweep,
         );
         ui.label(
             RichText::new(format!(
@@ -500,6 +649,20 @@ fn progress_cell(ui: &mut Ui, pal: &Palette, data: &Data, job: &Job, width: f32)
             .color(pal.muted),
         );
     });
+}
+
+/// The live subline of a downloading job: the measured speed and, from it, the time
+/// left for the bytes still missing. `None` without a measured speed (never a guess).
+pub fn live_subline(job: &Job, done: u64, speed_bps: u64) -> Option<String> {
+    if job.state != JobState::Downloading || speed_bps == 0 {
+        return None;
+    }
+    let speed = format::speed(speed_bps);
+    if job.bytes_total == 0 {
+        return Some(speed);
+    }
+    let eta = eta_secs(job.bytes_total.saturating_sub(done), speed_bps)?;
+    Some(format!("{speed} · {} left", format::duration_secs(eta)))
 }
 
 fn actions_cell(
@@ -623,6 +786,48 @@ mod tests {
         let (p, min) = table_widths(560.0, 8.0);
         assert_eq!(p, PROGRESS_MIN);
         assert!(min > 560.0);
+    }
+
+    #[test]
+    fn live_subline_only_with_a_measured_speed() {
+        let mut j = job(1, "a", 1000, JobState::Downloading, 0);
+        assert_eq!(live_subline(&j, 500, 0), None);
+        assert_eq!(
+            live_subline(&j, 500, 100).as_deref(),
+            Some("100 B/s · 0:05 left")
+        );
+        j.bytes_total = 0;
+        assert_eq!(live_subline(&j, 0, 100).as_deref(), Some("100 B/s"));
+        j.state = JobState::Queued;
+        assert_eq!(live_subline(&j, 0, 100), None);
+    }
+
+    #[test]
+    fn eta_needs_a_speed() {
+        assert_eq!(eta_secs(1000, 0), None);
+        assert_eq!(eta_secs(1000, 100), Some(10));
+        assert_eq!(eta_secs(1001, 100), Some(11), "rounds up");
+        assert_eq!(eta_secs(0, 100), Some(0));
+    }
+
+    #[test]
+    fn finishes_flash_once_and_fade() {
+        let mut q = QueueState::default();
+        let mut jobs = vec![job(1, "a", 10, JobState::Downloading, 0)];
+        q.note_finishes(&jobs, 0.0);
+        assert!(q.flash(1, 0.0).is_none(), "no flash on first sight");
+        jobs[0].state = JobState::Done;
+        q.note_finishes(&jobs, 1.0);
+        let (state, s) = q.flash(1, 1.0).expect("flash");
+        assert_eq!(state, JobState::Done);
+        assert!((s - 1.0).abs() < 1e-6);
+        let (_, mid) = q.flash(1, 1.0 + FLASH_SECS / 2.0).expect("fading");
+        assert!(mid < 1.0 && mid > 0.0);
+        q.note_finishes(&jobs, 1.0 + FLASH_SECS + 0.1);
+        assert!(q.flash(1, 5.0).is_none(), "expired");
+        // A row that vanishes is forgotten.
+        q.note_finishes(&[], 9.0);
+        assert!(q.last_states.is_empty());
     }
 
     #[test]

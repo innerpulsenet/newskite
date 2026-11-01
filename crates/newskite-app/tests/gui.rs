@@ -611,6 +611,85 @@ fn single_stored_sample_and_live_series_draw() {
     snapshot(&mut h, "live-series-dark");
 }
 
+/// A downloading job with a measured speed shows a real time-left estimate; the job's
+/// finish washes the row, then fades (motion on, so the wash is exercised).
+#[test]
+fn downloading_row_shows_eta_and_finish_flash() {
+    let fx = Fixture::new(|store, dir| {
+        seed_populated(store, dir);
+        let job = store
+            .insert_job_at(
+                &NewJob {
+                    name: "Live.Download.Now".into(),
+                    bytes_total: 200 * 1024 * 1024,
+                    dest_dir: Path::new("/home/reader/Downloads/Newskite/Live.Download.Now").into(),
+                    source_path: dir.join("live.nzb"),
+                    password: None,
+                },
+                now() - 60,
+            )
+            .expect("job");
+        store
+            .set_job_progress(job.id, 100 * 1024 * 1024)
+            .expect("progress");
+        store
+            .set_job_state(job.id, JobState::Downloading, None)
+            .expect("state");
+    });
+    let mut h = fx.harness_with(true, SIZE, false);
+    h.run_steps(3);
+    let tx = app(&h).sender();
+    tx.send(newskite_app::gui::UiMsg::Service(
+        newskite_service::ServiceEvent::Throughput {
+            bytes_per_sec: 1024 * 1024,
+        },
+    ))
+    .expect("send");
+    run_until(&mut h, |h| app(h).data.speed() > 0);
+    // The service puts an interrupted job back to queued at startup; the GUI's copy is
+    // marked downloading here, as a live run would report it.
+    {
+        let app = h.state_mut().as_mut().expect("app");
+        for j in app.data.jobs.iter_mut() {
+            if j.name == "Live.Download.Now" {
+                j.state = JobState::Downloading;
+            }
+        }
+    }
+    h.run_steps(1);
+    // 100 MB left at 1 MB/s → 100 s.
+    h.get_by_label("1.0 MB/s · 1:40 left");
+    h.get_by_label("50%  ·  100 MB / 200 MB");
+    assert_no_bad_numbers(&h);
+    snapshot(&mut h, "downloading-dark");
+
+    // The finish wash: the queue state notices the state change and fades it out.
+    let id = app(&h)
+        .data
+        .jobs
+        .iter()
+        .find(|j| j.name == "Live.Download.Now")
+        .map(|j| j.id)
+        .expect("job");
+    {
+        let app = h.state_mut().as_mut().expect("app");
+        for j in app.data.jobs.iter_mut() {
+            if j.id == id {
+                j.state = JobState::Done;
+            }
+        }
+    }
+    h.run_steps(1);
+    let t = h.ctx.input(|i| i.time);
+    assert!(
+        app(&h).view.queue.flash(id, t).is_some(),
+        "finish wash started"
+    );
+    h.run_steps(12);
+    let t = h.ctx.input(|i| i.time);
+    assert!(app(&h).view.queue.flash(id, t).is_none(), "wash fades out");
+}
+
 #[test]
 fn dropped_nzb_is_imported() {
     let fx = Fixture::new(|_, _| {});

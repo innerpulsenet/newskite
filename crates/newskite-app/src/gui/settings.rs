@@ -216,18 +216,26 @@ pub fn validate(s: &Settings) -> Vec<String> {
 }
 
 /// Draws the modal. Esc is handled by the app (it closes without saving).
+/// Key of the sheet's fade-in (reset by the app while it is closed).
+pub fn fade_id() -> Id {
+    Id::new("settings-fade")
+}
+
 pub fn show(
     ctx: &egui::Context,
     pal: &Palette,
     draft: &mut SettingsDraft,
     dialog_open: bool,
+    reduced_motion: bool,
     actions: &mut Vec<Action>,
 ) {
     let max_h = (ctx.content_rect().height() - 210.0).max(220.0);
     let width = (ctx.content_rect().width() - 80.0).clamp(560.0, 820.0);
+    let t = super::motion::fade_in(ctx, fade_id(), 0.16, reduced_motion);
     egui::Modal::new(Id::new("settings-modal"))
-        .backdrop_color(pal.shadow)
+        .backdrop_color(Palette::fade(pal.shadow, t))
         .show(ctx, |ui| {
+            ui.set_opacity(t);
             ui.set_width(width);
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Settings").heading().strong().color(pal.text));
