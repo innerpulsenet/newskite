@@ -72,6 +72,11 @@ const MIGRATIONS: &[&str] = &[
         seen_at      INTEGER NOT NULL
     );
     "#,
+    // v3: an explicit queue position. 0 for every existing row, so the queue keeps its
+    // created_at order until the user moves a job.
+    r#"
+    ALTER TABLE jobs ADD COLUMN position INTEGER NOT NULL DEFAULT 0;
+    "#,
 ];
 
 /// The schema version this build writes.

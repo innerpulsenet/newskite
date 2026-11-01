@@ -201,9 +201,9 @@ fn next_runnable_job_ordering() {
     store.set_job_state(tie_a.id, JobState::Done, None).unwrap();
     assert_eq!(store.next_runnable_job().unwrap().unwrap().id, tie_b.id);
 
-    // Paused jobs are runnable.
+    // Paused (held) jobs are skipped.
     store.set_job_state(tie_b.id, JobState::Paused, None).unwrap();
-    assert_eq!(store.next_runnable_job().unwrap().unwrap().id, tie_b.id);
+    assert_eq!(store.next_runnable_job().unwrap().unwrap().id, newer.id);
     store.set_job_state(tie_b.id, JobState::Failed, None).unwrap();
     assert_eq!(store.next_runnable_job().unwrap().unwrap().id, newer.id);
     store.set_job_state(newer.id, JobState::Done, None).unwrap();
@@ -226,10 +226,32 @@ fn next_runnable_job_among_is_restricted_to_the_ids() {
     // The unlisted older job is skipped; among the listed ones the oldest wins.
     assert_eq!(store.next_runnable_job_among(&[b.id, a.id]).unwrap().unwrap().id, a.id);
     store.set_job_state(a.id, JobState::Paused, None).unwrap();
-    assert_eq!(store.next_runnable_job_among(&[b.id, a.id]).unwrap().unwrap().id, a.id);
+    assert_eq!(store.next_runnable_job_among(&[b.id, a.id]).unwrap().unwrap().id, b.id, "held job skipped");
     store.set_job_state(a.id, JobState::Done, None).unwrap();
     assert_eq!(store.next_runnable_job_among(&[b.id, a.id]).unwrap().unwrap().id, b.id);
     assert_eq!(store.next_runnable_job().unwrap().unwrap().id, oldest.id);
+}
+
+#[test]
+fn queue_order_follows_explicit_positions() {
+    let store = mem();
+    let a = store.insert_job_at(&new_job("a"), 10).unwrap();
+    let b = store.insert_job_at(&new_job("b"), 20).unwrap();
+    let c = store.insert_job_at(&new_job("c"), 30).unwrap();
+    let done = store.insert_job_at(&new_job("done"), 5).unwrap();
+    store.set_job_state(done.id, JobState::Done, None).unwrap();
+    assert_eq!(store.queue_order().unwrap(), vec![a.id, b.id, c.id], "created_at order, history excluded");
+
+    store.set_queue_order(&[c.id, a.id, b.id]).unwrap();
+    assert_eq!(store.queue_order().unwrap(), vec![c.id, a.id, b.id]);
+    assert_eq!(store.next_runnable_job().unwrap().unwrap().id, c.id);
+    // A job added after a reorder goes last, whatever its created_at.
+    let d = store.insert_job_at(&new_job("d"), 1).unwrap();
+    assert_eq!(store.queue_order().unwrap(), vec![c.id, a.id, b.id, d.id]);
+    // Held jobs keep their place in the order but are not runnable.
+    store.set_job_state(c.id, JobState::Paused, None).unwrap();
+    assert_eq!(store.queue_order().unwrap()[0], c.id);
+    assert_eq!(store.next_runnable_job().unwrap().unwrap().id, a.id);
 }
 
 #[test]

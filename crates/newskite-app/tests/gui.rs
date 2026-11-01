@@ -11,17 +11,22 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use eframe::egui;
 use egui_kittest::kittest::Queryable;
 use egui_kittest::{Harness, SnapshotError, SnapshotOptions};
-use newskite_app::gui::queue::EMPTY_QUEUE;
+use newskite_app::gui::docks::LogFilter;
+use newskite_app::gui::queue::{EMPTY_HISTORY, EMPTY_QUEUE};
 use newskite_app::gui::{brand, brand_tokens, Action, Appearance, Tab};
 use newskite_app::{AppConfig, NewskiteApp, ThemeMode};
 use newskite_service::{
-    JobState, LogLevel, NewBookmark, Service, ServiceOptions, Store, ThroughputSample,
+    JobFile, JobMove, JobState, LogLevel, Service, ServiceOptions, Store, ThroughputSample,
 };
 use newskite_store::NewJob;
 use newskite_theme::Theme;
 use newskite_types::{ServerConfig, Settings};
 
 const SIZE: egui::Vec2 = egui::vec2(1280.0, 800.0);
+
+/// Free space shown in every test window (the real filesystem's figure would change the
+/// snapshots from run to run).
+const FIXED_FREE: u64 = 128 * 1024 * 1024 * 1024;
 
 /// Desktop-like themes: the theme crate's Breeze fixtures when present, else the
 /// built-in fallback palette.
@@ -104,7 +109,7 @@ impl Fixture {
             .build_state(
                 move |ctx, app: &mut Option<NewskiteApp>| {
                     let app = app.get_or_insert_with(|| {
-                        NewskiteApp::new(
+                        let mut a = NewskiteApp::new(
                             ctx.clone(),
                             service.clone(),
                             handle.clone(),
@@ -115,7 +120,9 @@ impl Fixture {
                                 appearance_file: appearance_file.clone(),
                                 reduced_motion: Some(reduced_motion),
                             },
-                        )
+                        );
+                        a.data.disk_free = Some(FIXED_FREE);
+                        a
                     });
                     app.ui(ctx);
                 },
@@ -196,30 +203,32 @@ fn seed_populated(store: &Store, dir: &Path) {
         .set_job_state(d.id, JobState::Paused, None)
         .expect("state");
 
-    let isos = store
-        .add_bookmark(&NewBookmark {
-            parent_id: None,
-            name: "Linux ISOs".into(),
-            newsgroup: Some("alt.binaries.linux".into()),
-            color: Some("#3daee9".into()),
-        })
-        .expect("bookmark");
-    store
-        .add_bookmark(&NewBookmark {
-            parent_id: Some(isos.id),
-            name: "Debian".into(),
-            newsgroup: None,
-            color: Some("46,160,67".into()),
-        })
-        .expect("bookmark");
-    store
-        .add_bookmark(&NewBookmark {
-            parent_id: None,
-            name: "Podcasts".into(),
-            newsgroup: None,
-            color: None,
-        })
-        .expect("bookmark");
+    // Per-file progress of the queued job (two files done, one partway).
+    for (name, total, done, state) in [
+        (
+            "open.movie.part01.rar",
+            1_500_000_000,
+            1_500_000_000,
+            "done",
+        ),
+        (
+            "open.movie.part02.rar",
+            1_500_000_000,
+            200_000_000,
+            "downloading",
+        ),
+        ("open.movie.par2", 400_000, 400_000, "done"),
+    ] {
+        store
+            .upsert_job_file(&JobFile {
+                job_id: b.id,
+                name: name.into(),
+                bytes_total: total,
+                bytes_done: done,
+                state: state.into(),
+            })
+            .expect("job file");
+    }
 
     // A shaped hour of history.
     let start = now() - 3000;
@@ -311,17 +320,17 @@ fn empty_state_renders_cleanly() {
         let mut h = fx.harness_themed(t, SIZE, true, None, true, 0.25);
         h.run_steps(4);
         h.get_by_label(EMPTY_QUEUE);
-        h.get_by_label("No bookmarks yet");
+        h.get_by_label("Add NZB…");
         h.get_by_label("No throughput history yet");
         h.get_by_label("No server configured.");
-        h.get_by_label("Remaining: 0 / 0 jobs");
-        assert_eq!(
-            h.get_all_by_label("No server").count(),
-            2,
-            "queue pill and status pill"
-        );
+        h.get_by_label("Nothing left");
+        h.get_by_label("No server");
         h.get_by_label("0 B/s");
-        h.get_by_label("Support Issues?");
+        h.get_by_label("128 GB free  ·  0 B downloaded");
+        h.get_by_label("Queue (0)");
+        h.get_by_label("History (0)");
+        // Nothing queued: Start cannot act.
+        h.get_by_label("Start");
         // Masthead (mark, wordmark, readout) and the quiet credit.
         h.get_by_label("Newskite · NO SERVER");
         h.get_by_label("innerpulse");
@@ -336,24 +345,30 @@ fn populated_window_renders() {
     for (t, look) in looks() {
         let mut h = fx.harness_themed(t, SIZE, true, None, true, 0.25);
         h.run_steps(4);
-        h.get_by_label("Debian.12.Netinst.amd64");
+        // The queue holds the pending jobs only, in queue order.
         h.get_by_label("Open.Movie.Project.2160p");
-        h.get_by_label("done");
-        h.get_by_label("failed");
+        h.get_by_label("Public.Domain.Archive");
+        assert!(
+            h.query_by_label("Debian.12.Netinst.amd64").is_none(),
+            "done is history"
+        );
+        h.get_by_label("queued");
         h.get_by_label("paused");
-        h.get_by_label("3 missing articles: part1@x, part7@x, part9@x");
-        h.get_by_label("Linux ISOs");
-        h.get_by_label("Debian");
-        h.get_by_label("Ready · news.example.net:563 · 12 conn");
+        h.get_by_label("Queue (2)");
+        h.get_by_label("History (2)");
+        h.get_by_label_contains("2 jobs  ·  ");
+        h.get_by_label_contains("1 held");
+        // Per-row controls: idle, so both rows start on their own.
+        h.get_by_label("Download this job now (the rest of the queue stays put)");
+        h.get_by_label("Resume this job");
         h.get_by_label("Online");
         h.get_by_label("news.example.net:563");
         h.get_by_label("reader");
         h.get_by_label("12 / 20");
         h.get_by_label_contains("Throughput graph, 600 stored samples");
-        h.get_by_label("Remaining: 2 / 4 jobs");
-        h.get_by_label("100%  ·  658 MB / 658 MB");
+        h.get_by_label("20%  ·  20.0 MB / 96.0 MB");
         h.get_by_label("Newskite · NNTP · NEWS.EXAMPLE.NET:563 TLS · 12 CONN");
-        h.get_by_label("Articles fetched: 0");
+        h.get_by_label("Articles: 0");
         assert!(
             h.query_by_label_contains("not-shown").is_none(),
             "password must never be displayed"
@@ -361,10 +376,10 @@ fn populated_window_renders() {
         assert_no_bad_numbers(&h);
         snapshot(&mut h, &format!("populated-{look}"));
     }
-    // Narrow window: docks stack 2×2, toolbar drops labels.
-    let mut h = fx.harness(true, egui::vec2(1000.0, 640.0));
+    // Narrow window: the toolbar drops its labels (still named for assistive tech).
+    let mut h = fx.harness(true, egui::vec2(880.0, 640.0));
     h.run_steps(4);
-    h.get_by_label("Open NZB");
+    h.get_by_label("Add NZB");
     assert_no_bad_numbers(&h);
     snapshot(&mut h, "populated-dark-narrow");
 }
@@ -393,11 +408,11 @@ fn import_nzb_switches_to_queue_and_errors_inline() {
     let mut h = fx.harness(true, SIZE);
     h.run_steps(2);
 
-    // Ctrl+O reveals the field; the Search tab is shown first to check the switch.
+    // Ctrl+O reveals the field; the History tab is shown first to check the switch.
     h.state_mut()
         .as_mut()
         .expect("app")
-        .push_action(Action::SetTab(Tab::Search));
+        .push_action(Action::SetTab(Tab::History));
     h.run_steps(2);
     h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::O);
     h.run_steps(2);
@@ -425,8 +440,14 @@ fn import_nzb_switches_to_queue_and_errors_inline() {
     let a = app(&h);
     assert_eq!(a.data.jobs.len(), 1);
     assert_eq!(a.view.tab, Tab::Queue);
+    assert_eq!(
+        a.view.queue.selected,
+        Some(a.data.jobs[0].id),
+        "the new job is selected"
+    );
     assert!(a.view.open_nzb.error.is_none());
-    h.get_by_label("Sample Release");
+    // In the queue and, selected, in the Details dock.
+    assert_eq!(h.get_all_by_label("Sample Release").count(), 2);
     h.get_by_label("0%  ·  0 B / 977 KB");
 }
 
@@ -488,41 +509,143 @@ fn settings_modal_opens_validates_and_closes() {
 }
 
 #[test]
-fn bookmarks_add_and_remove_inline() {
-    let fx = Fixture::new(|_, _| {});
+fn queue_rows_hold_resume_and_reorder() {
+    // The server is disabled, so starting a job never reaches the network: the run ends
+    // at once ("no enabled server") and the job stays queued.
+    let fx = Fixture::new(|store, dir| {
+        seed_populated(store, dir);
+        let mut settings = store.load_settings().expect("load");
+        settings.servers[0].enabled = false;
+        store.save_settings(&settings).expect("settings");
+    });
+    let mut h = fx.harness_with(true, SIZE, false);
+    h.run_steps(3);
+    let id = |h: &Harness<'_, Option<NewskiteApp>>, name: &str| {
+        app(h)
+            .data
+            .jobs
+            .iter()
+            .find(|j| j.name == name)
+            .map(|j| j.id)
+            .expect("job")
+    };
+    let movie = id(&h, "Open.Movie.Project.2160p");
+    let archive = id(&h, "Public.Domain.Archive");
+    assert_eq!(app(&h).data.queue_order, vec![movie, archive]);
+
+    // Hold the queued job from its row menu action.
+    h.state_mut()
+        .as_mut()
+        .expect("app")
+        .push_action(Action::PauseJob(movie));
+    h.run_steps(2);
+    let state = |id| {
+        fx.service
+            .jobs()
+            .into_iter()
+            .find(|j| j.id == id)
+            .unwrap()
+            .state
+    };
+    assert_eq!(state(movie), JobState::Paused);
+    h.get_by_label_contains("2 held");
+
+    // Move the archive to the top: the order and the # column follow.
+    h.state_mut()
+        .as_mut()
+        .expect("app")
+        .push_action(Action::MoveJob(archive, JobMove::Top));
+    h.run_steps(2);
+    assert_eq!(app(&h).data.queue_order, vec![archive, movie]);
+
+    // Keyboard: select, then Space resumes the held job (no server, so it stays queued).
+    h.state_mut()
+        .as_mut()
+        .expect("app")
+        .push_action(Action::Select(Some(movie)));
+    h.run_steps(2);
+    h.key_press(egui::Key::Space);
+    h.run_steps(3);
+    assert_eq!(state(movie), JobState::Queued);
+    // Alt+Up moves the selected job up; Delete asks to remove it in place.
+    h.key_press_modifiers(egui::Modifiers::ALT, egui::Key::ArrowUp);
+    h.run_steps(2);
+    assert_eq!(app(&h).data.queue_order, vec![movie, archive]);
+    h.key_press(egui::Key::Delete);
+    h.run_steps(2);
+    assert_eq!(app(&h).view.queue.confirm_remove, Some(movie));
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert_eq!(app(&h).view.queue.confirm_remove, None);
+    assert_no_bad_numbers(&h);
+}
+
+#[test]
+fn history_lists_finished_jobs_and_clears_them() {
+    let fx = Fixture::new(seed_populated);
     let mut h = fx.harness(true, SIZE);
     h.run_steps(2);
-    h.get_by_label("Add a bookmark").click();
-    h.run_steps(2);
-    // Empty name is rejected in place.
-    h.get_by_label("Add").click();
-    h.run_steps(2);
-    h.get_by_label("Name is required.");
-    assert!(fx.service.bookmarks().is_empty());
-
-    if let Some(form) = h
-        .state_mut()
-        .as_mut()
-        .and_then(|a| a.view.sidebar.form.as_mut())
-    {
-        form.name = "Linux ISOs".into();
-        form.newsgroup = "alt.binaries.linux".into();
-        form.color = "#3daee9".into();
-    }
-    h.run_steps(1);
-    h.get_by_label("Add").click();
+    h.get_by_label("History (2)").click();
     h.run_steps(3);
-    assert_eq!(fx.service.bookmarks().len(), 1);
-    h.get_by_label("Linux ISOs");
-
-    // × asks in place, Yes removes.
-    h.get_by_label("Remove bookmark").click();
+    assert_eq!(app(&h).view.tab, Tab::History);
+    h.get_by_label("Debian.12.Netinst.amd64");
+    h.get_by_label("done");
+    h.get_by_label("failed");
+    h.get_by_label("3 missing articles: part1@x, part7@x, part9@x");
+    h.get_by_label("1 finished  ·  1 failed");
+    assert!(
+        h.query_by_label("Open.Movie.Project.2160p").is_none(),
+        "pending is queue"
+    );
+    // The filter narrows the list.
+    h.state_mut().as_mut().expect("app").view.filter = "debian".into();
     h.run_steps(2);
-    h.get_by_label("Remove?");
-    h.get_by_label("Yes").click();
+    assert!(h.query_by_label("Linux.Audio.Samples.Pack").is_none());
+    h.state_mut().as_mut().expect("app").view.filter.clear();
+    h.run_steps(2);
+    assert_no_bad_numbers(&h);
+    snapshot(&mut h, "history-dark");
+
+    h.get_by_label("Clear history").click();
+    h.run_steps(2);
+    h.get_by_label("Remove 2 jobs from the list? Files stay on disk.");
+    h.get_by_label("Clear").click();
     h.run_steps(3);
-    assert!(fx.service.bookmarks().is_empty());
-    h.get_by_label("No bookmarks yet");
+    assert_eq!(fx.service.jobs().len(), 2, "pending jobs stay");
+    h.get_by_label(EMPTY_HISTORY);
+}
+
+#[test]
+fn selecting_a_job_shows_its_details_and_files() {
+    let fx = Fixture::new(seed_populated);
+    let mut h = fx.harness(true, SIZE);
+    h.run_steps(2);
+    h.get_by_label("Open.Movie.Project.2160p").click();
+    h.run_steps(3);
+    let movie = app(&h)
+        .data
+        .jobs
+        .iter()
+        .find(|j| j.name == "Open.Movie.Project.2160p")
+        .map(|j| j.id);
+    assert_eq!(app(&h).view.queue.selected, movie);
+    h.get_by_label("DETAILS");
+    h.get_by_label("open.movie.part01.rar");
+    h.get_by_label("open.movie.part02.rar");
+    h.get_by_label("2 of 3 done");
+    // The folder: the row's subline and the Details link.
+    assert_eq!(
+        h.get_all_by_label("/home/reader/Downloads/Newskite/Open.Movie.Project.2160p")
+            .count(),
+        2
+    );
+    assert_no_bad_numbers(&h);
+    snapshot(&mut h, "details-dark");
+    // Esc clears the selection; the dock shows the server again.
+    h.key_press(egui::Key::Escape);
+    h.run_steps(3);
+    assert_eq!(app(&h).view.queue.selected, None);
+    h.get_by_label("SERVER");
 }
 
 #[test]
@@ -544,7 +667,7 @@ fn messages_dock_shows_logs_newest_first() {
     let long = h
         .get_by_label("Open.Movie.Project.2160p: par2 repaired 3 blocks, extract ok")
         .rect();
-    let title = h.get_by_label("MESSAGES").rect();
+    let title = h.get_by_label("LOG").rect();
     assert!(
         long.left() > title.left() + 60.0,
         "text sits right of the clock column"
@@ -552,6 +675,12 @@ fn messages_dock_shows_logs_newest_first() {
     assert!(long.right() <= SIZE.x, "{long:?}");
     assert_no_bad_numbers(&h);
     snapshot(&mut h, "messages-dark");
+    // The level filter: errors only.
+    h.get_by_label("Errors").click();
+    h.run_steps(2);
+    assert_eq!(app(&h).view.docks.log_filter, LogFilter::Errors);
+    h.get_by_label("second line");
+    assert!(h.query_by_label("first line").is_none());
 }
 
 #[test]
@@ -702,7 +831,7 @@ fn dropped_nzb_is_imported() {
     });
     run_until(&mut h, |h| app(h).data.jobs.len() == 1);
     assert_eq!(fx.service.jobs().len(), 1);
-    h.get_by_label("Sample Release");
+    assert!(h.get_all_by_label("Sample Release").count() >= 1);
 }
 
 #[test]
@@ -857,7 +986,7 @@ fn nntp_activity_counts_articles_and_missing() {
     let fx = Fixture::new(seed_populated);
     let mut h = fx.harness_with(true, SIZE, false);
     h.run_steps(2);
-    h.get_by_label("Articles fetched: 0");
+    h.get_by_label("Articles: 0");
     let tx = app(&h).sender();
     let job_id = app(&h).data.jobs[1].id;
     for done in 1..=3 {
@@ -885,7 +1014,7 @@ fn nntp_activity_counts_articles_and_missing() {
     ))
     .expect("send");
     h.run_steps(2);
-    h.get_by_label("Articles fetched: 3");
+    h.get_by_label("Articles: 3");
     assert_eq!(app(&h).data.articles_missing, 2);
     assert_no_bad_numbers(&h);
 }
@@ -898,6 +1027,20 @@ fn minimum_window_keeps_remove_confirmation_and_docks_on_screen() {
     let size = egui::vec2(960.0, 600.0);
     let mut h = fx.harness(true, size);
     h.run_steps(4);
+    // Every control of a queue row is inside the window.
+    for label in [
+        "Resume this job",
+        "More actions",
+        "Remove from the queue (Del)",
+    ] {
+        for node in h.get_all_by_label(label) {
+            assert!(
+                node.rect().right() <= size.x - 4.0,
+                "{label} at {:?}",
+                node.rect()
+            );
+        }
+    }
     let failed = app(&h)
         .data
         .jobs
@@ -905,8 +1048,13 @@ fn minimum_window_keeps_remove_confirmation_and_docks_on_screen() {
         .find(|j| j.state == JobState::Failed)
         .map(|j| j.id)
         .expect("failed job");
+    h.state_mut()
+        .as_mut()
+        .expect("app")
+        .push_action(Action::SetTab(Tab::History));
+    h.run_steps(2);
     // Every action icon of the failed row is inside the window.
-    for label in ["Retry (completed files are kept)", "Remove from the queue"] {
+    for label in ["Retry (completed files are kept)", "Remove from the list"] {
         for node in h.get_all_by_label(label) {
             assert!(
                 node.rect().right() <= size.x - 4.0,
@@ -930,7 +1078,7 @@ fn minimum_window_keeps_remove_confirmation_and_docks_on_screen() {
         );
     }
     // Account readings fit in their card, above the status bar.
-    for label in ["Jobs pending", "Max connections"] {
+    for label in ["Downloaded", "Missing"] {
         let r = h.get_by_label(label).rect();
         assert!(r.bottom() <= size.y - 28.0, "{label} at {r:?}");
     }
@@ -952,52 +1100,6 @@ fn minimum_window_keeps_remove_confirmation_and_docks_on_screen() {
     h.get_by_label("Yes").click();
     h.run_steps(3);
     assert!(fx.service.jobs().iter().all(|j| j.id != failed));
-}
-
-#[test]
-fn a_failed_bookmark_add_says_why_and_drops_a_vanished_parent() {
-    let fx = Fixture::new(seed_populated);
-    let mut h = fx.harness(true, SIZE);
-    h.run_steps(2);
-    h.get_by_label("Add a bookmark").click();
-    h.run_steps(2);
-    let parent = fx
-        .service
-        .bookmarks()
-        .into_iter()
-        .find(|b| b.name == "Podcasts")
-        .map(|b| b.id)
-        .expect("bookmark");
-    if let Some(form) = h
-        .state_mut()
-        .as_mut()
-        .and_then(|a| a.view.sidebar.form.as_mut())
-    {
-        form.name = "Shows".into();
-        form.parent = Some(parent);
-    }
-    // The parent disappears while the form is open (removed elsewhere), then Add.
-    fx.service.remove_bookmark(parent).expect("remove");
-    h.state_mut()
-        .as_mut()
-        .expect("app")
-        .push_action(Action::AddBookmark(NewBookmark {
-            parent_id: Some(parent),
-            name: "Shows".into(),
-            newsgroup: None,
-            color: None,
-        }));
-    h.run_steps(2);
-    let form = app(&h).view.sidebar.form.as_ref().expect("form stays open");
-    assert!(
-        form.error
-            .as_deref()
-            .is_some_and(|e| e.starts_with("Could not add the bookmark")),
-        "{:?}",
-        form.error
-    );
-    assert_eq!(form.parent, None, "the vanished parent is dropped");
-    h.get_by_label_contains("Could not add the bookmark");
 }
 
 #[test]

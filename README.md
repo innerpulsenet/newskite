@@ -11,15 +11,17 @@
 Newskite is a desktop Usenet (NZB) download client written in Rust. You give it an NZB file;
 it downloads the listed articles from your news server (NNTP, usually over TLS), decodes the
 yEnc payloads, writes the original files to disk byte for byte, then verifies, repairs and
-extracts them when the right tools are installed. It keeps a resumable queue, bookmarks,
-a message log and a live throughput graph, and it follows the desktop's light or dark color
-scheme (KDE Plasma first).
+extracts them when the right tools are installed. It keeps a resumable, reorderable queue
+where every job can be started, paused or moved on its own, a download history, per-file
+progress, a filterable log and a live throughput graph, and it follows the desktop's light
+or dark color scheme (KDE Plasma first).
 
 The same queue engine also runs without a window: `newskite --headless` downloads NZBs from
 a terminal or a script.
 
-Newskite does not come with a Usenet server subscription or a search indexer. You need an
-account with a news provider.
+Newskite does not come with a Usenet server subscription, and it does not search or browse
+Usenet: NZB files are the input (open them, drop them on the window, or use a watch folder).
+You need an account with a news provider.
 
 The product specification is in [APP-OUTLINE.md](APP-OUTLINE.md) and the public API of every
 crate is in [docs/CONTRACTS.md](docs/CONTRACTS.md).

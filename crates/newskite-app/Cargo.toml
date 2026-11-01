@@ -35,6 +35,10 @@ serde_json.workspace = true
 chrono = { version = "0.4.41", default-features = false, features = ["clock", "std"] }
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
 
+[target.'cfg(unix)'.dependencies]
+# statvfs for the free space on the download folder's filesystem (safe API).
+rustix = { version = "1.1.2", default-features = false, features = ["fs", "std"] }
+
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 notify-rust = { version = "4.11", default-features = false, features = ["z"] }
 
@@ -67,8 +71,8 @@ extended-description = """\
 Newskite is a desktop Usenet (NZB) download client. It downloads the binary articles \
 listed in an NZB file from an NNTP server over TLS, decodes them, writes the original \
 files to disk and verifies, repairs and extracts them using the external par2, 7z, unrar \
-and unzip tools when they are installed. It keeps a resumable queue, bookmarks and live \
-throughput statistics, follows the desktop light or dark color scheme, and includes a \
+and unzip tools when they are installed. It keeps a resumable, reorderable queue with per-job \
+pause and start, a download history and live throughput statistics, follows the desktop light or dark color scheme, and includes a \
 headless command-line mode (newskite --headless) that drives the same queue engine. \
 Server passwords are stored unencrypted in the local database."""
 assets = [

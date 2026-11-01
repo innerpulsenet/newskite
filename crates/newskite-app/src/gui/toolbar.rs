@@ -1,17 +1,19 @@
-//! Toolbar (outline §6.1) with the masthead, and the inline Open NZB field.
+//! Toolbar with the masthead: Add NZB, the queue control, Scan Folder, Downloads and
+//! Settings, and the inline Add NZB field.
 
 use eframe::egui::{self, Align, Layout, Pos2, Rect, RichText, Sense, Stroke, TextEdit, Ui, Vec2};
+use newskite_service::JobState;
 use newskite_types::Settings;
 
-use super::app::{Action, Data, Tab, ViewState};
+use super::app::{Action, Data, ViewState};
 use super::brand;
 use super::fonts;
 use super::icons;
 use super::theme::Palette;
-use super::widgets::{error_line, icon_button, paint_icon, spaced, tool_button, Icon, ToolState};
+use super::widgets::{error_line, icon_button, spaced, tool_button, Icon, ToolState};
 
 /// Width below which toolbar labels are hidden (icons + tooltips only).
-const LABEL_MIN_WIDTH: f32 = 1240.0;
+const LABEL_MIN_WIDTH: f32 = 900.0;
 /// Side of the masthead mark (whole-pixel bars at 1× and 2×).
 pub const MASTHEAD_MARK: f32 = 24.0;
 /// Width of the masthead wordmark (≈ 18.5 px Syne: the mark is 1.3× its font size).
@@ -89,8 +91,36 @@ fn masthead(
         .on_hover_text("About Newskite")
 }
 
-const NOT_YET: &str =
-    "Not available yet: browsing needs a Newznab indexer, which is not configured.";
+/// The global queue control: what it does now, its icon, label and tooltip, and
+/// whether it can act.
+pub fn queue_control(data: &Data) -> (Action, Icon, &'static str, &'static str, bool) {
+    let st = &data.status;
+    if st.paused {
+        (
+            Action::Resume,
+            Icon::Play,
+            "Resume",
+            "Resume the queue",
+            true,
+        )
+    } else if st.running {
+        (
+            Action::Pause,
+            Icon::Pause,
+            "Pause",
+            "Pause the queue now (the current download resumes first)",
+            true,
+        )
+    } else {
+        let runnable = data.jobs.iter().any(|j| j.state == JobState::Queued);
+        let tip = if runnable {
+            "Download every queued job, in queue order"
+        } else {
+            "Nothing queued to start (held jobs start from their row)"
+        };
+        (Action::Start, Icon::Play, "Start", tip, runnable)
+    }
+}
 
 /// Draws the toolbar.
 pub fn show(
@@ -121,60 +151,6 @@ pub fn show(
             tool_button(ui, pal, icon, label, labels, state).on_hover_text(tip)
         };
 
-        if t(
-            ui,
-            Icon::Back,
-            "Back",
-            ToolState::Unavailable,
-            "Back (no browsing history yet)",
-        )
-        .clicked()
-        {
-            // Harmless no-op until browse exists.
-        }
-        if t(
-            ui,
-            Icon::Home,
-            "Home",
-            ToolState::Normal,
-            "Go to the default tab (Queue)",
-        )
-        .clicked()
-        {
-            actions.push(Action::SetTab(Tab::Queue));
-        }
-        let search_state = if view.tab == Tab::Search {
-            ToolState::Active
-        } else {
-            ToolState::Normal
-        };
-        if t(
-            ui,
-            Icon::Search,
-            "Search",
-            search_state,
-            "Open the Search tab",
-        )
-        .clicked()
-        {
-            actions.push(Action::FocusSearch);
-        }
-        t(ui, Icon::List, "My List", ToolState::Unavailable, NOT_YET);
-        t(
-            ui,
-            Icon::Newsgroups,
-            "Newsgroups",
-            ToolState::Unavailable,
-            NOT_YET,
-        );
-        t(
-            ui,
-            Icon::AutoSearch,
-            "Auto Search",
-            ToolState::Unavailable,
-            NOT_YET,
-        );
-        ui.add_space(6.0);
         let open_state = if view.open_nzb.visible {
             ToolState::Active
         } else {
@@ -183,9 +159,9 @@ pub fn show(
         if t(
             ui,
             Icon::OpenNzb,
-            "Open NZB",
+            "Add NZB",
             open_state,
-            "Import an NZB file (Ctrl+O)",
+            "Import an NZB file (Ctrl+O), or drop .nzb files onto the window",
         )
         .clicked()
         {
@@ -196,6 +172,29 @@ pub fn show(
                 actions.push(Action::ShowOpenNzb);
             }
         }
+        let (action, icon, label, tip, enabled) = queue_control(data);
+        let state = if enabled {
+            ToolState::Normal
+        } else {
+            ToolState::Unavailable
+        };
+        if t(ui, icon, label, state, tip).clicked() && enabled {
+            actions.push(action);
+        }
+        let watch = &data.settings.watch_folder;
+        if !watch.as_os_str().is_empty() {
+            let (state, tip) = if view.scanning {
+                (ToolState::Active, "Scanning the watch folder…".to_owned())
+            } else {
+                (
+                    ToolState::Normal,
+                    format!("Import new .nzb files from {} now", watch.display()),
+                )
+            };
+            if t(ui, Icon::Scan, "Scan Folder", state, &tip).clicked() && !view.scanning {
+                actions.push(Action::ScanWatch);
+            }
+        }
         let folder_tip = format!(
             "Open {} in the file manager",
             data.settings.download_dir.display()
@@ -203,7 +202,7 @@ pub fn show(
         if t(
             ui,
             Icon::Folder,
-            "Download Folder",
+            "Downloads",
             ToolState::Normal,
             &folder_tip,
         )
@@ -211,104 +210,21 @@ pub fn show(
         {
             actions.push(Action::OpenDownloadFolder);
         }
-        let queue_state = if view.tab == Tab::Queue {
-            ToolState::Active
-        } else {
-            ToolState::Normal
-        };
-        if t(
-            ui,
-            Icon::Transfers,
-            "Transfers",
-            queue_state,
-            "Show the download queue",
-        )
-        .clicked()
-        {
-            actions.push(Action::SetTab(Tab::Queue));
-        }
-        let paused = data.status.paused;
-        let (icon, label, tip) = if paused {
-            (Icon::Play, "Resume", "Resume the queue")
-        } else {
-            (
-                Icon::Pause,
-                "Pause",
-                "Pause the queue after the current job",
-            )
-        };
-        if t(ui, icon, label, ToolState::Normal, tip).clicked() {
-            actions.push(if paused {
-                Action::Resume
-            } else {
-                Action::Pause
-            });
-        }
 
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
-            if tool_button(ui, pal, Icon::Gear, "Settings", false, ToolState::Normal)
+            if tool_button(ui, pal, Icon::Gear, "Settings", labels, ToolState::Normal)
                 .on_hover_text("Settings (Ctrl+,)")
                 .clicked()
             {
                 actions.push(Action::OpenSettings);
             }
-            search_box(ui, pal, view, actions);
         });
     });
 
     if view.open_nzb.visible {
         open_nzb_row(ui, pal, view, actions);
     }
-}
-
-fn search_box(ui: &mut Ui, pal: &Palette, view: &mut ViewState, actions: &mut Vec<Action>) {
-    let width = (ui.available_width() - 8.0).clamp(120.0, 260.0);
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 28.0), egui::Sense::hover());
-    let mut child = ui.new_child(
-        egui::UiBuilder::new()
-            .max_rect(rect)
-            .layout(Layout::left_to_right(Align::Center)),
-    );
-    let edit = TextEdit::singleline(&mut view.search_text)
-        .id_salt("toolbar-search")
-        .hint_text(
-            RichText::new(if width >= 240.0 {
-                "Search (no indexer configured)"
-            } else {
-                "Search"
-            })
-            .color(pal.muted),
-        )
-        .desired_width(width - 30.0)
-        .font(egui::TextStyle::Body)
-        .margin(egui::Margin {
-            left: 26,
-            right: 6,
-            top: 5,
-            bottom: 5,
-        });
-    let resp = child.add(edit);
-    paint_icon(
-        ui.painter(),
-        egui::Rect::from_center_size(
-            egui::pos2(rect.left() + 14.0, rect.center().y),
-            egui::vec2(14.0, 14.0),
-        ),
-        Icon::Search,
-        pal.faint,
-    );
-    if view.focus_search {
-        resp.request_focus();
-        view.focus_search = false;
-    }
-    if resp.lost_focus()
-        && ui.input(|i| i.key_pressed(egui::Key::Enter))
-        && !view.search_text.trim().is_empty()
-    {
-        actions.push(Action::SetTab(Tab::Search));
-    }
-    resp.on_hover_text("Usenet search needs a Newznab indexer; none is configured.");
 }
 
 fn open_nzb_row(ui: &mut Ui, pal: &Palette, view: &mut ViewState, actions: &mut Vec<Action>) {

@@ -16,11 +16,18 @@
 //!   re-read every second, so changes apply without a restart). Manual scans work whenever a
 //!   watch folder is configured. Timer scans log only imports and new problems.
 //! * **Queue (F4).** One run at a time ([`Service::start`] is idempotent). A run processes
-//!   `queued`/`paused` jobs oldest first. [`Service::pause`] is cooperative: the current job
-//!   finishes and the run stops before the next one; the `Paused` event is emitted at once as
-//!   the acknowledgment. [`Service::resume`] clears the pause and starts a run if none is
-//!   active. [`Service::remove_job`] deletes the row and cancels the job if it is downloading
+//!   `queued` jobs in queue order (an explicit position set by [`Service::move_job`], then
+//!   oldest first); `paused` jobs are held by the user and skipped. [`Service::pause`] is
+//!   cooperative: the current job finishes and the run stops before the next one;
+//!   [`Service::pause_now`] interrupts the current job too (it goes back to `queued` and
+//!   resumes first). The `Paused` event is emitted at once as the acknowledgment.
+//!   [`Service::resume`] clears the pause and starts a run if none is active.
+//!   [`Service::remove_job`] deletes the row and cancels the job if it is downloading
 //!   (partial files are left on disk).
+//! * **Per-job control.** [`Service::pause_job`] holds one job (interrupting it if it is
+//!   downloading; completed files are kept), [`Service::start_job`] downloads one job without
+//!   starting the rest of the queue (or adds it to the active run), and
+//!   [`Service::clear_history`] removes finished jobs from the list.
 //! * **Per job.** Usable servers come from [`Settings::usable_servers`]; with none, the job is
 //!   left `queued`, a single error "no enabled server configured" is logged and the run stops.
 //!   Files recorded as `done` in earlier runs are passed to the engine as `skip_files`, so an
@@ -193,6 +200,22 @@ pub struct Status {
     pub speed_bps: u64,
     /// Last run-level error (cleared when a run starts).
     pub last_error: Option<String>,
+    /// The jobs the active run is limited to ([`Service::start_job`]); `None` while the
+    /// whole queue runs or no run is active.
+    pub run_scope: Option<Vec<i64>>,
+}
+
+/// Where [`Service::move_job`] moves a job within the queue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JobMove {
+    /// First in the queue.
+    Top,
+    /// One place earlier.
+    Up,
+    /// One place later.
+    Down,
+    /// Last in the queue.
+    Bottom,
 }
 
 /// Construction options for [`Service`].
@@ -258,6 +281,11 @@ pub(crate) struct RunState {
     pub(crate) job_cancel: Option<CancellationToken>,
     /// The active job was removed by the user (its cancellation is not a failure).
     pub(crate) removed_active: bool,
+    /// The active job was interrupted by the user; when its download returns it takes
+    /// this state (`paused` for a hold, `queued` for a pause of the whole queue).
+    pub(crate) stop_active: Option<JobState>,
+    /// The jobs the active run is limited to (`None`: the whole queue).
+    pub(crate) only: Option<Vec<i64>>,
     pub(crate) last_error: Option<String>,
     /// Token of the running auto-shutdown countdown.
     pub(crate) countdown: Option<CancellationToken>,
@@ -591,6 +619,197 @@ impl Service {
         );
     }
 
+    /// Pauses the queue at once: like [`Service::pause`], and the job downloading now is
+    /// interrupted and put back to `queued` (completed files are kept), so it resumes first.
+    pub fn pause_now(&self) {
+        let (was_paused, cancel) = {
+            let mut st = self.inner.lock_state();
+            let was = std::mem::replace(&mut st.paused, true);
+            let cancel = if st.active_job.is_some() && !st.removed_active && st.stop_active.is_none() {
+                st.stop_active = Some(JobState::Queued);
+                st.job_cancel.clone()
+            } else {
+                None
+            };
+            (was, cancel)
+        };
+        if let Some(token) = cancel {
+            token.cancel();
+        }
+        if !was_paused {
+            self.inner.emit(ServiceEvent::Paused);
+            self.inner.log(LogLevel::Info, "queue paused");
+        }
+    }
+
+    /// Holds one job: a `queued` job becomes `paused` (skipped by runs); a downloading job
+    /// is interrupted and becomes `paused` once its download stops (completed files are
+    /// kept), and the run moves on to the next job. Holding a `paused` job does nothing;
+    /// finished jobs are refused.
+    pub fn pause_job(&self, id: i64) -> Result<(), ServiceError> {
+        let result = (|| {
+            let job = self.inner.store.get_job(id)?.ok_or(ServiceError::NotFound(id))?;
+            let cancel = {
+                let mut st = self.inner.lock_state();
+                if st.active_job == Some(id) {
+                    if st.removed_active {
+                        return Err(ServiceError::NotFound(id));
+                    }
+                    st.stop_active = Some(JobState::Paused);
+                    st.job_cancel.clone()
+                } else {
+                    match job.state {
+                        JobState::Queued => {
+                            self.inner.store.set_job_state(id, JobState::Paused, None).map_err(|e| store_err(id, e))?
+                        }
+                        JobState::Paused => return Ok((job, false)),
+                        other => {
+                            return Err(ServiceError::Other(format!(
+                                "only queued or downloading jobs can be paused ({} is {other})",
+                                job.name
+                            )))
+                        }
+                    }
+                    None
+                }
+            };
+            if let Some(token) = cancel {
+                token.cancel();
+            }
+            Ok((job, true))
+        })();
+        match result {
+            Ok((job, changed)) => {
+                if changed {
+                    self.inner.log(LogLevel::Info, format!("paused {}", job.name));
+                    self.inner.emit(ServiceEvent::JobsChanged);
+                }
+                Ok(())
+            }
+            Err(e) => {
+                self.inner.log(LogLevel::Error, format!("could not pause job {id}: {e}"));
+                Err(e)
+            }
+        }
+    }
+
+    /// Downloads one job: a `paused` or `queued` job becomes `queued`; if no run is active
+    /// a run limited to this job starts (the rest of the queue stays as it is), and an
+    /// active run limited to other jobs takes this one too. A run of the whole queue picks
+    /// it up in queue order. A failed job is retried first ([`Service::retry_job`]).
+    /// Clears a pending pause of the queue.
+    pub fn start_job(&self, id: i64) -> Result<(), ServiceError> {
+        let job = match self.inner.store.get_job(id) {
+            Ok(Some(job)) => job,
+            Ok(None) => {
+                self.inner.log(LogLevel::Error, format!("could not start job {id}: not found"));
+                return Err(ServiceError::NotFound(id));
+            }
+            Err(e) => {
+                let e = ServiceError::Store(e);
+                self.inner.log(LogLevel::Error, format!("could not start job {id}: {e}"));
+                return Err(e);
+            }
+        };
+        match job.state {
+            JobState::Failed => self.retry_job(id)?,
+            JobState::Paused => {
+                if let Err(e) = self.inner.store.set_job_state(id, JobState::Queued, None) {
+                    let e = store_err(id, e);
+                    self.inner.log(LogLevel::Error, format!("could not start {}: {e}", job.name));
+                    return Err(e);
+                }
+                self.inner.log(LogLevel::Info, format!("resumed {}", job.name));
+                self.inner.emit(ServiceEvent::JobsChanged);
+            }
+            JobState::Queued | JobState::Downloading => {}
+            JobState::Done => {
+                let e = ServiceError::Other(format!("{} is already done", job.name));
+                self.inner.log(LogLevel::Error, format!("could not start job {id}: {e}"));
+                return Err(e);
+            }
+        }
+        let was_paused = std::mem::take(&mut self.inner.lock_state().paused);
+        if was_paused {
+            self.inner.emit(ServiceEvent::Resumed);
+        }
+        runner::start_with(&self.inner, Some(vec![id]));
+        Ok(())
+    }
+
+    /// Ids of the pending jobs (`queued`, `downloading`, `paused`) in queue order (empty,
+    /// with a logged error, if the database fails).
+    pub fn queue_order(&self) -> Vec<i64> {
+        self.inner.store.queue_order().unwrap_or_else(|e| {
+            self.inner.log(LogLevel::Error, format!("could not read the queue order: {e}"));
+            Vec::new()
+        })
+    }
+
+    /// Moves a pending job within the queue order. Moving past either end does nothing.
+    pub fn move_job(&self, id: i64, to: JobMove) -> Result<(), ServiceError> {
+        let result = (|| {
+            let mut order = self.inner.store.queue_order()?;
+            let from = order.iter().position(|&j| j == id).ok_or(ServiceError::NotFound(id))?;
+            let dest = match to {
+                JobMove::Top => 0,
+                JobMove::Up => from.saturating_sub(1),
+                JobMove::Down => (from + 1).min(order.len() - 1),
+                JobMove::Bottom => order.len() - 1,
+            };
+            if dest == from {
+                return Ok(false);
+            }
+            let job = order.remove(from);
+            order.insert(dest, job);
+            self.inner.store.set_queue_order(&order)?;
+            Ok(true)
+        })();
+        match result {
+            Ok(changed) => {
+                if changed {
+                    self.inner.emit(ServiceEvent::JobsChanged);
+                }
+                Ok(())
+            }
+            Err(e) => {
+                self.inner.log(LogLevel::Error, format!("could not move job {id}: {e}"));
+                Err(e)
+            }
+        }
+    }
+
+    /// Removes every finished (`done` or `failed`) job from the list, like
+    /// [`Service::remove_job`] (files on disk are kept). Returns how many were removed.
+    pub fn clear_history(&self) -> usize {
+        let finished: Vec<Job> = self
+            .jobs()
+            .into_iter()
+            .filter(|j| matches!(j.state, JobState::Done | JobState::Failed))
+            .collect();
+        let mut removed = 0;
+        for job in &finished {
+            match self.inner.store.remove_job(job.id) {
+                Ok(()) => {
+                    removed += 1;
+                    if let Some(fp) = Fingerprint::of(&job.source_path) {
+                        let _ = self.inner.store.mark_source_seen(&job.source_path, fp.size, fp.mtime);
+                    }
+                }
+                Err(StoreError::NotFound) => {}
+                Err(e) => self.inner.log(LogLevel::Error, format!("could not remove {}: {e}", job.name)),
+            }
+        }
+        if removed > 0 {
+            self.inner.log(
+                LogLevel::Info,
+                format!("cleared {removed} finished job{} from the list", if removed == 1 { "" } else { "s" }),
+            );
+            self.inner.emit(ServiceEvent::JobsChanged);
+        }
+        removed
+    }
+
     /// Clears a pause, emits [`ServiceEvent::Resumed`] and starts a run if none is active.
     pub fn resume(&self) {
         let was_paused = std::mem::take(&mut self.inner.lock_state().paused);
@@ -610,6 +829,7 @@ impl Service {
             active_job: st.active_job,
             speed_bps: self.inner.speed_bps.load(Ordering::Relaxed),
             last_error: st.last_error.clone(),
+            run_scope: if st.running { st.only.clone() } else { None },
         }
     }
 

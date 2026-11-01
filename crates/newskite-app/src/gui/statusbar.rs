@@ -8,7 +8,25 @@ use super::app::{Action, Data};
 use super::brand;
 use super::motion::Beat;
 use super::theme::Palette;
-use super::widgets::{credit, link_label, status_chip_live, Status, CREDIT_URL};
+use super::widgets::{credit, status_chip_live, Status, CREDIT_URL};
+
+/// Free space below which the reading turns to the warning color.
+pub const LOW_DISK: u64 = 2 * 1024 * 1024 * 1024;
+
+/// The left-hand reading: free space on the download folder's filesystem (when known)
+/// and the lifetime download total. `true` when the free space is short of what the
+/// queue still needs or below [`LOW_DISK`].
+pub fn disk_reading(data: &Data) -> (String, bool) {
+    let total = format!("{} downloaded", format::bytes(data.totals.downloaded_bytes));
+    match data.disk_free {
+        Some(free) => {
+            let left = data.bytes_left();
+            let low = free < LOW_DISK || free < left;
+            (format!("{} free  ·  {total}", format::bytes(free)), low)
+        }
+        None => (total, false),
+    }
+}
 
 /// Fraction of the bytes of every unfinished job that is already down (0…1; 0 when
 /// nothing is pending). The status bar's hairline while a run is active.
@@ -50,7 +68,7 @@ impl Pill {
         match self {
             Pill::Online => "Online".into(),
             Pill::Downloading(speed) => format!("Downloading · {speed}"),
-            Pill::Pausing(speed) => format!("Downloading · {speed} · pausing after this job"),
+            Pill::Pausing(speed) => format!("Downloading · {speed} · pausing"),
             Pill::Paused => "Paused".into(),
             Pill::Error(e) => short_cause(e),
             Pill::NoServer => "No server".into(),
@@ -110,7 +128,7 @@ impl Pill {
     }
 }
 
-/// Draws the status bar: the support link at the left; the quiet innerpulse credit at
+/// Draws the status bar: free disk space and the lifetime total at the left; the quiet innerpulse credit at
 /// the right end, the state chip beside it (its live dot breathing with the busy beat).
 /// While a run is active a 2 px accent hairline along the top edge shows how much of
 /// the pending bytes is down.
@@ -148,7 +166,21 @@ pub fn show(
         }
     }
     ui.horizontal_centered(|ui| {
-        link_label(ui, pal, "Support Issues?").on_hover_text("Help resources are not set up yet.");
+        let (text, low) = disk_reading(data);
+        let r = ui.label(
+            RichText::new(text)
+                .font(super::fonts::mono_id(11.0))
+                .color(if low { pal.warning } else { pal.muted }),
+        );
+        let dir = data.settings.download_dir.display().to_string();
+        if low {
+            r.on_hover_text(format!(
+                "Low on space in {dir}: the queue still needs {}",
+                format::bytes(data.bytes_left())
+            ));
+        } else {
+            r.on_hover_text(format!("Free space on the filesystem of {dir}"));
+        }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             if credit(ui, pal).clicked() {
                 actions.push(Action::OpenUrl(CREDIT_URL.to_owned()));
@@ -162,7 +194,7 @@ pub fn show(
             }
             if data.totals.jobs_pending > 0 {
                 ui.label(
-                    RichText::new(format!("{} pending", data.totals.jobs_pending))
+                    RichText::new(format!("{} in queue", data.totals.jobs_pending))
                         .small()
                         .color(pal.muted),
                 );
@@ -221,6 +253,19 @@ mod tests {
             job(3, JobState::Queued, 0, 100),
         ];
         assert!((pending_fraction(&d) - 0.125).abs() < 1e-6);
+    }
+
+    #[test]
+    fn disk_reading_warns_when_the_queue_does_not_fit() {
+        let mut d = Data::default();
+        d.totals.downloaded_bytes = 2048;
+        assert_eq!(disk_reading(&d), ("2.0 KB downloaded".to_owned(), false));
+        d.disk_free = Some(100 * 1024 * 1024 * 1024);
+        let (t, low) = disk_reading(&d);
+        assert!(t.starts_with("100 GB free"), "{t}");
+        assert!(!low);
+        d.disk_free = Some(LOW_DISK - 1);
+        assert!(disk_reading(&d).1);
     }
 
     #[test]
