@@ -228,14 +228,23 @@ Other tabs: `Search` and `Latest File Groups` are placeholders that explain them
 ("indexer-agnostic search; NZB import is the primary input").
 
 ### 6.3 Bottom docks (four, equal-ish width)
-1. **Connection Graph** — sparkline of stored history (muted/dashed) plus the live series (accent),
-   current speed text, and `Remaining: pending / total jobs`. One stored sample must still draw a
-   visible (flat) trace.
-2. **NNTP Activity** — `host:port`, plain/TLS, `N connections`, username, configured max.
-   Per-connection live counters are optional.
+1. **Connection Graph** — current speed (with a live dot that breathes while bytes move) and
+   `Remaining: pending / total jobs`; a live plot of the last 10 min (gradient fill, pulsing end
+   marker, scale and time-span corner labels) over a separate 24 h history strip (stepped area,
+   busiest bucket ticked in the live color), so the two time axes never share one plot. One
+   stored sample must still draw a visible (flat) trace.
+2. **NNTP Activity** — `host:port`, a TLS/Plain chip, username, fail-over count; a row of
+   connection slots (one cell per configured connection, the effective ones lit; they shimmer
+   while downloading) under an `effective / max` figure; stat tiles for articles fetched and
+   missing this session.
 3. **Messages** — last ~50 lines, newest first, one line per meaningful event (never one per
-   segment); local errors included.
-4. **Your Account** — downloaded total, jobs done, jobs pending, configured max connections.
+   segment); local errors included. Three columns (level mark, clock, text) so long lines wrap
+   under their own text; a line that arrives after the first frame fades in.
+4. **Your Account** — stat tiles: downloaded total, jobs done, jobs pending, jobs failed (when
+   any), configured max connections; a segment track of jobs finished over jobs known.
+
+Readings are stat tiles (a large mono figure over a small eyebrow label); the 2×2 grid uses
+their one-line inline form. All dock motion stops under reduced motion.
 
 ### 6.4 Status bar
 Left: "Support Issues?" (help link placeholder). Right: a state pill — `Online` when connected and
