@@ -2397,6 +2397,7 @@ name = "newskite-nzb"
 version = "0.1.0"
 dependencies = [
  "crc32fast",
+ "memchr",
  "newskite-types",
  "quick-xml 0.42.0",
  "thiserror 2.0.21",

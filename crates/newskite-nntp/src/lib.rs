@@ -5,10 +5,13 @@
 //! `QUIT`, over plain TCP or TLS (rustls with the `ring` provider; trust roots are the
 //! platform store plus the bundled Mozilla roots).
 //!
-//! Multi-line bodies are read line by line into a reusable buffer, dot-unstuffed, and
-//! returned with every line terminated by `\r\n` (bare `\n` from sloppy servers is
+//! Multi-line bodies are read chunk by chunk straight from the socket buffer, dot-unstuffed,
+//! and returned with every line terminated by `\r\n` (bare `\n` from sloppy servers is
 //! normalized). A single article is capped at [`MAX_ARTICLE_BYTES`] so a hostile server
-//! cannot exhaust memory.
+//! cannot exhaust memory. `BODY` requests can be pipelined
+//! ([`NntpConnection::send_body`] / [`NntpConnection::begin_body`] /
+//! [`NntpConnection::finish_body`]) so a connection never sits idle for a round trip
+//! between articles.
 //!
 //! [`test_server`] performs the Settings "Test" handshake and returns a human-readable
 //! transcript that never contains the password (or the username).

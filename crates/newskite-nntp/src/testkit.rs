@@ -16,8 +16,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
+use tokio::time::Instant;
 
 /// Behavior of a [`MockServer`].
 #[derive(Clone, Debug, Default)]
@@ -30,8 +31,18 @@ pub struct MockConfig {
     pub articles: HashMap<String, Vec<u8>>,
     /// The first N accepted connections are closed immediately (simulates flaky servers).
     pub fail_first_n_connections: usize,
-    /// Delay before answering each `BODY`, in milliseconds.
+    /// Delay before answering each `BODY`, in milliseconds. Models server-side work: the
+    /// session handles commands one at a time, so a pipelined request waits behind it.
     pub delay_ms: u64,
+    /// One-way network latency in milliseconds applied to every reply: commands are read
+    /// and answered at once, but each reply reaches the wire `latency_ms` after its
+    /// command arrived (in order). Unlike `delay_ms`, a client that pipelines requests
+    /// hides this entirely.
+    pub latency_ms: u64,
+    /// Per-session bandwidth in bytes per second (0 = unlimited): replies are written in
+    /// slices paced to this rate, so a body takes realistic time to arrive and a pipelined
+    /// request has something to overlap with.
+    pub bandwidth_bps: u64,
 }
 
 #[derive(Default)]
@@ -125,18 +136,30 @@ async fn session(socket: TcpStream, cfg: Arc<MockConfig>, counters: Arc<Counters
 }
 
 async fn serve(socket: TcpStream, cfg: &MockConfig, counters: &Counters) -> std::io::Result<()> {
-    let (read_half, mut writer) = socket.into_split();
+    let (read_half, writer) = socket.into_split();
     let mut reader = BufReader::new(read_half);
     let needs_auth = cfg.username.is_some();
     let mut authenticated = !needs_auth;
     let mut pending_user: Option<String> = None;
 
-    writer.write_all(b"200 newskite mock server ready\r\n").await?;
+    // Replies go through a writer task that releases each one `latency_ms` after its
+    // command arrived, in order, so reading the next command never waits for a reply.
+    let (reply_tx, reply_rx) = mpsc::unbounded_channel::<(Instant, Vec<u8>)>();
+    let mut writer_task = tokio::spawn(write_replies(writer, reply_rx, cfg.bandwidth_bps));
+    let latency = Duration::from_millis(cfg.latency_ms);
+    let send = |reply: Vec<u8>| reply_tx.send((Instant::now() + latency, reply)).map_err(|_| std::io::Error::other("writer gone"));
+
+    send(b"200 newskite mock server ready\r\n".to_vec())?;
     let mut line = Vec::new();
     loop {
         line.clear();
-        if reader.read_until(b'\n', &mut line).await? == 0 {
-            return Ok(());
+        let n = tokio::select! {
+            n = reader.read_until(b'\n', &mut line) => n?,
+            res = &mut writer_task => return res.unwrap_or_else(|e| Err(std::io::Error::other(e))),
+        };
+        if n == 0 {
+            drop(reply_tx);
+            return writer_task.await.unwrap_or_else(|e| Err(std::io::Error::other(e)));
         }
         let text = String::from_utf8_lossy(&line);
         let text = text.trim_end_matches(['\r', '\n']);
@@ -213,15 +236,39 @@ async fn serve(socket: TcpStream, cfg: &MockConfig, counters: &Counters) -> std:
             "DATE" => format!("111 {}\r\n", utc_timestamp(SystemTime::now())).into_bytes(),
             "MODE" if arg.eq_ignore_ascii_case("READER") => b"200 reader mode\r\n".to_vec(),
             "QUIT" => {
-                writer.write_all(b"205 closing connection\r\n").await?;
-                writer.flush().await?;
-                return Ok(());
+                send(b"205 closing connection\r\n".to_vec())?;
+                drop(reply_tx);
+                return writer_task.await.unwrap_or_else(|e| Err(std::io::Error::other(e)));
             }
             _ => b"500 unknown command\r\n".to_vec(),
         };
-        writer.write_all(&reply).await?;
+        send(reply)?;
+    }
+}
+
+/// Writes queued replies in order, each no earlier than its release instant. Ends when
+/// the queue closes (session over) or the peer goes away.
+async fn write_replies(
+    mut writer: tokio::net::tcp::OwnedWriteHalf,
+    mut rx: mpsc::UnboundedReceiver<(Instant, Vec<u8>)>,
+    bandwidth_bps: u64,
+) -> std::io::Result<()> {
+    const SLICE: usize = 16 * 1024;
+    while let Some((at, reply)) = rx.recv().await {
+        tokio::time::sleep_until(at).await;
+        if bandwidth_bps == 0 {
+            writer.write_all(&reply).await?;
+        } else {
+            let mut due = Instant::now();
+            for slice in reply.chunks(SLICE) {
+                writer.write_all(slice).await?;
+                due += Duration::from_secs_f64(slice.len() as f64 / bandwidth_bps as f64);
+                tokio::time::sleep_until(due).await;
+            }
+        }
         writer.flush().await?;
     }
+    Ok(())
 }
 
 fn strip_brackets(id: &str) -> &str {
