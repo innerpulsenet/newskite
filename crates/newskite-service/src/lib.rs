@@ -71,7 +71,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use newskite_engine::Progress;
+use newskite_engine::{ConnectionPool, Progress};
 use newskite_nzb::NzbError;
 use newskite_postproc::Tools;
 use newskite_types::{format, EngineEvent, ServerConfig, Settings};
@@ -272,6 +272,8 @@ pub(crate) struct Inner {
     logs: Mutex<VecDeque<LogLine>>,
     /// Shared counters handed to every engine run; the sampler diffs `bytes_down`.
     pub(crate) progress: Arc<Progress>,
+    /// NNTP connections kept between the jobs of one run; closed when the run ends.
+    pub(crate) pool: Arc<ConnectionPool>,
     /// Fired by [`Service::shutdown`]; parent of every job and countdown token.
     pub(crate) shutdown: CancellationToken,
     /// `true` while a run is active (backs [`Service::wait_idle`]).
@@ -507,6 +509,7 @@ impl Service {
             state: Mutex::new(RunState::default()),
             logs: Mutex::new(VecDeque::with_capacity(LOG_CAPACITY)),
             progress: Arc::new(Progress::new()),
+            pool: Arc::new(ConnectionPool::new()),
             shutdown: CancellationToken::new(),
             running_tx,
             speed_bps: AtomicU64::new(0),
@@ -899,6 +902,7 @@ impl Service {
         }
         // Bytes since the last sampler tick would otherwise never be recorded.
         timers::flush_throughput(&self.inner);
+        self.inner.pool.close_idle();
         self.inner.log(LogLevel::Info, "service stopping");
     }
 
