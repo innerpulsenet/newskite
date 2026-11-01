@@ -86,12 +86,17 @@ install -d "${appdir}/usr/bin" \
     "${appdir}/usr/share/applications" \
     "${appdir}/usr/share/metainfo" \
     "${appdir}/usr/share/mime/packages" \
-    "${appdir}/usr/share/icons/hicolor/scalable/apps"
+    "${appdir}/usr/share/icons/hicolor/scalable/apps" \
+    "${appdir}/usr/share/doc/${BIN_NAME}"
 
 install -m 755 "${binary}" "${appdir}/usr/bin/${BIN_NAME}"
 install -m 644 "${SCRIPT_DIR}/${APP_ID}.desktop" "${appdir}/usr/share/applications/${APP_ID}.desktop"
 install -m 644 "${SCRIPT_DIR}/${APP_ID}.metainfo.xml" "${appdir}/usr/share/metainfo/${APP_ID}.appdata.xml"
 install -m 644 "${SCRIPT_DIR}/mime/newskite-nzb.xml" "${appdir}/usr/share/mime/packages/newskite-nzb.xml"
+# The binary embeds Instrument Sans and JetBrains Mono (SIL OFL 1.1): their notices and
+# license travel with it.
+install -m 644 "${SCRIPT_DIR}/../assets/brand/fonts/OFL.txt" "${appdir}/usr/share/doc/${BIN_NAME}/fonts-OFL.txt"
+install -m 644 "${SCRIPT_DIR}/debian/copyright" "${appdir}/usr/share/doc/${BIN_NAME}/copyright"
 install -m 644 "${SCRIPT_DIR}/icons/${APP_ID}.svg" "${appdir}/usr/share/icons/hicolor/scalable/apps/${APP_ID}.svg"
 for png in "${SCRIPT_DIR}"/icons/hicolor/*/apps/"${APP_ID}".png; do
     [[ -f "${png}" ]] || continue

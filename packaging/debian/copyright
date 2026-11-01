@@ -1,0 +1,24 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: newskite
+Upstream-Contact: Pat
+Source: https://www.innerpulse.net/
+
+Files: *
+Copyright: 2026, Pat
+License: MIT or Apache-2.0
+ Newskite is licensed under either of the MIT license or the Apache License,
+ Version 2.0, at your option.
+
+Files: assets/brand/fonts/*
+Copyright: 2022 The Instrument Sans Project Authors (https://github.com/Instrument/instrument-sans)
+           2020 The JetBrains Mono Project Authors (https://github.com/JetBrains/JetBrainsMono)
+License: OFL-1.1
+Comment: Instrument Sans and JetBrains Mono (Regular and SemiBold) are embedded in
+ /usr/bin/newskite.
+
+License: OFL-1.1
+ The binary embeds static instances of these fonts (generated from the upstream
+ variable fonts with fontTools; no glyphs were changed). The full SIL Open Font
+ License, Version 1.1, with both copyright notices, is installed as
+ /usr/share/doc/newskite/fonts-OFL.txt and is available with a FAQ at
+ https://openfontlicense.org

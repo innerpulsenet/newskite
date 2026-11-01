@@ -7,7 +7,47 @@ use newskite_service::{Bookmark, NewBookmark};
 
 use super::app::{Action, Data};
 use super::theme::{parse_user_color, Palette};
-use super::widgets::{icon_button, paint_icon, section_title, Icon};
+use super::widgets::{error_line, icon_button, paint_icon, section_title, Icon};
+
+/// The label colors the add form offers: the kit's categorical chart slots (identity
+/// colors, never status). Coral (slot 2) is left out: beside ember it would read as
+/// "live" or "error". A choice is stored as its slot name (`chart-3`), so it follows the
+/// theme; any `#hex` or `r,g,b` typed by hand is kept as given.
+pub const LABEL_SLOTS: [(&str, usize); 6] = [
+    ("Violet", 3),
+    ("Cyan", 1),
+    ("Blue", 5),
+    ("Mint", 6),
+    ("Amber", 4),
+    ("Magenta", 7),
+];
+
+/// The stored name of chart slot `n` (1-based).
+pub fn slot_name(n: usize) -> String {
+    format!("chart-{n}")
+}
+
+/// Resolves a stored bookmark color: a chart slot name in the current palette, else a
+/// literal color.
+pub fn label_color(pal: &Palette, stored: &str) -> Option<egui::Color32> {
+    let s = stored.trim();
+    if let Some(n) = s
+        .strip_prefix("chart-")
+        .and_then(|n| n.parse::<usize>().ok())
+    {
+        return (1..=pal.chart.len()).contains(&n).then(|| pal.chart[n - 1]);
+    }
+    parse_user_color(s)
+}
+
+/// Paints a label swatch: a small rounded square (a legend key, not a status dot).
+fn paint_swatch(ui: &Ui, rect: egui::Rect, side: f32, color: egui::Color32) {
+    ui.painter().rect_filled(
+        egui::Rect::from_center_size(rect.center(), egui::vec2(side, side)),
+        egui::CornerRadius::same(2),
+        color,
+    );
+}
 
 /// Pixels of indentation per nesting level.
 const INDENT: f32 = 14.0;
@@ -44,7 +84,8 @@ impl BookmarkForm {
             return Err("Name is required.".into());
         }
         let color = self.color.trim();
-        if !color.is_empty() && parse_user_color(color).is_none() {
+        let is_slot = LABEL_SLOTS.iter().any(|&(_, n)| slot_name(n) == color);
+        if !color.is_empty() && !is_slot && parse_user_color(color).is_none() {
             return Err("Color must be #rrggbb, #rgb or r,g,b.".into());
         }
         let group = self.newsgroup.trim();
@@ -197,16 +238,19 @@ fn row(
                 actions.push(Action::ToggleBookmark(b.id));
             }
         }
-        // Color swatch, falling back to a neutral dot.
-        let color = b.color.as_deref().and_then(parse_user_color);
+        // Label swatch (a small square, so it never reads as a status or live dot),
+        // falling back to a neutral outline.
+        let color = b.color.as_deref().and_then(|c| label_color(pal, c));
         let (dot, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), Sense::hover());
         match color {
-            Some(c) => {
-                ui.painter().circle_filled(dot.center(), 5.0, c);
-            }
+            Some(c) => paint_swatch(ui, dot, 9.0, c),
             None => {
-                ui.painter()
-                    .circle_stroke(dot.center(), 4.0, egui::Stroke::new(1.5, pal.muted));
+                ui.painter().rect_stroke(
+                    egui::Rect::from_center_size(dot.center(), egui::vec2(8.0, 8.0)),
+                    egui::CornerRadius::same(2),
+                    egui::Stroke::new(1.5, pal.muted),
+                    egui::StrokeKind::Inside,
+                );
             }
         }
 
@@ -264,30 +308,30 @@ fn add_form(
         );
         let mut submitted = (r_name.lost_focus() || r_group.lost_focus())
             && ui.input(|i| i.key_pressed(egui::Key::Enter));
-        // Swatches drawn from token colors; free text accepts any hex / r,g,b value.
+        // Swatches are the chart's categorical slots, stored by slot name; free text
+        // accepts any hex / r,g,b value.
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
-            let swatches = [
-                ("Accent", pal.accent),
-                ("Green", pal.positive),
-                ("Orange", pal.warning),
-                ("Red", pal.negative),
-                ("Gray", pal.muted),
-            ];
-            for (name, c) in swatches {
-                let hex = format!("#{:02x}{:02x}{:02x}", c.r(), c.g(), c.b());
-                let selected = form.color.eq_ignore_ascii_case(&hex);
+            for (name, n) in LABEL_SLOTS {
+                let slot = slot_name(n);
+                let c = pal.chart[n - 1];
+                let selected = form.color.trim() == slot;
                 let (rect, resp) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), Sense::click());
-                ui.painter().circle_filled(rect.center(), 7.0, c);
+                paint_swatch(ui, rect, 12.0, c);
                 if selected {
-                    ui.painter().circle_stroke(
-                        rect.center(),
-                        8.5,
+                    ui.painter().rect_stroke(
+                        egui::Rect::from_center_size(rect.center(), egui::vec2(16.0, 16.0)),
+                        egui::CornerRadius::same(3),
                         egui::Stroke::new(1.5, pal.text),
+                        egui::StrokeKind::Inside,
                     );
                 }
-                if resp.on_hover_text(name).clicked() {
-                    form.color = hex;
+                let resp = resp.on_hover_text(name);
+                resp.widget_info(|| {
+                    egui::WidgetInfo::selected(egui::WidgetType::RadioButton, true, selected, name)
+                });
+                if resp.clicked() {
+                    form.color = slot;
                 }
             }
             let r_color = ui.add(
@@ -314,7 +358,7 @@ fn add_form(
                 });
         }
         if let Some(e) = &form.error {
-            ui.label(RichText::new(e).color(pal.negative));
+            error_line(ui, pal, e);
         }
         ui.horizontal(|ui| {
             if ui.button(RichText::new("Add").strong()).clicked() || submitted {
@@ -395,5 +439,32 @@ mod tests {
         assert_eq!(nb.newsgroup.as_deref(), Some("alt.binaries.test"));
         f.newsgroup = "alt binaries".into();
         assert!(f.to_new().is_err());
+        f.newsgroup.clear();
+        f.color = slot_name(3);
+        assert_eq!(f.to_new().expect("slot").color.as_deref(), Some("chart-3"));
+    }
+
+    #[test]
+    fn label_slots_follow_the_theme_and_avoid_status_colors() {
+        use super::super::brand_tokens;
+        use super::super::theme::Palette;
+        for theme in [brand_tokens::ink(), brand_tokens::paper()] {
+            let pal = Palette::from_theme(&theme);
+            for (_, n) in LABEL_SLOTS {
+                let c = label_color(&pal, &slot_name(n)).expect("slot resolves");
+                assert_eq!(c, pal.chart[n - 1]);
+                for status in [pal.positive, pal.warning, pal.negative, pal.mark] {
+                    assert_ne!(c, status, "a label is never a status color");
+                }
+            }
+        }
+        let ink = Palette::from_theme(&brand_tokens::ink());
+        let paper = Palette::from_theme(&brand_tokens::paper());
+        assert_ne!(label_color(&ink, "chart-3"), label_color(&paper, "chart-3"));
+        assert_eq!(label_color(&ink, "chart-9"), None);
+        assert!(
+            label_color(&ink, "#3daee9").is_some(),
+            "typed colors still work"
+        );
     }
 }

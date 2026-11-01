@@ -27,10 +27,11 @@ thiserror.workspace = true
 # egui 0.33 is the newest release whose MSRV (1.88) fits the workspace MSRV (1.89);
 # 0.34+ need rustc 1.92/1.95.
 eframe = { version = "0.33.3", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland", "x11"] }
-egui_extras = { version = "0.33.3", default-features = false }
+egui_extras = { version = "0.33.3", default-features = false, features = ["svg"] }
 clap = { version = "4.6", features = ["derive"] }
 rfd = "0.17"
 open = "5.3"
+serde_json.workspace = true
 chrono = { version = "0.4.41", default-features = false, features = ["clock", "std"] }
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
 
@@ -40,7 +41,11 @@ notify-rust = { version = "4.11", default-features = false, features = ["z"] }
 [dev-dependencies]
 egui_kittest = { version = "0.33.3", features = ["wgpu", "snapshot"] }
 tempfile = "3.27"
+# Same resvg as egui_extras' svg loader; the icon tests rasterize with it directly.
+resvg = { version = "0.45.1", default-features = false }
 newskite-store.workspace = true
+# Writes an unreadable settings row for the settings-notice test.
+rusqlite = { version = "0.41.1", features = ["bundled"] }
 
 # Debian package metadata for cargo-deb (`cargo deb -p newskite`). Asset sources are relative
 # to this crate; `target/release/...` is rewritten by cargo-deb to the real target dir.
@@ -48,12 +53,15 @@ newskite-store.workspace = true
 name = "newskite"
 maintainer = "Pat"
 copyright = "2026, Pat"
+# A machine-readable copyright file: the app's own license and the OFL fonts it embeds.
+license-file = ["../../packaging/debian/copyright", "0"]
 section = "net"
 priority = "optional"
 # $auto finds the libraries linked at build time (libc, libgcc). winit/glutin load the
 # windowing libraries with dlopen, so those are listed explicitly.
 depends = "$auto, libgl1, libegl1, libxkbcommon0, libwayland-client0, libwayland-cursor0, libwayland-egl1, libx11-6, libxcursor1, libxrandr2, libxi6, libxkbcommon-x11-0"
-recommends = "par2, 7zip | p7zip-full, unzip"
+# zenity or kdialog shows a start-up error when not even a window of our own can open.
+recommends = "par2, 7zip | p7zip-full, unzip, zenity | kdialog"
 suggests = "unrar"
 extended-description = """\
 Newskite is a desktop Usenet (NZB) download client. It downloads the binary articles \
@@ -78,4 +86,6 @@ assets = [
     ["../../packaging/icons/hicolor/256x256/apps/net.innerpulse.Newskite.png", "usr/share/icons/hicolor/256x256/apps/", "644"],
     ["../../packaging/icons/hicolor/512x512/apps/net.innerpulse.Newskite.png", "usr/share/icons/hicolor/512x512/apps/", "644"],
     ["../../README.md", "usr/share/doc/newskite/", "644"],
+    # The binary embeds Instrument Sans and JetBrains Mono (SIL OFL 1.1).
+    ["../../assets/brand/fonts/OFL.txt", "usr/share/doc/newskite/fonts-OFL.txt", "644"],
 ]

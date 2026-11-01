@@ -8,11 +8,35 @@ use newskite_service::{Job, JobState};
 use newskite_types::{format, Settings};
 
 use super::app::{Action, Data, Tab, ViewState};
+use super::fonts;
 use super::theme::Palette;
-use super::widgets::{icon_button, icon_text_button, pill, progress_bar, state_badge, Icon};
+use super::widgets::{
+    article_grid, icon_button, kit_button, segment_track, spaced, state_badge, status_chip,
+    status_chip_width, ButtonKind, Icon, Status, EYEBROW_TRACKING,
+};
 
 /// Exact empty-state text of the Queue table.
 pub const EMPTY_QUEUE: &str = "No jobs. Import an NZB to begin.";
+
+/// Queue table column widths (logical px). Only Name and Progress give way on narrow
+/// windows; Actions keeps room for the "Remove?" Yes/No confirmation and the inline
+/// archive-password field.
+const ID_W: f32 = 44.0;
+const STATE_W: f32 = 100.0;
+const SIZE_W: f32 = 84.0;
+const ACTIONS_W: f32 = 168.0;
+const NAME_MIN: f32 = 140.0;
+const PROGRESS_MIN: f32 = 110.0;
+const PROGRESS_MAX: f32 = 230.0;
+
+/// Progress column width and the table's minimum width for `available` px with
+/// `gap` px between columns. When the minimum exceeds `available` (a widened sidebar),
+/// the table scrolls sideways instead of being clipped.
+pub fn table_widths(available: f32, gap: f32) -> (f32, f32) {
+    let fixed = ID_W + STATE_W + SIZE_W + ACTIONS_W + 5.0 * gap;
+    let progress = (available - fixed - NAME_MIN).clamp(PROGRESS_MIN, PROGRESS_MAX);
+    (progress, fixed + NAME_MIN + progress)
+}
 
 /// Queue sort keys.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -133,7 +157,7 @@ pub fn show_center(
                 } else {
                     (Icon::ChevronUp, "Ascending (click for descending)")
                 };
-                if icon_button(ui, pal, icon, pal.text, tip).clicked() {
+                if icon_button(ui, pal, icon, pal.muted, tip).clicked() {
                     view.queue.descending = !view.queue.descending;
                 }
                 egui::ComboBox::from_id_salt("queue-sort")
@@ -227,7 +251,16 @@ fn placeholder(ui: &mut Ui, pal: &Palette, title: &str, text: &str, actions: &mu
         ui.add_space(6.0);
         ui.label(RichText::new(text).color(pal.muted));
         ui.add_space(12.0);
-        if ui.button("Open NZB…").clicked() {
+        if kit_button(
+            ui,
+            pal,
+            ButtonKind::Outline,
+            Some(Icon::OpenNzb),
+            "Open NZB…",
+            true,
+        )
+        .clicked()
+        {
             actions.push(Action::ShowOpenNzb);
         }
     });
@@ -246,26 +279,60 @@ fn queue_tab(
             .jobs
             .iter()
             .any(|j| matches!(j.state, JobState::Queued | JobState::Paused));
-        if icon_text_button(ui, pal, Icon::Play, "Start", !st.running && has_runnable)
-            .on_hover_text("Start downloading queued jobs, oldest first")
-            .clicked()
+        // The Queue view's one filled call to action.
+        let can_start = !st.running && has_runnable;
+        if kit_button(
+            ui,
+            pal,
+            ButtonKind::Primary,
+            Some(Icon::Play),
+            "Start",
+            can_start,
+        )
+        .on_hover_text("Start downloading queued jobs, oldest first")
+        .clicked()
+            && can_start
         {
             actions.push(Action::Start);
         }
-        if icon_text_button(ui, pal, Icon::Pause, "Pause", st.running && !st.paused)
-            .on_hover_text("Stop after the current job finishes")
-            .clicked()
+        let can_pause = st.running && !st.paused;
+        if kit_button(
+            ui,
+            pal,
+            ButtonKind::Outline,
+            Some(Icon::Pause),
+            "Pause",
+            can_pause,
+        )
+        .on_hover_text("Stop after the current job finishes")
+        .clicked()
+            && can_pause
         {
             actions.push(Action::Pause);
         }
-        if icon_text_button(ui, pal, Icon::Play, "Resume", st.paused)
-            .on_hover_text("Clear the pause and continue")
-            .clicked()
+        if kit_button(
+            ui,
+            pal,
+            ButtonKind::Outline,
+            Some(Icon::Play),
+            "Resume",
+            st.paused,
+        )
+        .on_hover_text("Clear the pause and continue")
+        .clicked()
+            && st.paused
         {
             actions.push(Action::Resume);
         }
         let watch_set = !data.settings.watch_folder.as_os_str().is_empty();
-        let scan = icon_text_button(ui, pal, Icon::Folder, "Scan watch folder", watch_set);
+        let scan = kit_button(
+            ui,
+            pal,
+            ButtonKind::Outline,
+            Some(Icon::Folder),
+            "Scan watch folder",
+            watch_set,
+        );
         let scan = if watch_set {
             scan.on_hover_text(format!(
                 "Import new .nzb files from {}",
@@ -274,50 +341,90 @@ fn queue_tab(
         } else {
             scan.on_hover_text("Set a watch folder in Settings, Downloads first")
         };
-        if scan.clicked() {
+        if scan.clicked() && watch_set {
             actions.push(Action::ScanWatch);
         }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             let (text, ok) = connection_text(&data.settings, st.running);
-            let (fg, bg) = if ok {
-                (pal.positive, pal.positive_soft)
+            let status = if ok { Status::Ok } else { Status::Warn };
+            if status_chip_width(ui, &text) <= ui.available_width() {
+                status_chip(ui, pal, status, &text);
             } else {
-                (pal.warning, pal.warning_soft)
-            };
-            pill(ui, &text, fg, bg);
+                // Narrow windows: the state word alone, the details on hover.
+                let short = text.split(" · ").next().unwrap_or(&text).to_owned();
+                status_chip(ui, pal, status, &short).on_hover_text(text);
+            }
         });
     });
-    ui.add_space(8.0);
+    ui.add_space(10.0);
 
     if data.jobs.is_empty() {
-        ui.add_space(40.0);
+        ui.add_space(36.0);
         ui.vertical_centered(|ui| {
+            article_grid(ui, pal);
+            ui.add_space(18.0);
             ui.label(RichText::new(EMPTY_QUEUE).size(14.0).color(pal.muted));
-            ui.add_space(8.0);
-            if ui.button("Open NZB…").clicked() {
+            ui.add_space(12.0);
+            if kit_button(
+                ui,
+                pal,
+                ButtonKind::Outline,
+                Some(Icon::OpenNzb),
+                "Open NZB…",
+                true,
+            )
+            .clicked()
+            {
                 actions.push(Action::ShowOpenNzb);
             }
         });
         return;
     }
 
+    let (progress_w, min_width) = table_widths(ui.available_width(), ui.spacing().item_spacing.x);
+    if min_width > ui.available_width() + 0.5 {
+        egui::ScrollArea::horizontal()
+            .id_salt("queue-hscroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.set_min_width(min_width);
+                queue_table(ui, pal, data, view, actions, progress_w);
+            });
+    } else {
+        queue_table(ui, pal, data, view, actions, progress_w);
+    }
+}
+
+fn queue_table(
+    ui: &mut Ui,
+    pal: &Palette,
+    data: &Data,
+    view: &mut ViewState,
+    actions: &mut Vec<Action>,
+    progress_w: f32,
+) {
     let jobs = sorted(&data.jobs, view.queue.sort, view.queue.descending);
-    let progress_w = 230.0;
     TableBuilder::new(ui)
         .id_salt("queue-table")
         .striped(true)
         .resizable(false)
         .cell_layout(Layout::left_to_right(Align::Center))
-        .column(Column::exact(44.0))
-        .column(Column::remainder().at_least(160.0).clip(true))
-        .column(Column::exact(100.0))
-        .column(Column::exact(84.0))
+        .column(Column::exact(ID_W))
+        .column(Column::remainder().at_least(NAME_MIN).clip(true))
+        .column(Column::exact(STATE_W))
+        .column(Column::exact(SIZE_W))
         .column(Column::exact(progress_w))
-        .column(Column::exact(150.0))
+        .column(Column::exact(ACTIONS_W))
         .header(24.0, |mut h| {
             for t in ["#", "Name", "State", "Size", "Progress", ""] {
                 h.col(|ui| {
-                    ui.label(RichText::new(t).small().strong().color(pal.muted));
+                    let job = spaced(
+                        &t.to_uppercase(),
+                        fonts::mono_id(11.0),
+                        pal.faint,
+                        EYEBROW_TRACKING,
+                    );
+                    ui.add(egui::Label::new(job).selectable(false));
                 });
             }
         })
@@ -327,8 +434,8 @@ fn queue_tab(
                     row.col(|ui| {
                         ui.label(
                             RichText::new(job.id.to_string())
-                                .monospace()
-                                .color(pal.muted),
+                                .font(fonts::mono_id(12.0))
+                                .color(pal.faint),
                         );
                     });
                     row.col(|ui| name_cell(ui, pal, job, view.queue.highlight == Some(job.id)));
@@ -339,7 +446,11 @@ fn queue_tab(
                         }
                     });
                     row.col(|ui| {
-                        ui.label(RichText::new(format::bytes(job.bytes_total)).color(pal.text));
+                        ui.label(
+                            RichText::new(format::bytes(job.bytes_total))
+                                .font(fonts::mono_id(12.0))
+                                .color(pal.text),
+                        );
                     });
                     row.col(|ui| progress_cell(ui, pal, data, job, progress_w - 8.0));
                     row.col(|ui| actions_cell(ui, pal, job, &mut view.queue, actions));
@@ -364,15 +475,14 @@ fn name_cell(ui: &mut Ui, pal: &Palette, job: &Job, highlight: bool) {
 
 fn progress_cell(ui: &mut Ui, pal: &Palette, data: &Data, job: &Job, width: f32) {
     let done = data.shown_done(job);
+    // Segment cells fill in the accent; a failed job's cells take the error color.
     let color = match job.state {
-        JobState::Done => pal.positive,
         JobState::Failed => pal.negative,
-        JobState::Paused => pal.warning,
         _ => pal.accent,
     };
     ui.vertical(|ui| {
-        ui.spacing_mut().item_spacing.y = 3.0;
-        progress_bar(
+        ui.spacing_mut().item_spacing.y = 4.0;
+        segment_track(
             ui,
             pal,
             format::fraction(done, job.bytes_total),
@@ -386,7 +496,7 @@ fn progress_cell(ui: &mut Ui, pal: &Palette, data: &Data, job: &Job, width: f32)
                 format::bytes(done),
                 format::bytes(job.bytes_total)
             ))
-            .small()
+            .font(fonts::mono_id(11.0))
             .color(pal.muted),
         );
     });
@@ -434,7 +544,7 @@ fn actions_cell(
             ui,
             pal,
             Icon::Retry,
-            pal.text,
+            pal.muted,
             "Retry (completed files are kept)",
         )
         .clicked()
@@ -448,7 +558,7 @@ fn actions_cell(
             "Set archive password"
         };
         let color = if job.password.is_some() {
-            pal.accent_fg
+            pal.text
         } else {
             pal.muted
         };
@@ -461,7 +571,7 @@ fn actions_cell(
     } else {
         "Remove from the queue"
     };
-    if icon_button(ui, pal, Icon::Close, pal.negative, tip).clicked() {
+    if icon_button(ui, pal, Icon::Close, pal.muted, tip).clicked() {
         q.confirm_remove = Some(job.id);
     }
 }
@@ -499,6 +609,20 @@ mod tests {
         assert_eq!(ids(sorted(&jobs, SortKey::Name, false)), vec![2, 1, 3]);
         assert_eq!(ids(sorted(&jobs, SortKey::Size, false)), vec![2, 3, 1]);
         assert_eq!(ids(sorted(&jobs, SortKey::State, false)), vec![2, 3, 1]);
+    }
+
+    #[test]
+    fn queue_table_fits_the_minimum_window() {
+        // 960 px window, default 220 px sidebar, 10 px panel margins: about 720 px.
+        let (progress, min) = table_widths(720.0, 8.0);
+        assert!(min <= 720.0 + 0.5, "{min}");
+        assert!((PROGRESS_MIN..=PROGRESS_MAX).contains(&progress));
+        // Wide windows get the full progress column.
+        assert_eq!(table_widths(1400.0, 8.0).0, PROGRESS_MAX);
+        // Too narrow (widened sidebar): the minimum is reported so the table can scroll.
+        let (p, min) = table_widths(560.0, 8.0);
+        assert_eq!(p, PROGRESS_MIN);
+        assert!(min > 560.0);
     }
 
     #[test]

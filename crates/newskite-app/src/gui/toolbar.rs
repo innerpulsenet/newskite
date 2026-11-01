@@ -1,15 +1,93 @@
-//! Toolbar (outline §6.1) and the inline Open NZB field.
+//! Toolbar (outline §6.1) with the masthead, and the inline Open NZB field.
 
-use std::path::PathBuf;
-
-use eframe::egui::{self, Align, Layout, RichText, TextEdit, Ui};
+use eframe::egui::{self, Align, Layout, Pos2, Rect, RichText, Sense, Stroke, TextEdit, Ui, Vec2};
+use newskite_types::Settings;
 
 use super::app::{Action, Data, Tab, ViewState};
+use super::brand;
+use super::fonts;
+use super::icons;
 use super::theme::Palette;
-use super::widgets::{icon_button, paint_icon, tool_button, Icon, ToolState};
+use super::widgets::{error_line, icon_button, paint_icon, spaced, tool_button, Icon, ToolState};
 
 /// Width below which toolbar labels are hidden (icons + tooltips only).
-const LABEL_MIN_WIDTH: f32 = 1180.0;
+const LABEL_MIN_WIDTH: f32 = 1240.0;
+/// Side of the masthead mark (whole-pixel bars at 1× and 2×).
+pub const MASTHEAD_MARK: f32 = 24.0;
+/// Width of the masthead wordmark (≈ 18.5 px Syne: the mark is 1.3× its font size).
+const WORDMARK_W: f32 = 128.0;
+/// Longest server address the readout shows before eliding.
+const READOUT_HOST_MAX: usize = 26;
+
+/// The masthead's mono readout: true facts about the connection Newskite would use,
+/// e.g. `NNTP · NEWS.EXAMPLE.NET:563 TLS · 12 CONN`, or `NO SERVER`.
+pub fn masthead_readout(settings: &Settings) -> String {
+    match settings.first_usable_server() {
+        None => "NO SERVER".to_owned(),
+        Some(s) => {
+            let addr = s.address();
+            let addr: String = if addr.chars().count() > READOUT_HOST_MAX {
+                let cut: String = addr.chars().take(READOUT_HOST_MAX - 1).collect();
+                format!("{cut}…")
+            } else {
+                addr
+            };
+            format!(
+                "NNTP · {} {} · {} CONN",
+                addr,
+                if s.tls { "TLS" } else { "PLAIN" },
+                settings.effective_connections()
+            )
+            .to_uppercase()
+        }
+    }
+}
+
+/// The masthead: the live mark beside the product wordmark, the readout under the
+/// wordmark. A click opens About.
+fn masthead(
+    ui: &mut Ui,
+    pal: &Palette,
+    data: &Data,
+    view: &ViewState,
+    row_h: f32,
+) -> egui::Response {
+    let readout = masthead_readout(&data.settings);
+    let job = spaced(&readout, fonts::mono_id(11.0), pal.muted, 0.66);
+    let galley = ui.painter().layout_job(job);
+    let (_, _, bw, bh) = icons::WORDMARK_BOX;
+    let wm_h = WORDMARK_W * bh / bw;
+    let gap = 9.0;
+    let block_w = WORDMARK_W.max(galley.size().x);
+    let size = Vec2::new(MASTHEAD_MARK + gap + block_w + 4.0, row_h);
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        if resp.has_focus() {
+            super::widgets::focus_ring(ui, pal, rect.shrink(2.0), 4);
+        }
+        let mark = Rect::from_center_size(
+            Pos2::new(rect.left() + MASTHEAD_MARK / 2.0, rect.center().y),
+            Vec2::splat(MASTHEAD_MARK),
+        );
+        brand::paint_mark(painter, mark, &view.masthead_mark, pal.mark);
+        let block_h = wm_h + 5.0 + galley.size().y;
+        let top = (rect.center().y - block_h / 2.0).round();
+        let x = rect.left() + MASTHEAD_MARK + gap;
+        let wm = Rect::from_min_size(Pos2::new(x, top), Vec2::new(WORDMARK_W, wm_h));
+        icons::paint_svg(painter, icons::WORDMARK_URI, wm, pal.text);
+        painter.galley(Pos2::new(x, top + wm_h + 5.0), galley, pal.muted);
+    }
+    resp.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Button,
+            true,
+            format!("Newskite · {readout}"),
+        )
+    });
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text("About Newskite")
+}
 
 const NOT_YET: &str =
     "Not available yet: browsing needs a Newznab indexer, which is not configured.";
@@ -23,8 +101,22 @@ pub fn show(
     actions: &mut Vec<Action>,
 ) {
     let labels = ui.ctx().content_rect().width() >= LABEL_MIN_WIDTH;
+    let row_h = if labels { 50.0 } else { 36.0 };
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 2.0;
+        if masthead(ui, pal, data, view, row_h).clicked() {
+            actions.push(Action::OpenAbout);
+        }
+        // A hairline between the signature and the controls.
+        let (sep, _) = ui.allocate_exact_size(Vec2::new(21.0, row_h), Sense::hover());
+        let x = sep.center().x.round() + 0.5;
+        ui.painter().line_segment(
+            [
+                Pos2::new(x, sep.top() + row_h * 0.22),
+                Pos2::new(x, sep.bottom() - row_h * 0.22),
+            ],
+            Stroke::new(1.0, pal.border),
+        );
         let t = |ui: &mut Ui, icon, label: &str, state, tip: &str| {
             tool_button(ui, pal, icon, label, labels, state).on_hover_text(tip)
         };
@@ -180,8 +272,16 @@ fn search_box(ui: &mut Ui, pal: &Palette, view: &mut ViewState, actions: &mut Ve
     );
     let edit = TextEdit::singleline(&mut view.search_text)
         .id_salt("toolbar-search")
-        .hint_text(RichText::new("Search (no indexer configured)").color(pal.muted))
+        .hint_text(
+            RichText::new(if width >= 240.0 {
+                "Search (no indexer configured)"
+            } else {
+                "Search"
+            })
+            .color(pal.muted),
+        )
         .desired_width(width - 30.0)
+        .font(egui::TextStyle::Body)
         .margin(egui::Margin {
             left: 26,
             right: 6,
@@ -196,7 +296,7 @@ fn search_box(ui: &mut Ui, pal: &Palette, view: &mut ViewState, actions: &mut Ve
             egui::vec2(14.0, 14.0),
         ),
         Icon::Search,
-        pal.muted,
+        pal.faint,
     );
     if view.focus_search {
         resp.request_focus();
@@ -234,20 +334,30 @@ fn open_nzb_row(ui: &mut Ui, pal: &Palette, view: &mut ViewState, actions: &mut 
         if browse.clicked() {
             actions.push(Action::BrowseNzb);
         }
-        let path = view.open_nzb.path.trim().to_owned();
+        let text = view.open_nzb.path.trim().to_owned();
         let add = ui.add_enabled(
-            !path.is_empty(),
+            !text.is_empty(),
             egui::Button::new(RichText::new("Add").strong()),
         );
-        if (add.clicked() || submit) && !path.is_empty() {
-            actions.push(Action::AddNzb(PathBuf::from(path)));
+        if (add.clicked() || submit) && !text.is_empty() {
+            // Pasted file:// URIs (as file managers copy them) and ~ paths work too.
+            match crate::launch::path_from_text(&text) {
+                Ok(path) => actions.push(Action::AddNzb(path)),
+                Err(e) => view.open_nzb.error = Some(e),
+            }
         }
         if icon_button(ui, pal, Icon::Close, pal.muted, "Close (Esc)").clicked() {
             view.open_nzb.visible = false;
             view.open_nzb.error = None;
         }
     });
+    if view.open_nzb.importing > 0 {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.label(RichText::new("Importing…").color(pal.muted));
+        });
+    }
     if let Some(err) = &view.open_nzb.error {
-        ui.label(RichText::new(err).color(pal.negative));
+        error_line(ui, pal, err);
     }
 }

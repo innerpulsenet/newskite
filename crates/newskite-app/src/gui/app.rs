@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eframe::egui::{self, Key, KeyboardShortcut, Modifiers};
@@ -15,9 +15,12 @@ use newskite_types::{EngineEvent, Settings};
 use tokio::runtime::Handle;
 use tokio::sync::broadcast::error::RecvError;
 
+use super::appearance::{self, Appearance};
+use super::brand::{self, MarkClock};
+use super::events::{Pending, SharedPending};
 use super::settings::{FolderTarget, SettingsDraft};
 use super::theme::{self, Palette};
-use super::{docks, queue, settings, sidebar, statusbar, toolbar};
+use super::{about, docks, fonts, icons, motion, queue, settings, sidebar, statusbar, toolbar};
 
 /// How often the job list is re-read while a job is downloading (outline §7).
 pub const JOBS_REFRESH: Duration = Duration::from_millis(1500);
@@ -25,8 +28,14 @@ pub const JOBS_REFRESH: Duration = Duration::from_millis(1500);
 pub const LIVE_WINDOW_SECS: usize = 600;
 /// Stored history shown in the graph (seconds).
 pub const HISTORY_SECS: u64 = 24 * 3600;
+/// Share of the window height the 2×2 dock grid starts at (clamped to 260–320 px).
+const GRID_DOCK_SHARE: f32 = 0.46;
+/// How often the stored throughput history is re-read (also after each queue run).
+pub const HISTORY_REFRESH: Duration = Duration::from_secs(60);
 /// Theme watcher poll interval.
 const THEME_POLL: Duration = Duration::from_secs(1);
+/// How often the reduced-motion preference is re-read (when not fixed by the config).
+const MOTION_POLL: Duration = Duration::from_secs(5);
 
 /// Where the theme comes from.
 pub enum ThemeMode {
@@ -45,6 +54,12 @@ pub struct AppConfig {
     /// Spawn the background thread that forwards service events (off in tests that
     /// feed events by hand).
     pub forward_events: bool,
+    /// Where the Appearance choice is stored (`<data dir>/appearance.json`); `None` keeps
+    /// it in memory only (tests).
+    pub appearance_file: Option<PathBuf>,
+    /// Force reduced motion on (`Some(true)`) or off; `None` reads the desktop setting
+    /// and `NEWSKITE_REDUCED_MOTION` (see [`motion`]).
+    pub reduced_motion: Option<bool>,
 }
 
 impl Default for AppConfig {
@@ -53,6 +68,8 @@ impl Default for AppConfig {
             theme: ThemeMode::Desktop,
             notifications: true,
             forward_events: true,
+            appearance_file: None,
+            reduced_motion: None,
         }
     }
 }
@@ -88,6 +105,15 @@ pub enum UiMsg {
         /// Transcript or error text.
         result: Result<String, String>,
     },
+    /// An NZB import (run off the UI thread) finished.
+    NzbImported {
+        /// The imported file.
+        path: PathBuf,
+        /// The new job, or why the import failed.
+        result: Result<Job, String>,
+    },
+    /// A manual watch-folder scan (run off the UI thread) finished.
+    WatchScanned,
 }
 
 /// Something the user asked for this frame; applied after the UI pass so panels only
@@ -140,6 +166,14 @@ pub enum Action {
     FocusSearch,
     /// Write an info line to the message log (harmless placeholder actions).
     Note(String),
+    /// Show the About dialog.
+    OpenAbout,
+    /// Close the About dialog.
+    CloseAbout,
+    /// Open a web page in the browser (the innerpulse credit).
+    OpenUrl(String),
+    /// Wear another theme (Settings › Appearance) and remember the choice.
+    SetAppearance(Appearance),
 }
 
 /// Everything the panels display, refreshed from the service.
@@ -165,6 +199,12 @@ pub struct Data {
     pub live_done: HashMap<i64, u64>,
     /// Seconds left on the auto-shutdown countdown, if one is running.
     pub shutdown_secs: Option<u32>,
+    /// Articles (segments) fetched and decoded this session (`SegmentDone` events).
+    pub articles_fetched: u64,
+    /// Articles reported missing this session (from `FileFailed` events).
+    pub articles_missing: u64,
+    /// Why the stored settings document could not be read, if it could not.
+    pub settings_load_error: Option<String>,
 }
 
 impl Data {
@@ -213,6 +253,12 @@ pub struct ViewState {
     pub settings: Option<SettingsDraft>,
     /// A native dialog is open (prevents stacking dialogs).
     pub dialog_open: bool,
+    /// The About dialog is open.
+    pub about_open: bool,
+    /// The masthead mark's bar heights this frame.
+    pub masthead_mark: [f64; 6],
+    /// The About mark's bar heights this frame.
+    pub about_mark: [f64; 6],
 }
 
 /// The toolbar's inline Open NZB field.
@@ -226,6 +272,8 @@ pub struct OpenNzbState {
     pub focus: bool,
     /// Last import error (shown inline).
     pub error: Option<String>,
+    /// Imports still running in the background.
+    pub importing: usize,
 }
 
 enum ThemeState {
@@ -242,7 +290,18 @@ pub struct NewskiteApp {
     tx: mpsc::Sender<UiMsg>,
     theme_state: ThemeState,
     last_theme_poll: Instant,
-    /// The resolved desktop theme.
+    /// The desktop's theme (or the fixed one), before the Appearance choice.
+    desktop_theme: Theme,
+    /// Settings › Appearance.
+    pub appearance: Appearance,
+    appearance_file: Option<PathBuf>,
+    /// Reduced motion is in effect (the mark rests).
+    pub reduced_motion: bool,
+    fixed_motion: Option<bool>,
+    last_motion_poll: Instant,
+    masthead_clock: MarkClock,
+    about_clock: MarkClock,
+    /// The theme being worn (the desktop's, or an innerpulse theme).
     pub theme: Theme,
     /// Colors derived from [`Self::theme`].
     pub palette: Palette,
@@ -255,6 +314,14 @@ pub struct NewskiteApp {
     notifications: bool,
     /// Jobs already finished when last notified (so only new completions notify).
     finished_seen: HashSet<i64>,
+    /// The body of the last completion notification (also kept when notifications are
+    /// off, so the behavior can be checked).
+    pub last_notice: Option<String>,
+    /// Frequent events folded by the forwarder thread (see [`super::events`]).
+    pending: SharedPending,
+    /// A manual watch-folder scan is running.
+    scanning: bool,
+    last_history_reload: Instant,
 }
 
 fn now_secs() -> i64 {
@@ -267,8 +334,11 @@ fn now_secs() -> i64 {
 impl NewskiteApp {
     /// Creates the app, applies the theme and (optionally) starts the event forwarder.
     pub fn new(ctx: egui::Context, service: Service, rt: Handle, config: AppConfig) -> Self {
+        // Unbounded, but only rare events travel here: the frequent ones are folded into
+        // `pending` by the forwarder, which keeps memory bounded while the UI is away.
         let (tx, rx) = mpsc::channel();
-        let (theme_state, theme) = match config.theme {
+        let pending: SharedPending = Arc::new(Mutex::new(Pending::default()));
+        let (theme_state, desktop_theme) = match config.theme {
             ThemeMode::Desktop => {
                 let hint = ctx.system_theme().map(|t| t == egui::Theme::Dark);
                 let watcher = ThemeWatcher::with_hint(hint);
@@ -277,10 +347,19 @@ impl NewskiteApp {
             }
             ThemeMode::Fixed(t) => (ThemeState::Fixed, t),
         };
+        let appearance = config
+            .appearance_file
+            .as_deref()
+            .map(appearance::load)
+            .unwrap_or_default();
+        let theme = appearance.resolve(&desktop_theme);
+        fonts::install(&ctx);
+        icons::install(&ctx);
         let palette = theme::apply(&ctx, &theme);
+        let reduced_motion = config.reduced_motion.unwrap_or_else(motion::reduced_motion);
 
         if config.forward_events {
-            spawn_forwarder(&service, tx.clone(), ctx.clone());
+            spawn_forwarder(&service, tx.clone(), pending.clone(), ctx.clone());
         }
 
         let mut app = Self {
@@ -291,6 +370,14 @@ impl NewskiteApp {
             tx,
             theme_state,
             last_theme_poll: Instant::now(),
+            desktop_theme,
+            appearance,
+            appearance_file: config.appearance_file,
+            reduced_motion,
+            fixed_motion: config.reduced_motion,
+            last_motion_poll: Instant::now(),
+            masthead_clock: MarkClock::new(),
+            about_clock: MarkClock::new(),
             theme,
             palette,
             data: Data::default(),
@@ -303,11 +390,18 @@ impl NewskiteApp {
                 queue: queue::QueueState::default(),
                 settings: None,
                 dialog_open: false,
+                about_open: false,
+                masthead_mark: brand::rest_heights(),
+                about_mark: brand::rest_heights(),
             },
             actions: Vec::new(),
             last_jobs_reload: Instant::now(),
             notifications: config.notifications,
             finished_seen: HashSet::new(),
+            last_notice: None,
+            pending,
+            scanning: false,
+            last_history_reload: Instant::now(),
         };
         app.reload_all();
         app.finished_seen = app.finished_ids();
@@ -342,11 +436,19 @@ impl NewskiteApp {
     pub fn reload_all(&mut self) {
         self.reload_jobs();
         self.data.bookmarks = self.service.bookmarks();
-        self.data.logs = self.service.logs();
+        // Settings first: reading them logs an unreadable document once, and the log
+        // read after it then includes that line.
         self.data.settings = self.service.settings();
+        self.data.settings_load_error = self.service.settings_load_error();
+        self.data.logs = self.service.logs();
         self.data.status = self.service.status();
-        let since = HISTORY_SECS;
-        self.data.history = self.service.throughput_history(since);
+        self.reload_history();
+    }
+
+    /// Re-reads the stored throughput history (the last [`HISTORY_SECS`]).
+    pub fn reload_history(&mut self) {
+        self.data.history = self.service.throughput_history(HISTORY_SECS);
+        self.last_history_reload = Instant::now();
     }
 
     /// Re-reads jobs and totals.
@@ -370,6 +472,8 @@ impl NewskiteApp {
             let e = self.data.live_done.entry(j.id).or_insert(j.bytes_done);
             *e = (*e).max(j.bytes_done);
         }
+        // A job that is no longer finished (retried) notifies again when it finishes.
+        forget_unfinished(&mut self.finished_seen, &self.data.jobs);
         self.last_jobs_reload = Instant::now();
     }
 
@@ -377,6 +481,19 @@ impl NewskiteApp {
     pub fn drain_messages(&mut self) {
         let mut reload_jobs = false;
         let mut reload_logs = false;
+        let (segments, throughput) = self
+            .pending
+            .lock()
+            .map(|mut p| p.take())
+            .unwrap_or_default();
+        for (job_id, t) in segments {
+            let e = self.data.live_done.entry(job_id).or_insert(0);
+            *e = e.saturating_add(t.bytes);
+            self.data.articles_fetched = self.data.articles_fetched.saturating_add(t.articles);
+        }
+        for (ts, bytes_per_sec) in throughput {
+            self.push_live(ts, bytes_per_sec);
+        }
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
                 UiMsg::Service(ev) => self.on_event(ev, &mut reload_jobs, &mut reload_logs),
@@ -402,6 +519,31 @@ impl NewskiteApp {
                         d.set_test_result(row_id, result);
                     }
                 }
+                UiMsg::NzbImported { path, result } => {
+                    self.view.open_nzb.importing = self.view.open_nzb.importing.saturating_sub(1);
+                    match result {
+                        Ok(job) => {
+                            self.view.open_nzb.error = None;
+                            if self.view.open_nzb.path.trim() == path.display().to_string() {
+                                self.view.open_nzb.path.clear();
+                            }
+                            self.view.tab = Tab::Queue;
+                            self.view.queue.highlight = Some(job.id);
+                            reload_jobs = true;
+                        }
+                        Err(e) => {
+                            // The service already logged the failure; show it inline too.
+                            self.view.open_nzb.visible = true;
+                            self.view.open_nzb.error = Some(e);
+                            reload_logs = true;
+                        }
+                    }
+                }
+                UiMsg::WatchScanned => {
+                    self.scanning = false;
+                    reload_jobs = true;
+                    reload_logs = true;
+                }
             }
         }
         if reload_jobs {
@@ -418,10 +560,16 @@ impl NewskiteApp {
                 EngineEvent::SegmentDone { bytes, .. } => {
                     let e = self.data.live_done.entry(job_id).or_insert(0);
                     *e = e.saturating_add(bytes);
+                    self.data.articles_fetched = self.data.articles_fetched.saturating_add(1);
                 }
-                EngineEvent::FileDone { .. } | EngineEvent::FileFailed { .. } => {
+                EngineEvent::FileFailed { missing, .. } => {
+                    self.data.articles_missing = self
+                        .data
+                        .articles_missing
+                        .saturating_add(missing.len() as u64);
                     *reload_jobs = true
                 }
+                EngineEvent::FileDone { .. } => *reload_jobs = true,
                 EngineEvent::FileStarted { .. } | EngineEvent::Log(_) => {}
             },
             ServiceEvent::JobLog(_) | ServiceEvent::Error(_) => *reload_logs = true,
@@ -430,14 +578,12 @@ impl NewskiteApp {
                 *reload_jobs = true;
                 self.reload_jobs();
                 self.notify_finished();
+                self.reload_history();
             }
             ServiceEvent::Paused | ServiceEvent::Resumed => {}
-            ServiceEvent::Throughput { bytes_per_sec } => {
-                self.data.live.push_back((now_secs(), bytes_per_sec));
-                while self.data.live.len() > LIVE_WINDOW_SECS {
-                    self.data.live.pop_front();
-                }
-            }
+            // Normally folded (and stamped on arrival) by the forwarder; a sample sent
+            // straight to the channel is stamped now.
+            ServiceEvent::Throughput { bytes_per_sec } => self.push_live(now_secs(), bytes_per_sec),
             ServiceEvent::ShutdownCountdown { secs_left } => {
                 self.data.shutdown_secs = Some(secs_left)
             }
@@ -445,54 +591,66 @@ impl NewskiteApp {
         }
     }
 
+    /// Appends a live throughput sample (oldest dropped past the window).
+    fn push_live(&mut self, ts: i64, bytes_per_sec: u64) {
+        self.data.live.push_back((ts, bytes_per_sec));
+        while self.data.live.len() > LIVE_WINDOW_SECS {
+            self.data.live.pop_front();
+        }
+    }
+
     /// Desktop notification for jobs that finished since the last one.
     fn notify_finished(&mut self) {
         let now = self.finished_ids();
-        let new: Vec<&Job> = self
-            .data
-            .jobs
-            .iter()
-            .filter(|j| now.contains(&j.id) && !self.finished_seen.contains(&j.id))
-            .collect();
-        let done = new.iter().filter(|j| j.state == JobState::Done).count();
-        let failed = new.len() - done;
-        self.finished_seen = now;
-        if !self.notifications || new.is_empty() {
+        let Some(body) = completion_notice(&self.data.jobs, &self.finished_seen) else {
+            self.finished_seen = now;
             return;
-        }
-        let body = match (done, failed) {
-            (d, 0) => format!("{d} download{} finished", if d == 1 { "" } else { "s" }),
-            (0, f) => format!("{f} download{} failed", if f == 1 { "" } else { "s" }),
-            (d, f) => format!("{d} finished, {f} failed"),
         };
-        desktop_notify(body);
+        self.finished_seen = now;
+        self.last_notice = Some(body.clone());
+        if self.notifications {
+            desktop_notify(body);
+        }
     }
 
     /// Applies queued actions.
     pub fn apply_actions(&mut self) {
         let actions = std::mem::take(&mut self.actions);
+        // Imports parse whole NZB files and touch the store: they run off the UI thread,
+        // one batch per frame so dropped files are queued in the order given.
+        let mut imports = Vec::new();
         for a in actions {
-            self.apply(a);
+            match a {
+                Action::AddNzb(path) => imports.push(path),
+                other => self.apply(other),
+            }
         }
+        if !imports.is_empty() {
+            self.import_nzbs(imports);
+        }
+    }
+
+    /// Imports NZB files on a blocking worker; each result comes back as
+    /// [`UiMsg::NzbImported`].
+    fn import_nzbs(&mut self, paths: Vec<PathBuf>) {
+        self.view.open_nzb.importing += paths.len();
+        let svc = self.service.clone();
+        let tx = self.tx.clone();
+        let ctx = self.ctx.clone();
+        self.rt.spawn_blocking(move || {
+            for path in paths {
+                let result = svc.add_nzb(&path).map_err(|e| e.to_string());
+                if tx.send(UiMsg::NzbImported { path, result }).is_err() {
+                    break;
+                }
+                ctx.request_repaint();
+            }
+        });
     }
 
     fn apply(&mut self, a: Action) {
         match a {
-            Action::AddNzb(path) => match self.service.add_nzb(&path) {
-                Ok(job) => {
-                    self.view.open_nzb.error = None;
-                    self.view.open_nzb.path.clear();
-                    self.view.tab = Tab::Queue;
-                    self.view.queue.highlight = Some(job.id);
-                    self.reload_jobs();
-                }
-                Err(e) => {
-                    // The service already logged the failure; show it inline too.
-                    self.view.open_nzb.visible = true;
-                    self.view.open_nzb.error = Some(e.to_string());
-                    self.data.logs = self.service.logs();
-                }
-            },
+            Action::AddNzb(path) => self.import_nzbs(vec![path]),
             Action::BrowseNzb => self.browse_nzb(),
             Action::BrowseFolder(target) => self.browse_folder(target),
             Action::Start => {
@@ -501,16 +659,29 @@ impl NewskiteApp {
             Action::Pause => self.service.pause(),
             Action::Resume => self.service.resume(),
             Action::ScanWatch => {
-                // Errors are logged by the service.
-                let _ = self.service.scan_watch_folder();
-                self.reload_jobs();
+                // Directory reads and NZB parsing (possibly on a slow network mount) run
+                // off the UI thread. Errors are logged by the service.
+                if !self.scanning {
+                    self.scanning = true;
+                    let svc = self.service.clone();
+                    let tx = self.tx.clone();
+                    let ctx = self.ctx.clone();
+                    self.rt.spawn_blocking(move || {
+                        let _ = svc.scan_watch_folder();
+                        let _ = tx.send(UiMsg::WatchScanned);
+                        ctx.request_repaint();
+                    });
+                }
             }
             Action::RemoveJob(id) => {
                 let _ = self.service.remove_job(id);
                 self.reload_jobs();
             }
             Action::RetryJob(id) => {
-                let _ = self.service.retry_job(id);
+                if self.service.retry_job(id).is_ok() {
+                    // Its next completion is news again.
+                    self.finished_seen.remove(&id);
+                }
                 self.reload_jobs();
             }
             Action::SetJobPassword(id, pw) => {
@@ -518,14 +689,20 @@ impl NewskiteApp {
                 self.reload_jobs();
             }
             Action::AddBookmark(b) => {
-                if self.service.add_bookmark(b).is_ok() {
-                    self.view.sidebar.form = None;
+                match self.service.add_bookmark(b) {
+                    Ok(_) => self.view.sidebar.form = None,
+                    Err(e) => {
+                        if let Some(form) = self.view.sidebar.form.as_mut() {
+                            form.error = Some(format!("Could not add the bookmark: {e}"));
+                        }
+                        self.data.logs = self.service.logs();
+                    }
                 }
-                self.data.bookmarks = self.service.bookmarks();
+                self.reload_bookmarks();
             }
             Action::RemoveBookmark(id) => {
                 let _ = self.service.remove_bookmark(id);
-                self.data.bookmarks = self.service.bookmarks();
+                self.reload_bookmarks();
             }
             Action::ToggleBookmark(id) => {
                 if let Some(b) = self.data.bookmarks.iter().find(|b| b.id == id) {
@@ -533,18 +710,28 @@ impl NewskiteApp {
                     b.expanded = !b.expanded;
                     let _ = self.service.update_bookmark(&b);
                 }
-                self.data.bookmarks = self.service.bookmarks();
+                self.reload_bookmarks();
             }
             Action::OpenSettings => {
                 if self.view.settings.is_none() {
+                    self.view.about_open = false;
                     self.data.settings = self.service.settings();
-                    self.view.settings = Some(SettingsDraft::new(self.data.settings.clone()));
+                    self.data.settings_load_error = self.service.settings_load_error();
+                    let mut draft = SettingsDraft::new(self.data.settings.clone());
+                    draft.appearance = self.appearance;
+                    draft.load_error = self.data.settings_load_error.clone();
+                    self.view.settings = Some(draft);
                 }
             }
             Action::SaveSettings(s) => match self.service.save_settings(*s) {
                 Ok(()) => {
                     self.data.settings = self.service.settings();
-                    self.view.settings = None;
+                    self.data.settings_load_error = self.service.settings_load_error();
+                    // The sheet's appearance is applied with the save, never before it.
+                    if let Some(a) = self.view.settings.take().map(|d| d.appearance) {
+                        self.set_appearance(a);
+                    }
+                    self.data.logs = self.service.logs();
                 }
                 Err(e) => {
                     if let Some(d) = self.view.settings.as_mut() {
@@ -583,6 +770,63 @@ impl NewskiteApp {
                 self.service.log(LogLevel::Info, text);
                 self.data.logs = self.service.logs();
             }
+            Action::OpenAbout => {
+                if self.view.settings.is_none() && !self.view.about_open {
+                    self.view.about_open = true;
+                    self.about_clock.reset();
+                }
+            }
+            Action::CloseAbout => self.view.about_open = false,
+            Action::OpenUrl(url) => {
+                if let Err(e) = open::that_detached(&url) {
+                    self.service.log(
+                        LogLevel::Error,
+                        format!("cannot open {url} in the browser: {e}"),
+                    );
+                    self.data.logs = self.service.logs();
+                }
+            }
+            Action::SetAppearance(a) => self.set_appearance(a),
+        }
+    }
+
+    /// Re-reads the bookmarks; an add form whose parent no longer exists falls back to
+    /// the top level (what its picker already shows).
+    fn reload_bookmarks(&mut self) {
+        self.data.bookmarks = self.service.bookmarks();
+        if let Some(form) = self.view.sidebar.form.as_mut() {
+            if form
+                .parent
+                .is_some_and(|p| !self.data.bookmarks.iter().any(|b| b.id == p))
+            {
+                form.parent = None;
+            }
+        }
+    }
+
+    /// Wears the theme for `a` and stores the choice (a write failure is logged; the
+    /// choice still applies for this session).
+    pub fn set_appearance(&mut self, a: Appearance) {
+        if a != self.appearance {
+            self.appearance = a;
+            self.retheme();
+            if let Some(path) = &self.appearance_file {
+                if let Err(e) = appearance::save(path, a) {
+                    self.service.log(
+                        LogLevel::Error,
+                        format!("cannot save the appearance to {}: {e}", path.display()),
+                    );
+                    self.data.logs = self.service.logs();
+                }
+            }
+        }
+    }
+
+    fn retheme(&mut self) {
+        let t = self.appearance.resolve(&self.desktop_theme);
+        if t != self.theme {
+            self.palette = theme::apply(&self.ctx, &t);
+            self.theme = t;
         }
     }
 
@@ -666,9 +910,54 @@ impl NewskiteApp {
             w.set_prefers_dark_hint(ctx.system_theme().map(|t| t == egui::Theme::Dark));
             if let Some(t) = w.poll_changed() {
                 tracing::info!(source = ?t.source, dark = t.dark, "desktop theme changed");
-                self.palette = theme::apply(ctx, &t);
-                self.theme = t;
+                self.desktop_theme = t;
+                self.retheme();
             }
+        }
+        if self.fixed_motion.is_none() && self.last_motion_poll.elapsed() >= MOTION_POLL {
+            self.last_motion_poll = Instant::now();
+            self.reduced_motion = motion::reduced_motion();
+        }
+    }
+
+    /// The masthead's working tempo: a beat every 1.2 s while bytes move, every 2.4 s
+    /// while a job is active without traffic (connecting, waiting), none otherwise.
+    pub fn working_tempo(&self) -> Option<f64> {
+        let st = &self.data.status;
+        let active = (st.running && !st.paused)
+            || self
+                .data
+                .jobs
+                .iter()
+                .any(|j| j.state == JobState::Downloading);
+        if !active {
+            None
+        } else if self.data.speed() > 0 {
+            Some(brand::PERIOD_BUSY)
+        } else {
+            Some(brand::PERIOD_CALM)
+        }
+    }
+
+    /// Advances the marks and schedules the next repaint only while one moves.
+    fn animate_marks(&mut self, ctx: &egui::Context) {
+        let now = ctx.input(|i| i.time);
+        let tempo = self.working_tempo();
+        let (h, next) = self.masthead_clock.frame(now, tempo, self.reduced_motion);
+        self.view.masthead_mark = h;
+        let mut wake = next;
+        if self.view.about_open {
+            let (h, next) =
+                self.about_clock
+                    .frame(now, Some(brand::PERIOD_AMBIENT), self.reduced_motion);
+            self.view.about_mark = h;
+            wake = match (wake, next) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+        }
+        if let Some(d) = wake {
+            ctx.request_repaint_after(d);
         }
     }
 
@@ -705,6 +994,8 @@ impl NewskiteApp {
         if esc {
             if self.view.settings.is_some() {
                 self.actions.push(Action::CloseSettings);
+            } else if self.view.about_open {
+                self.actions.push(Action::CloseAbout);
             } else if self.view.open_nzb.visible {
                 self.view.open_nzb.visible = false;
                 self.view.open_nzb.error = None;
@@ -714,6 +1005,13 @@ impl NewskiteApp {
 
     /// One frame: drain events, lay out every panel, apply actions.
     pub fn ui(&mut self, ctx: &egui::Context) {
+        if !fonts::ready(ctx) {
+            // The brand faces were installed during this frame (headless harnesses create
+            // the app mid-frame); draw from the next one.
+            fonts::install(ctx);
+            ctx.request_repaint();
+            return;
+        }
         self.drain_messages();
         self.poll_theme(ctx);
         self.data.status = self.service.status();
@@ -727,8 +1025,13 @@ impl NewskiteApp {
         {
             self.reload_jobs();
         }
+        // The stored "last 24 h" moves on while the window is open.
+        if self.last_history_reload.elapsed() >= HISTORY_REFRESH {
+            self.reload_history();
+        }
         self.shortcuts(ctx);
         self.dropped_files(ctx);
+        self.animate_marks(ctx);
 
         let mut actions = Vec::new();
         let pal = self.palette;
@@ -753,12 +1056,20 @@ impl NewskiteApp {
                     .inner_margin(egui::Margin::symmetric(10, 3))
                     .stroke(egui::Stroke::new(1.0, pal.border)),
             )
-            .show(ctx, |ui| statusbar::show(ui, &pal, &self.data));
+            .show(ctx, |ui| {
+                statusbar::show(ui, &pal, &self.data, &mut actions)
+            });
 
-        // One panel id per arrangement so each keeps its own (user-resizable) height.
+        // One panel id per arrangement so each keeps its own (user-resizable) height. The
+        // 2×2 grid starts at a share of the window height, so a 600 px window still leaves
+        // the queue a few rows.
+        let window_h = ctx.content_rect().height();
         let (dock_id, dock_h) = match docks::layout_for(width) {
             docks::DockLayout::Row => ("docks-row", 210.0),
-            docks::DockLayout::Grid => ("docks-grid", 320.0),
+            docks::DockLayout::Grid => (
+                "docks-grid",
+                (window_h * GRID_DOCK_SHARE).clamp(260.0, 320.0),
+            ),
             docks::DockLayout::Stack => ("docks-stack", 260.0),
         };
         egui::TopBottomPanel::bottom(dock_id)
@@ -802,12 +1113,15 @@ impl NewskiteApp {
 
         if let Some(draft) = self.view.settings.as_mut() {
             settings::show(ctx, &pal, draft, self.view.dialog_open, &mut actions);
+        } else if self.view.about_open {
+            about::show(ctx, &pal, &self.view.about_mark, &mut actions);
         }
 
         self.actions.extend(actions);
         self.apply_actions();
 
-        // Keep ticking: theme polling and periodic refresh while downloading.
+        // Keep ticking: theme polling and periodic refresh while downloading. (The marks
+        // ask for frame-rate repaints themselves, and only while they move.)
         ctx.request_repaint_after(if self.data.status.running {
             Duration::from_millis(500)
         } else {
@@ -817,11 +1131,18 @@ impl NewskiteApp {
 }
 
 fn shutdown_banner(ui: &mut egui::Ui, pal: &Palette, secs: u32, actions: &mut Vec<Action>) {
-    egui::Frame::new()
-        .fill(pal.warning_soft)
-        .stroke(egui::Stroke::new(1.0, pal.warning))
-        .corner_radius(egui::CornerRadius::same(6))
-        .inner_margin(egui::Margin::symmetric(10, 6))
+    // A notice in the flow: surface 1, a hairline and a 2 px warning rule at the left edge
+    // (status colors never fill).
+    let shown = egui::Frame::new()
+        .fill(pal.raised)
+        .stroke(egui::Stroke::new(1.0, pal.border))
+        .corner_radius(egui::CornerRadius {
+            nw: 0,
+            sw: 0,
+            ne: 4,
+            se: 4,
+        })
+        .inner_margin(egui::Margin::symmetric(12, 6))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 let text = if secs == 0 {
@@ -837,6 +1158,14 @@ fn shutdown_banner(ui: &mut egui::Ui, pal: &Palette, secs: u32, actions: &mut Ve
                 });
             });
         });
+    let r = shown.response.rect;
+    ui.painter().line_segment(
+        [
+            egui::pos2(r.left() + 1.0, r.top()),
+            egui::pos2(r.left() + 1.0, r.bottom()),
+        ],
+        egui::Stroke::new(2.0, pal.warning),
+    );
     ui.add_space(6.0);
 }
 
@@ -854,33 +1183,46 @@ impl eframe::App for NewskiteApp {
     }
 }
 
-/// Forwards service events to the UI thread and wakes it. SegmentDone is frequent, so
-/// it only schedules a repaint within 100 ms instead of an immediate one.
-fn spawn_forwarder(service: &Service, tx: mpsc::Sender<UiMsg>, ctx: egui::Context) {
+/// Forwards service events to the UI thread and wakes it. The frequent ones are folded
+/// into `pending` (segments summed per job, throughput stamped on arrival; see
+/// [`super::events`]) and only schedule a repaint within 100 ms; the rest travel through
+/// the channel and wake the UI at once.
+fn spawn_forwarder(
+    service: &Service,
+    tx: mpsc::Sender<UiMsg>,
+    pending: SharedPending,
+    ctx: egui::Context,
+) {
     let mut rx = service.subscribe();
     let spawned = std::thread::Builder::new()
         .name("newskite-ui-events".into())
         .spawn(move || loop {
             let msg = match rx.blocking_recv() {
+                Ok(ServiceEvent::Engine {
+                    job_id,
+                    event: EngineEvent::SegmentDone { bytes, .. },
+                }) => {
+                    if let Ok(mut p) = pending.lock() {
+                        p.add_segment(job_id, bytes);
+                    }
+                    ctx.request_repaint_after(Duration::from_millis(100));
+                    continue;
+                }
+                Ok(ServiceEvent::Throughput { bytes_per_sec }) => {
+                    if let Ok(mut p) = pending.lock() {
+                        p.add_throughput(now_secs(), bytes_per_sec);
+                    }
+                    ctx.request_repaint();
+                    continue;
+                }
                 Ok(ev) => UiMsg::Service(ev),
                 Err(RecvError::Lagged(_)) => UiMsg::Resync,
                 Err(RecvError::Closed) => break,
             };
-            let frequent = matches!(
-                &msg,
-                UiMsg::Service(ServiceEvent::Engine {
-                    event: EngineEvent::SegmentDone { .. },
-                    ..
-                })
-            );
             if tx.send(msg).is_err() {
                 break;
             }
-            if frequent {
-                ctx.request_repaint_after(Duration::from_millis(100));
-            } else {
-                ctx.request_repaint();
-            }
+            ctx.request_repaint();
         });
     if let Err(e) = spawned {
         service.log(
@@ -888,6 +1230,34 @@ fn spawn_forwarder(service: &Service, tx: mpsc::Sender<UiMsg>, ctx: egui::Contex
             format!("cannot start the UI event thread: {e}"),
         );
     }
+}
+
+/// Drops from `seen` the jobs that are no longer done or failed (retried, removed), so
+/// their next completion notifies again.
+fn forget_unfinished(seen: &mut HashSet<i64>, jobs: &[Job]) {
+    seen.retain(|id| {
+        jobs.iter()
+            .any(|j| j.id == *id && matches!(j.state, JobState::Done | JobState::Failed))
+    });
+}
+
+/// The notification text for jobs finished (done or failed) and not yet in `seen`, if
+/// there are any.
+fn completion_notice(jobs: &[Job], seen: &HashSet<i64>) -> Option<String> {
+    let new: Vec<&Job> = jobs
+        .iter()
+        .filter(|j| matches!(j.state, JobState::Done | JobState::Failed) && !seen.contains(&j.id))
+        .collect();
+    if new.is_empty() {
+        return None;
+    }
+    let done = new.iter().filter(|j| j.state == JobState::Done).count();
+    let failed = new.len() - done;
+    Some(match (done, failed) {
+        (d, 0) => format!("{d} download{} finished", if d == 1 { "" } else { "s" }),
+        (0, f) => format!("{f} download{} failed", if f == 1 { "" } else { "s" }),
+        (d, f) => format!("{d} finished, {f} failed"),
+    })
 }
 
 /// Shows a desktop notification (Linux/BSD); a no-op elsewhere. Runs on its own thread
@@ -912,5 +1282,63 @@ fn desktop_notify(body: String) {
     #[cfg(not(all(unix, not(target_os = "macos"))))]
     {
         tracing::debug!("queue finished: {body}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn job(id: i64, state: JobState) -> Job {
+        Job {
+            id,
+            name: format!("j{id}"),
+            state,
+            bytes_total: 1,
+            bytes_done: 0,
+            dest_dir: PathBuf::new(),
+            source_path: PathBuf::new(),
+            created_at: id,
+            error: None,
+            password: None,
+        }
+    }
+
+    #[test]
+    fn a_retried_job_notifies_when_it_finishes_again() {
+        // Run 1 ends with the job failed: notified, then remembered.
+        let mut seen = HashSet::new();
+        let jobs = vec![job(1, JobState::Failed)];
+        assert_eq!(
+            completion_notice(&jobs, &seen).as_deref(),
+            Some("1 download failed")
+        );
+        seen.insert(1);
+        assert_eq!(completion_notice(&jobs, &seen), None);
+        // Retry: queued again, so it is forgotten...
+        let jobs = vec![job(1, JobState::Queued)];
+        forget_unfinished(&mut seen, &jobs);
+        assert!(seen.is_empty());
+        // ...and its completion is news.
+        let jobs = vec![job(1, JobState::Done)];
+        assert_eq!(
+            completion_notice(&jobs, &seen).as_deref(),
+            Some("1 download finished")
+        );
+    }
+
+    #[test]
+    fn notice_counts_done_and_failed() {
+        let jobs = vec![
+            job(1, JobState::Done),
+            job(2, JobState::Done),
+            job(3, JobState::Failed),
+            job(4, JobState::Queued),
+        ];
+        let seen = HashSet::from([1]);
+        assert_eq!(
+            completion_notice(&jobs, &seen).as_deref(),
+            Some("1 finished, 1 failed")
+        );
     }
 }

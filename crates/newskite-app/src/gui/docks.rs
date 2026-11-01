@@ -4,16 +4,20 @@ use eframe::egui::{self, Pos2, Rect, RichText, Sense, Shape, Stroke, Ui};
 use newskite_service::{LogLevel, LogLine};
 use newskite_types::format;
 
-use super::app::{Action, Data, LIVE_WINDOW_SECS};
+use super::app::{Action, Data, HISTORY_SECS, LIVE_WINDOW_SECS};
+use super::fonts;
 use super::theme::Palette;
-use super::widgets::{card, kv, section_title};
+use super::widgets::{card, kit_button, section_title, ButtonKind, Icon};
 
 /// Width at which the four docks sit side by side.
 pub const FOUR_COLUMN_MIN: f32 = 1100.0;
 /// Width at which the docks form a 2×2 grid (below: one column).
 pub const TWO_COLUMN_MIN: f32 = 960.0;
-/// Maximum number of points drawn for the stored history trace.
+/// Time buckets of the stored history trace (24 h / 160 = 9 min each).
 const HISTORY_POINTS: usize = 160;
+/// Vertical room a dock card takes beyond its content height: the 12 px inner margin on
+/// both sides and the hairline.
+const CARD_CHROME: f32 = 26.0;
 
 /// Dock arrangement for a given window width.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,6 +55,32 @@ pub fn downsample(values: &[u64], max_points: usize) -> Vec<f32> {
         .chunks(chunk)
         .map(|c| (c.iter().map(|&v| v as f64).sum::<f64>() / c.len() as f64) as f32)
         .collect()
+}
+
+/// Mean throughput (bytes/s) of each of `buckets` equal time slices of the `window_secs`
+/// ending at `now`. Samples hold the bytes of one second, keyed by time; seconds without
+/// a sample were idle and count as zero, so a short burst stays short and gaps stay
+/// visible. Samples outside the window are ignored.
+pub fn history_buckets(
+    samples: &[(i64, u64)],
+    now: i64,
+    window_secs: i64,
+    buckets: usize,
+) -> Vec<f32> {
+    if buckets == 0 || window_secs <= 0 {
+        return Vec::new();
+    }
+    let start = now - window_secs;
+    let mut sums = vec![0.0_f64; buckets];
+    for &(ts, bytes) in samples {
+        if ts < start || ts > now {
+            continue;
+        }
+        let i = (((ts - start) as i128 * buckets as i128) / window_secs as i128) as usize;
+        sums[i.min(buckets - 1)] += bytes as f64;
+    }
+    let bucket_secs = window_secs as f64 / buckets as f64;
+    sums.into_iter().map(|s| (s / bucket_secs) as f32).collect()
 }
 
 fn y_for(v: f32, rect: Rect, y_max: f32) -> f32 {
@@ -147,9 +177,12 @@ fn dock(
     data: &Data,
     which: Dock,
     height: f32,
+    compact: bool,
     actions: &mut Vec<Action>,
 ) {
     card(pal).show(ui, |ui| {
+        // An exact height: every card of a row lines up, and content that does not fit
+        // scrolls inside its card instead of pushing the next row down.
         ui.set_min_height(height);
         ui.set_max_height(height.max(60.0));
         ui.set_width(ui.available_width());
@@ -157,11 +190,25 @@ fn dock(
         ui.add_space(4.0);
         match which {
             Dock::Graph => graph(ui, pal, data),
-            Dock::Activity => activity(ui, pal, data, actions),
             Dock::Messages => messages(ui, pal, &data.logs),
-            Dock::Account => account(ui, pal, data),
+            Dock::Activity | Dock::Account => {
+                egui::ScrollArea::vertical()
+                    .id_salt(("dock-body", which.title()))
+                    .auto_shrink([false, false])
+                    .max_height(ui.available_height().max(20.0))
+                    .show(ui, |ui| match which {
+                        Dock::Activity => activity(ui, pal, data, compact, actions),
+                        _ => account(ui, pal, data, compact),
+                    });
+            }
         }
     });
+}
+
+/// Content height of each dock card in the 2×2 grid for a dock panel `available`
+/// tall: two rows of cards (each with its [`CARD_CHROME`]) and the gap between them.
+pub fn grid_card_height(available: f32, gap: f32) -> f32 {
+    ((available - 2.0 * CARD_CHROME - gap) / 2.0).max(80.0)
 }
 
 /// Draws the four docks in the arrangement that fits the available width.
@@ -169,22 +216,23 @@ pub fn show(ui: &mut Ui, pal: &Palette, data: &Data, actions: &mut Vec<Action>) 
     let width = ui.ctx().content_rect().width();
     match layout_for(width) {
         DockLayout::Row => {
-            let h = (ui.available_height() - 22.0).max(80.0);
+            let h = (ui.available_height() - CARD_CHROME).max(80.0);
             ui.columns(4, |cols| {
                 for (col, which) in cols.iter_mut().zip(Dock::ALL) {
-                    dock(col, pal, data, which, h, actions);
+                    dock(col, pal, data, which, h, false, actions);
                 }
             });
         }
         DockLayout::Grid => {
-            let h = ((ui.available_height() - 40.0) / 2.0).max(120.0);
+            let gap = ui.spacing().item_spacing.y;
+            let h = grid_card_height(ui.available_height(), gap);
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     for pair in Dock::ALL.chunks(2) {
                         ui.columns(2, |cols| {
                             for (col, which) in cols.iter_mut().zip(pair.iter().copied()) {
-                                dock(col, pal, data, which, h, actions);
+                                dock(col, pal, data, which, h, true, actions);
                             }
                         });
                     }
@@ -195,11 +243,39 @@ pub fn show(ui: &mut Ui, pal: &Palette, data: &Data, actions: &mut Vec<Action>) 
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     for which in Dock::ALL {
-                        dock(ui, pal, data, which, 110.0, actions);
+                        dock(ui, pal, data, which, 110.0, false, actions);
                     }
                 });
         }
     }
+}
+
+/// Key/value readings in a grid: one pair per row, or two side by side when `compact`
+/// (the 2×2 dock grid, where height is short and width is not).
+fn readings(
+    ui: &mut Ui,
+    pal: &Palette,
+    id: &str,
+    rows: &[(&str, String, egui::Color32)],
+    compact: bool,
+) {
+    let per_row = if compact { 2 } else { 1 };
+    egui::Grid::new(id)
+        .num_columns(2 * per_row)
+        .spacing([10.0, 4.0])
+        .show(ui, |ui| {
+            for chunk in rows.chunks(per_row) {
+                for (key, value, color) in chunk {
+                    ui.label(RichText::new(*key).color(pal.muted));
+                    ui.label(
+                        RichText::new(value)
+                            .font(fonts::mono_id(12.0))
+                            .color(*color),
+                    );
+                }
+                ui.end_row();
+            }
+        });
 }
 
 fn now_secs() -> i64 {
@@ -215,14 +291,13 @@ fn graph(ui: &mut Ui, pal: &Palette, data: &Data) {
     ui.horizontal(|ui| {
         ui.label(
             RichText::new(format::speed(data.speed()))
-                .size(17.0)
-                .strong()
-                .color(pal.accent_fg),
+                .font(egui::FontId::new(17.0, fonts::mono_semibold()))
+                .color(pal.text),
         );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.label(
                 RichText::new(format!("Remaining: {pending} / {total} jobs"))
-                    .small()
+                    .font(fonts::mono_id(11.0))
                     .color(pal.muted),
             );
         });
@@ -232,8 +307,13 @@ fn graph(ui: &mut Ui, pal: &Palette, data: &Data) {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), h), Sense::hover());
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, egui::CornerRadius::same(4), pal.sunken);
-    let history_raw: Vec<u64> = data.history.iter().map(|s| s.bytes_down).collect();
-    let history = downsample(&history_raw, HISTORY_POINTS);
+    let now = now_secs();
+    let history = if data.history.is_empty() {
+        Vec::new()
+    } else {
+        let raw: Vec<(i64, u64)> = data.history.iter().map(|s| (s.ts, s.bytes_down)).collect();
+        history_buckets(&raw, now, HISTORY_SECS as i64, HISTORY_POINTS)
+    };
     let live: Vec<(i64, u64)> = data.live.iter().copied().collect();
     let peak = history
         .iter()
@@ -248,7 +328,7 @@ fn graph(ui: &mut Ui, pal: &Palette, data: &Data) {
             rect.center(),
             egui::Align2::CENTER_CENTER,
             "No throughput history yet",
-            egui::FontId::proportional(12.0),
+            egui::FontId::proportional(12.5),
             pal.muted,
         );
     } else {
@@ -269,7 +349,7 @@ fn graph(ui: &mut Ui, pal: &Palette, data: &Data) {
                 3.0,
             ));
         }
-        let lp = time_points(&live, now_secs(), LIVE_WINDOW_SECS as i64, inner, y_max);
+        let lp = time_points(&live, now, LIVE_WINDOW_SECS as i64, inner, y_max);
         if lp.len() >= 2 {
             // Soft area under the live trace, then the trace itself.
             let mut area = Vec::with_capacity(lp.len() * 2);
@@ -282,12 +362,12 @@ fn graph(ui: &mut Ui, pal: &Palette, data: &Data) {
                         Pos2::new(b.x, rect.bottom()),
                         Pos2::new(a.x, rect.bottom()),
                     ],
-                    pal.accent.gamma_multiply(0.18),
+                    pal.series.gamma_multiply(0.18),
                     Stroke::NONE,
                 ));
             }
             painter.extend(area);
-            painter.add(Shape::line(lp, Stroke::new(1.8, pal.accent)));
+            painter.add(Shape::line(lp, Stroke::new(1.8, pal.series)));
         }
     }
     let summary = if history.is_empty() && live.is_empty() {
@@ -301,7 +381,7 @@ fn graph(ui: &mut Ui, pal: &Palette, data: &Data) {
     };
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, &summary));
     resp.on_hover_text(format!(
-        "Dashed: stored history (last 24 h, {} samples)\nSolid: live, last {} min\nPeak: {}",
+        "Dashed: stored history, last 24 h ({} samples; idle time at zero)\nSolid: live, last {} min\nPeak: {}",
         data.history.len(),
         LIVE_WINDOW_SECS / 60,
         format::speed(peak as u64)
@@ -319,11 +399,15 @@ fn graph(ui: &mut Ui, pal: &Palette, data: &Data) {
                 format::speed(peak as u64)
             )
         };
-        ui.label(RichText::new(caption).small().color(pal.muted));
+        ui.label(
+            RichText::new(caption)
+                .font(fonts::mono_id(11.0))
+                .color(pal.faint),
+        );
     }
 }
 
-fn activity(ui: &mut Ui, pal: &Palette, data: &Data, actions: &mut Vec<Action>) {
+fn activity(ui: &mut Ui, pal: &Palette, data: &Data, compact: bool, actions: &mut Vec<Action>) {
     let s = &data.settings;
     match s.first_usable_server() {
         None => {
@@ -334,57 +418,76 @@ fn activity(ui: &mut Ui, pal: &Palette, data: &Data, actions: &mut Vec<Action>) 
                     .color(pal.muted),
             );
             ui.add_space(4.0);
-            if ui.button("Open Settings…").clicked() {
+            if kit_button(
+                ui,
+                pal,
+                ButtonKind::Outline,
+                Some(Icon::Gear),
+                "Open settings…",
+                true,
+            )
+            .clicked()
+            {
                 actions.push(Action::OpenSettings);
             }
         }
         Some(server) => {
-            egui::Grid::new("nntp-activity")
-                .num_columns(2)
-                .spacing([10.0, 4.0])
-                .show(ui, |ui| {
-                    kv(ui, pal, "Server", server.address());
-                    kv(
-                        ui,
-                        pal,
-                        "Security",
-                        if server.tls {
-                            "TLS"
-                        } else {
-                            "Plain (unencrypted)"
-                        },
-                    );
-                    kv(
-                        ui,
-                        pal,
-                        "Connections",
-                        format!(
-                            "{} · max {} · using {}",
-                            server.connections,
-                            s.max_connections,
-                            s.effective_connections()
-                        ),
-                    );
-                    kv(
-                        ui,
-                        pal,
-                        "Username",
-                        if server.username.is_empty() {
-                            "(none)".to_owned()
-                        } else {
-                            server.username.clone()
-                        },
-                    );
-                    let others = s.usable_servers().len().saturating_sub(1);
-                    if others > 0 {
-                        kv(
-                            ui,
-                            pal,
-                            "Fail-over",
-                            format!("{others} more server{}", if others == 1 { "" } else { "s" }),
-                        );
+            let others = s.usable_servers().len().saturating_sub(1);
+            let mut rows = vec![
+                ("Server", server.address(), pal.text),
+                (
+                    "Security",
+                    if server.tls {
+                        "TLS"
+                    } else {
+                        "Plain (unencrypted)"
                     }
-                });
+                    .to_owned(),
+                    pal.text,
+                ),
+                (
+                    "Connections",
+                    format!(
+                        "{} · max {} · using {}",
+                        server.connections,
+                        s.max_connections,
+                        s.effective_connections()
+                    ),
+                    pal.text,
+                ),
+                (
+                    "Username",
+                    if server.username.is_empty() {
+                        "(none)".to_owned()
+                    } else {
+                        server.username.clone()
+                    },
+                    pal.text,
+                ),
+                // Real counts from this session's engine events, never estimates.
+                (
+                    "Articles",
+                    format!("{} this session", data.articles_fetched),
+                    pal.text,
+                ),
+                (
+                    "Missing",
+                    data.articles_missing.to_string(),
+                    if data.articles_missing > 0 {
+                        pal.warning
+                    } else {
+                        pal.text
+                    },
+                ),
+            ];
+            if others > 0 {
+                rows.push((
+                    "Fail-over",
+                    format!("{others} more server{}", if others == 1 { "" } else { "s" }),
+                    pal.text,
+                ));
+            }
+            readings(ui, pal, "nntp-activity", &rows, compact);
         }
     }
 }
@@ -421,13 +524,12 @@ fn messages(ui: &mut Ui, pal: &Palette, logs: &[LogLine]) {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(
                         RichText::new(clock(line.ts))
-                            .monospace()
-                            .size(11.0)
-                            .color(pal.muted),
+                            .font(fonts::mono_id(11.0))
+                            .color(pal.faint),
                     );
                     ui.label(
                         RichText::new(&line.text)
-                            .size(12.0)
+                            .font(fonts::mono_id(11.5))
                             .color(level_color(pal, line.level)),
                     );
                 });
@@ -435,27 +537,22 @@ fn messages(ui: &mut Ui, pal: &Palette, logs: &[LogLine]) {
         });
 }
 
-fn account(ui: &mut Ui, pal: &Palette, data: &Data) {
+fn account(ui: &mut Ui, pal: &Palette, data: &Data, compact: bool) {
     let t = &data.totals;
-    egui::Grid::new("account")
-        .num_columns(2)
-        .spacing([10.0, 4.0])
-        .show(ui, |ui| {
-            kv(ui, pal, "Downloaded", format::bytes(t.downloaded_bytes));
-            kv(ui, pal, "Jobs done", t.jobs_done.to_string());
-            kv(ui, pal, "Jobs pending", t.jobs_pending.to_string());
-            if t.jobs_failed > 0 {
-                ui.label(RichText::new("Jobs failed").color(pal.muted));
-                ui.label(RichText::new(t.jobs_failed.to_string()).color(pal.negative));
-                ui.end_row();
-            }
-            kv(
-                ui,
-                pal,
-                "Max connections",
-                data.settings.max_connections.to_string(),
-            );
-        });
+    let mut rows = vec![
+        ("Downloaded", format::bytes(t.downloaded_bytes), pal.text),
+        ("Jobs done", t.jobs_done.to_string(), pal.text),
+        ("Jobs pending", t.jobs_pending.to_string(), pal.text),
+    ];
+    if t.jobs_failed > 0 {
+        rows.push(("Jobs failed", t.jobs_failed.to_string(), pal.negative));
+    }
+    rows.push((
+        "Max connections",
+        data.settings.max_connections.to_string(),
+        pal.text,
+    ));
+    readings(ui, pal, "account", &rows, compact);
 }
 
 #[cfg(test)]
@@ -527,6 +624,37 @@ mod tests {
         assert!(d.len() <= 100);
         assert!((d[0] - 4.5).abs() < 1e-3);
         assert_eq!(downsample(&[1, 2, 3], 10), vec![1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn history_is_bucketed_on_a_time_axis() {
+        // A 2-minute burst at the end of a 24 h window fills the last bucket only.
+        let now = 100_000;
+        let burst: Vec<(i64, u64)> = (0..120).map(|i| (now - 119 + i, 1_000)).collect();
+        let b = history_buckets(&burst, now, 86_400, 160);
+        assert_eq!(b.len(), 160);
+        assert!(
+            b[..159].iter().all(|v| *v == 0.0),
+            "idle time stays at zero"
+        );
+        let bucket_secs = 86_400.0 / 160.0;
+        assert!((b[159] - 120_000.0 / bucket_secs).abs() < 1e-2);
+        // Samples outside the window are ignored; nothing is NaN.
+        let old = history_buckets(&[(now - 90_000, 5), (now + 10, 5)], now, 86_400, 160);
+        assert!(old.iter().all(|v| *v == 0.0));
+        assert!(history_buckets(&[], now, 86_400, 0).is_empty());
+        // The first second of the window lands in the first bucket, the last in the last.
+        let edges = history_buckets(&[(now - 86_400, 540), (now, 540)], now, 86_400, 160);
+        assert!(edges[0] > 0.0 && edges[159] > 0.0);
+    }
+
+    #[test]
+    fn grid_cards_fit_the_panel() {
+        // Two rows of cards plus the gap never exceed the panel.
+        for avail in [240.0_f32, 290.0, 320.0] {
+            let h = grid_card_height(avail, 8.0);
+            assert!(2.0 * (h + CARD_CHROME) + 8.0 <= avail + 0.5, "{avail}: {h}");
+        }
     }
 
     #[test]

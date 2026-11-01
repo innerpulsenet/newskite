@@ -261,23 +261,25 @@ Licensed under either of the MIT license or the Apache License, Version 2.0, at 
 
 Newskite is an [innerpulse](https://innerpulse.net) product.
 
-The app icon is the innerpulse ink tile and six-bar mark, with one row of small violet
-squares beneath it: Usenet articles arriving and assembling into a file. At 16 to 32 px the
-row is dropped and the stock innerpulse icon is used, drawn in whole pixels so it stays sharp.
+The app icon is the stock innerpulse app icon at every size: the ink tile and the six-bar
+mark. Following the brand's rule for desktop apps, the product's violet accent appears inside
+the app, not in the icon. The kit's whole-pixel renders keep the small sizes sharp.
 
 - `assets/brand/product/`: the Newskite wordmark and horizontal lockups (on dark and on light)
   and the social card.
 - `assets/brand/kit/`: the stock innerpulse mark, app icons and UI icons, copied from the
   brand kit.
 - `assets/brand/fonts/`: the brand typefaces (Instrument Sans, JetBrains Mono).
+- `assets/brand/fonts/OFL.txt`: the fonts' copyright notices and license (SIL OFL 1.1). The
+  fonts are embedded in the binary, so the packages install this file as
+  `/usr/share/doc/newskite/fonts-OFL.txt`, with a machine-readable `packaging/debian/copyright`.
 - `assets/brand/app-icon-256.png`: the 256 px app icon, a copy of the hicolor render.
 - `packaging/icons/`: the installed app icons and `preview.png`, a contact sheet of every size.
 
-To regenerate the icons, point `BRAND_KIT` at the innerpulse-brand kit and `NODE_PATH` at a
-`node_modules` that contains `sharp`:
+To reinstall the icons from the kit copy (set `BRAND_KIT` to the innerpulse-brand kit to
+refresh that copy first; ImageMagick, when installed, redraws `preview.png`):
 
 ```sh
-BRAND_KIT=/path/to/innerpulse-brand NODE_PATH=/path/to/node_modules \
-  node packaging/icons/make-icons.mjs
+BRAND_KIT=/path/to/innerpulse-brand node packaging/icons/make-icons.mjs
 packaging/tests/check-packaging.sh
 ```
