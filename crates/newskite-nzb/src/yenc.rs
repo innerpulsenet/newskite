@@ -256,29 +256,74 @@ fn find_keyword_line(body: &[u8], from: usize, keyword: &[u8]) -> Option<usize> 
     None
 }
 
+/// Bytes per step of the word-at-a-time decoder.
+const WORD: usize = 8;
+/// The high bit of every byte of a word.
+const HIGH: u64 = u64::from_ne_bytes([0x80; WORD]);
+/// The low bit of every byte of a word.
+const LOW: u64 = u64::from_ne_bytes([0x01; WORD]);
+
+/// Nonzero when some byte of `w` equals `b`. The lowest flagged byte is exactly the first
+/// such byte (a borrow only spreads upward from a match), which is all the decoder needs.
+#[inline]
+fn has_byte(w: u64, b: u8) -> u64 {
+    let v = w ^ (LOW * b as u64);
+    v.wrapping_sub(LOW) & !v & HIGH
+}
+
+/// Every byte of `w` minus 42 (mod 256), without borrows crossing bytes: with the high bit
+/// of every byte set first no byte can borrow, and the high bits are fixed up afterwards.
+#[inline]
+fn minus_42(w: u64) -> u64 {
+    ((w | HIGH) - LOW * 42) ^ (!w & HIGH)
+}
+
 /// Decodes yEnc data lines into `out`, in one pass over the bytes. CR and LF are dropped,
 /// `=` escapes the next byte and an escape never spans a line break: a dangling `=` at the
 /// end of a line is ignored.
-fn decode_into(mut encoded: &[u8], out: &mut Vec<u8>) {
-    loop {
-        // Plain bytes up to the next escape or line break are shifted as one run.
-        let (run, special) = match memchr::memchr3(b'=', b'\r', b'\n', encoded) {
-            Some(k) => (&encoded[..k], Some(encoded[k])),
-            None => (encoded, None),
-        };
-        out.extend(run.iter().map(|b| b.wrapping_sub(42)));
-        let Some(special) = special else { break };
-        encoded = &encoded[run.len() + 1..];
-        if special == b'=' {
-            match encoded.first() {
-                Some(&e) if e != b'\r' && e != b'\n' => {
-                    out.push(e.wrapping_sub(64).wrapping_sub(42));
-                    encoded = &encoded[1..];
-                }
-                _ => {}
+///
+/// Eight bytes are taken at a time: they are shifted and appended in one go, and when one
+/// of them is `=`, CR or LF the output is cut back to the bytes before it, which is then
+/// handled on its own. Plain runs therefore cost a few word operations per eight bytes.
+fn decode_into(encoded: &[u8], out: &mut Vec<u8>) {
+    // Output never outgrows the input, plus one word appended before it is cut back.
+    out.reserve(encoded.len() + WORD);
+    let mut i = 0;
+    while let Some(chunk) = encoded.get(i..i + WORD) {
+        let w = u64::from_le_bytes(chunk.try_into().expect("one word"));
+        let special = has_byte(w, b'=') | has_byte(w, b'\r') | has_byte(w, b'\n');
+        out.extend_from_slice(&minus_42(w).to_le_bytes());
+        if special == 0 {
+            i += WORD;
+            continue;
+        }
+        let plain = special.trailing_zeros() as usize / 8;
+        out.truncate(out.len() - WORD + plain);
+        i = decode_special(encoded, i + plain, out);
+    }
+    while i < encoded.len() {
+        match encoded[i] {
+            b'=' | b'\r' | b'\n' => i = decode_special(encoded, i, out),
+            b => {
+                out.push(b.wrapping_sub(42));
+                i += 1;
             }
         }
     }
+}
+
+/// Handles the `=`, CR or LF at `at`; returns the offset after what it consumed.
+#[inline]
+fn decode_special(encoded: &[u8], at: usize, out: &mut Vec<u8>) -> usize {
+    if encoded[at] == b'=' {
+        if let Some(&e) = encoded.get(at + 1) {
+            if e != b'\r' && e != b'\n' {
+                out.push(e.wrapping_sub(64).wrapping_sub(42));
+                return at + 2;
+            }
+        }
+    }
+    at + 1
 }
 
 /// Decodes raw yEnc data lines (no headers). CR and LF bytes are dropped, escapes are handled
@@ -420,6 +465,71 @@ mod tests {
         assert_eq!(decode_data(b"*\r*"), vec![0, 0]);
         assert_eq!(decode_data(b"="), Vec::<u8>::new());
         assert_eq!(decode_data(b""), Vec::<u8>::new());
+    }
+
+    /// The byte-at-a-time decoder the word-at-a-time one must equal.
+    fn reference(encoded: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < encoded.len() {
+            match encoded[i] {
+                b'\r' | b'\n' => i += 1,
+                b'=' => match encoded.get(i + 1) {
+                    Some(&e) if e != b'\r' && e != b'\n' => {
+                        out.push(e.wrapping_sub(106));
+                        i += 2;
+                    }
+                    _ => i += 1,
+                },
+                b => {
+                    out.push(b.wrapping_sub(42));
+                    i += 1;
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn word_helpers_are_exact() {
+        for b in 0..=255u8 {
+            let w = u64::from_le_bytes([b, 1, b, 0x80, 0xff, 0, b, 42]);
+            let want: Vec<u8> = w.to_le_bytes().iter().map(|x| x.wrapping_sub(42)).collect();
+            assert_eq!(minus_42(w).to_le_bytes().to_vec(), want, "{b}");
+            for v in [b'=', b'\r', b'\n'] {
+                let mut bytes = [b'a'; 8];
+                bytes[(b % 8) as usize] = b;
+                let first = bytes.iter().position(|&x| x == v);
+                let m = has_byte(u64::from_le_bytes(bytes), v);
+                assert_eq!(first, (m != 0).then(|| m.trailing_zeros() as usize / 8), "{b} {v}");
+            }
+        }
+    }
+
+    /// Random inputs dense in `=`, CR and LF (escapes at every word position, `==`,
+    /// `=` before line breaks and at the very end) decode as the reference does.
+    #[test]
+    fn word_decoder_matches_reference() {
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for len in 0..300 {
+            for _ in 0..20 {
+                let input: Vec<u8> = (0..len)
+                    .map(|_| match next() % 8 {
+                        0 => b'=',
+                        1 => b'\r',
+                        2 => b'\n',
+                        _ => next() as u8,
+                    })
+                    .collect();
+                assert_eq!(decode_data(&input), reference(&input), "{input:?}");
+            }
+        }
     }
 
     #[test]
