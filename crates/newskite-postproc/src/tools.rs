@@ -17,26 +17,28 @@ use std::time::{Duration, Instant};
 use crate::PostError;
 
 /// Paths to the external post-processing tools. `None` means the tool was not found and
-/// the corresponding step degrades gracefully (it is reported as skipped).
+/// the corresponding step degrades gracefully (it is reported as skipped). Extraction
+/// does not need any of the archive tools: they are only a fallback for archives the
+/// native backends report as unsupported (see the crate documentation).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Tools {
     /// `par2` (par2cmdline) used for PAR2 verify/repair.
     pub par2: Option<PathBuf>,
-    /// 7-Zip command-line binary (`7z`, `7zz` or `7za`).
+    /// 7-Zip command-line binary (`7z`, `7zz` or `7za`), extraction fallback.
     pub sevenz: Option<PathBuf>,
-    /// `unrar` (preferred for RAR archives).
+    /// `unrar` (preferred fallback for RAR archives).
     pub unrar: Option<PathBuf>,
-    /// Info-ZIP `unzip` (zip fallback when 7-Zip is missing).
+    /// Info-ZIP `unzip` (single-volume zip fallback when 7-Zip is missing).
     pub unzip: Option<PathBuf>,
 }
 
 impl Tools {
-    /// No tools at all (every step that needs one is skipped).
+    /// No tools at all: PAR2 is skipped, extraction runs natively without a fallback.
     pub fn none() -> Self {
         Self::default()
     }
 
-    /// True when at least one extraction tool is available.
+    /// True when at least one external extraction tool (fallback) is available.
     pub fn can_extract(&self) -> bool {
         self.sevenz.is_some() || self.unrar.is_some() || self.unzip.is_some()
     }

@@ -49,8 +49,8 @@ crates it depends on.
                  ┌─────────────────┘  │   └────────────────┐
          ┌───────▼────────┐  ┌────────▼───────┐  ┌──────────▼────────┐
          │ newskite-engine│  │ newskite-store │  │ newskite-postproc │
-         │ segment fetch, │  │ SQLite: jobs,  │  │ par2 / 7z / unrar │
-         │ decode, writes │  │ settings, ...  │  │ / unzip, cleanup  │
+         │ segment fetch, │  │ SQLite: jobs,  │  │ native par2, rar, │
+         │ decode, writes │  │ settings, ...  │  │ 7z, zip, cleanup  │
          └──┬──────────┬──┘  └────────┬───────┘  └──────────┬────────┘
      ┌──────▼─────┐ ┌──▼───────────┐  │                     │
      │newskite-nzb│ │ newskite-nntp│  │                     │
@@ -69,7 +69,8 @@ crates it depends on.
 | `newskite-nntp` | Async NNTP client (plain and TLS via rustls), plus a mock server used by tests |
 | `newskite-engine` | Downloads one job: concurrent segment fetches, decoding, positioned writes, speed limit |
 | `newskite-store` | SQLite persistence (bundled SQLite): jobs, files, bookmarks, throughput, settings |
-| `newskite-postproc` | PAR2 verify/repair, archive extraction and cleanup through external tools |
+| `newskite-par2` | Native PAR2 verify and repair (Reed-Solomon over GF(2^16)) |
+| `newskite-postproc` | Post-processing: PAR2, native archive extraction (external tools as fallback), cleanup |
 | `newskite-service` | The queue shared by the GUI and the CLI: runs jobs, persists progress, watch folder, scheduler, auto-shutdown |
 | `newskite-theme` | Reads the desktop color scheme (KDE `kdeglobals`, XDG portal, fallback) into color tokens |
 | `newskite-cli` | Headless mode (`newskite --headless ...`) |
@@ -161,9 +162,10 @@ backup of the files, or anyone who can watch your processes, can recover these:
   username and password, are kept as plain JSON in the `settings` table of the database in
   `~/.local/share/newskite/db`.
 - **Archive passwords** you enter for a job are stored in plain text with that job (the `jobs`
-  table). During extraction they are passed to `7z`/`unrar` (and `unzip`) on the command line,
-  so other local users can see them in the process list while the tool runs. The log shows
-  those commands with the password masked as `-p***`.
+  table). Extraction is built in and keeps the password in memory. Only when an archive
+  needs the external fallback (see below) is the password passed to `7z`/`unrar` (or
+  `unzip`) on the command line, where other local users can see it in the process list
+  while the tool runs. The log shows those commands with the password masked as `-p***`.
 - **Headless CLI:** prefer the `NEWSKITE_PASS` environment variable over `--pass`, because a
   password given on the command line is visible to other users in the process list. Passwords given with `--server`/`--pass`/`NEWSKITE_PASS` are kept only in
   memory and never written to the database.
@@ -172,19 +174,26 @@ Passwords are never written to the message log.
 
 ## Post-processing tools
 
-Repair and extraction use external programs, found on `PATH` at run time. Each one is
-optional: when it is missing, that step is skipped and the job log says why.
+PAR2 verify/repair and RAR, 7z and ZIP extraction (including split volumes and passwords)
+are built into Newskite; no program needs to be installed. A download with missing
+articles is still repaired when its PAR2 data covers the gap. The tools below are an
+optional fallback: `par2` only when no PAR2 recovery set can be read natively, the archive
+tools only for archives the built-in extraction cannot read (spanned `.z01` ZIP sets,
+rare codecs).
 
 | Tool | Used for | Debian/Ubuntu package |
 |---|---|---|
-| `par2` | PAR2 verify and repair | `par2` |
-| `7z` (or `7zz`, `7za`) | 7z, ZIP and most RAR archives | `7zip` (or `p7zip-full` on older releases) |
-| `unrar` | RAR archives (preferred for RAR) | `unrar` (non-free) |
-| `unzip` | ZIP archives when 7-Zip is missing | `unzip` |
+| `par2` | fallback for unreadable PAR2 sets | `par2` |
+| `7z` (or `7zz`, `7za`) | fallback for 7z, ZIP and RAR archives | `7zip` (or `p7zip-full` on older releases) |
+| `unrar` | fallback for RAR archives (preferred for RAR) | `unrar` (non-free) |
+| `unzip` | fallback for single ZIP archives when 7-Zip is missing | `unzip` |
 
 ```sh
-sudo apt install par2 7zip unzip     # plus unrar from the non-free/multiverse component
+sudo apt install par2 7zip     # optional fallbacks only
 ```
+
+Building from source compiles the bundled UnRAR library, so a C++ compiler (`g++` or
+`clang++`) is needed.
 
 ## Packaging
 

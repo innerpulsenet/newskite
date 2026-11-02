@@ -619,6 +619,7 @@ async fn forward_events(
                 );
             }
             EngineEvent::Log(line) => inner.log(LogLevel::Info, line.clone()),
+            EngineEvent::Warn(line) => inner.log(LogLevel::Warn, line.clone()),
         }
         inner.emit(ServiceEvent::Engine { job_id, event: ev });
     }

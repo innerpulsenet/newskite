@@ -629,7 +629,7 @@ impl NewskiteApp {
                     *reload_jobs = true
                 }
                 EngineEvent::FileDone { .. } => *reload_jobs = true,
-                EngineEvent::FileStarted { .. } | EngineEvent::Log(_) => {}
+                EngineEvent::FileStarted { .. } | EngineEvent::Log(_) | EngineEvent::Warn(_) => {}
             },
             ServiceEvent::JobLog(_) | ServiceEvent::Error(_) => *reload_logs = true,
             ServiceEvent::JobsChanged | ServiceEvent::WatchImported(_) => *reload_jobs = true,

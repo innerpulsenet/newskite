@@ -9,6 +9,18 @@ license.workspace = true
 newskite-types.workspace = true
 newskite-par2.workspace = true
 thiserror.workspace = true
+# Native archive backends: extraction runs in-process; external tools are only a
+# fallback for archives a backend reports as unsupported.
+# zip: read-side codecs only, plus AES / ZipCrypto for passworded archives.
+zip = { version = "9.2", default-features = false, features = ["aes-crypto", "bzip2", "deflate-flate2-zlib-rs", "deflate64", "lzma", "ppmd", "xz", "zstd"] }
+# sevenz-rust2 0.21+ requires Rust 1.93; 0.20 is the newest release within rust-version.
+sevenz-rust2 = { version = "0.20.2", default-features = false, features = ["aes256", "bzip2", "deflate", "ppmd", "zstd"] }
+# The bundled UnRAR library (C++, built by its build script), driven directly through
+# its DLL interface so every entry's data passes through our own writer (see
+# `native/rar.rs`). This is the FFI layer of the `unrar` crate, same version.
+unrar_sys = "0.5.8"
 
 [dev-dependencies]
 tempfile = "3.27"
+# Writers for archives built in-test.
+sevenz-rust2 = { version = "0.20.2", default-features = false, features = ["aes256", "compress"] }

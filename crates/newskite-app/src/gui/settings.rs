@@ -592,7 +592,7 @@ fn postprocess_section(ui: &mut Ui, pal: &Palette, s: &mut Settings) {
         });
         ui.label(
             RichText::new(
-                "PAR2 repair is built in. Extraction uses 7z, unrar and unzip when installed; missing tools are skipped.",
+                "PAR2 repair and RAR, 7z and zip extraction are built in; no external tools are needed.",
             )
             .small()
             .color(pal.muted),
