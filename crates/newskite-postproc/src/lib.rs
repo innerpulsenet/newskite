@@ -1,9 +1,6 @@
 //! Post-processing for finished downloads (outline F5): PAR2 verify/repair, archive
 //! extraction and cleanup, all in-process: PAR2 through [`newskite_par2`], zip, 7z and RAR
-//! through native backends. `par2`, `7z`/`7zz`/`7za`, `unrar` and `unzip` are only a
-//! fallback for sets the native code cannot read.
-//! Missing tools degrade gracefully: the step is reported as [`Verdict::Skipped`] with a
-//! reason.
+//! through native backends. No external program is ever started.
 //!
 //! The API is blocking; callers on an async runtime should use `spawn_blocking`.
 //!
@@ -18,71 +15,62 @@
 //!    After a successful PAR2 step, a `.nkpart` file is deleted when it supplied slices
 //!    or its final name is now a correct protected file; the rest are reported in
 //!    [`PostReport::incomplete`]. Per-file results are logged and summed in
-//!    [`PostReport::par2_stats`]; progress goes to [`PostEvent::Stage`]. Only when no
-//!    recovery set parses is the external `par2` tool tried (verify, then repair with
-//!    unmatched files as extras; exit codes cross-checked with its output). With repair
-//!    disabled, a damaged set is a failure.
+//!    [`PostReport::par2_stats`]; progress goes to [`PostEvent::Stage`]. When no
+//!    recovery set parses (main packet missing or corrupt), the step is
+//!    [`Verdict::Skipped`] (`PAR2 files unreadable`) and extraction still runs, checking
+//!    its own CRCs. With repair disabled, a damaged set is a failure.
 //! 2. **Extraction** (when [`PostOptions::extract`] is set and PAR2 did not fail).
 //!    Archive sets are detected by name (`.rar`, `.partNN.rar`, `.rNN`, `.7z`,
 //!    `.7z.NNN`, `.zip`, `.zNN`, `.zip.NNN`) and magic bytes (files with no or a
 //!    random-looking extension are sniffed; the magic of each set's first volume also
 //!    decides the format when it disagrees with the extension).
 //!
-//!    **Native backends.** zip uses the `zip` crate (deflate, deflate64, bzip2, LZMA,
-//!    XZ, zstd, PPMd; AES and ZipCrypto passwords), 7z uses `sevenz-rust2` (LZMA/LZMA2,
-//!    PPMd, bzip2, deflate, zstd, BCJ/BCJ2/delta filters; AES passwords, encrypted
-//!    headers) and RAR (RAR 1.5 to RAR 7) uses the bundled UnRAR library in test mode,
-//!    so it decompresses and verifies while every byte is written by our own code.
-//!    Split `.7z.NNN` and
-//!    `.zip.NNN` volumes are read as one chained stream (a gap in the numbering is a
-//!    missing volume); UnRAR follows `.partNN.rar` / `.rNN` volumes from the first one.
-//!    Spanned zips (`.z01` ... `.zip`) cannot be read natively. Progress is logged every
-//!    5% for sets of 32 MiB or more.
-//!
-//!    **External fallback.** Only when a native backend reports the archive as
-//!    *unsupported* (a spanned zip, an unknown codec or RAR feature) is the set handed to
-//!    a tool: unrar for RAR, 7-Zip for everything else, unzip for single-volume zip when
-//!    7-Zip is missing. Without a suitable tool such a set fails with a reason naming
-//!    what to install. Any other native error (corrupt data, missing volume, password)
-//!    is final.
+//!    **Backends.** zip uses the `zip` crate (deflate, deflate64, bzip2, LZMA, XZ, zstd,
+//!    PPMd; AES and ZipCrypto passwords), 7z uses `sevenz-rust2` (LZMA/LZMA2, PPMd,
+//!    bzip2, deflate, zstd, BCJ/BCJ2/delta filters; AES passwords, encrypted headers) and
+//!    RAR (RAR 1.5 to RAR 7) uses the UnRAR library compiled into the program, in test
+//!    mode, so it decompresses and verifies while every byte is written by our own code.
+//!    Split `.7z.NNN` and `.zip.NNN` volumes are read as one chained stream (a gap in the
+//!    numbering is a missing volume). Spanned zips (`.z01`, `.z02` ... `.zip`, as written
+//!    by `zip -s` or WinZip) are read as one archive: the volumes in disk order followed
+//!    by a copy of the central directory, rewritten in memory with absolute offsets. UnRAR
+//!    follows `.partNN.rar` / `.rNN` volumes from the first one. An archive a backend
+//!    cannot read (an unknown codec or RAR feature) fails with `unsupported archive:
+//!    <what>`, like corrupt data, a missing volume or a password problem. Progress is
+//!    logged every 5% for sets of 32 MiB or more.
 //!
 //!    Every set is extracted into **`dir/<sanitized job_name>/`** (see
 //!    [`extraction_dir_name`]); if a *file* of that name already exists,
-//!    `dir/<name>.extracted/` is used instead. Before extracting, the archive is listed
-//!    (natively, or `7z l -slt`, `unrar lb`, `unzip -Z1` for a tool) and refused if any
-//!    entry is absolute or has a `..` component; an archive without entries counts as
-//!    damaged. Each set is then extracted into a fresh private staging folder
-//!    (`.newskite-staging-*`) inside the extraction folder. The native backends sanitize
-//!    every entry path again before writing, create folders one component at a time
-//!    without following links, open files with `create_new` (a duplicate entry unlinks
-//!    the earlier file first, so data never goes through a link or a hard link) and
-//!    **never create links**: symbolic links, junctions and hard links in an archive are
-//!    skipped and logged, and one pointing outside the extraction folder (absolute or
+//!    `dir/<name>.extracted/` is used instead. Before anything is written, the archive is
+//!    listed and refused if any entry is absolute or has a `..` component; an archive
+//!    without entries counts as damaged. Each set is then extracted into a fresh private
+//!    staging folder (`.newskite-staging-*`) inside the extraction folder. The backends
+//!    sanitize every entry path again before writing, create folders one component at a
+//!    time without following links, open files with `create_new` (a duplicate entry
+//!    unlinks the earlier file first, so data never goes through a link or a hard link)
+//!    and **never create links**: symbolic links, junctions and hard links in an archive
+//!    are skipped and logged, and one pointing outside the extraction folder (absolute or
 //!    climbing out with `..`) reports the set as failed. A file that fails to decode is
 //!    removed. Whether extraction succeeds or fails, symbolic links in the staging folder
-//!    that point outside it (or use an absolute destination; only a tool can create
-//!    them) are deleted, the remaining output is moved into the extraction folder
-//!    without following any link already there (an existing file or link of the same
-//!    name is replaced; a file never replaces a real folder), the staging folder is
-//!    removed and the whole extraction folder is checked again for links pointing
-//!    outside it. Any deleted link reports the set as failed. Links are judged by their
-//!    fully resolved destination when it exists, else lexically.
+//!    that point outside it or use an absolute destination are deleted (defense in
+//!    depth), the remaining output is moved into the extraction folder without following
+//!    any link already there (an existing file or link of the same name is replaced; a
+//!    file never replaces a real folder), the staging folder is removed and the whole
+//!    extraction folder is checked again for links pointing outside it. Any deleted link
+//!    reports the set as failed. Links are judged by their fully resolved destination
+//!    when it exists, else lexically.
 //!
 //!    **Passwords.** A wrong password fails the set with "wrong password", a missing
-//!    one with "password required ..."; nothing ever prompts or waits. Natively the
-//!    password stays in memory (UnRAR receives it through its callback as a wide
-//!    string). Formats without a password check value (RAR 4, ZipCrypto, 7z data) can
-//!    only tell a wrong password from damage by the failed integrity check of encrypted
-//!    data, which is reported as a wrong password. For the tool fallback, passwords are
-//!    passed on the tool's command line (`-p<pw>` for 7-Zip/unrar, `-P <pw>` for unzip),
-//!    which other local users can see in the process list while the tool runs; without a
-//!    password the tools are made non-interactive (`-p-` for unrar, a placeholder
-//!    password for 7-Zip/unzip) and stdin is always the null device. Passwords are never
-//!    logged (commands are logged with `-p***`).
+//!    one with "password required ..."; nothing ever prompts or waits. The password
+//!    never leaves the process: the backends get it in memory (UnRAR through its
+//!    callback, as a wide string), and it is never logged. Formats without a password
+//!    check value (RAR 4, ZipCrypto, 7z data) can only tell a wrong password from damage
+//!    by the failed integrity check of encrypted data, which is reported as a wrong
+//!    password.
 //! 3. **Cleanup.** With [`PostOptions::cleanup`], the volumes of every extracted set are
 //!    deleted when the extraction verdict is [`Verdict::Ok`]. With
-//!    [`PostOptions::remove_leftovers`], all `.par2` files, the `name.1` backups par2 left
-//!    after a repair and release sidecars (`.sfv`, `.nfo`, ...) are deleted when PAR2
+//!    [`PostOptions::remove_leftovers`], all `.par2` files, the `name.1` backups a PAR2
+//!    repair leaves and release sidecars (`.sfv`, `.nfo`, ...) are deleted when PAR2
 //!    verified or repaired the files (or there were none) and no archive set failed or was
 //!    skipped; this also applies to downloads without archives. Deleted paths are
 //!    returned in [`PostReport::removed`].
@@ -91,15 +79,13 @@ mod detect;
 mod extract;
 mod native;
 mod par2;
-mod tools;
 
 use std::fmt;
 use std::path::{Path, PathBuf};
 
 pub use detect::{sniff_bytes, sniff_file, ArchiveKind, Magic};
-pub use extract::{is_unsafe_entry, parse_7z_listing, parse_bare_listing};
+pub use extract::is_unsafe_entry;
 pub use par2::Par2Stats;
-pub use tools::{detect_tools, detect_tools_in, find_tool, Tools};
 
 use newskite_types::PostProcessSettings;
 
@@ -107,14 +93,14 @@ use newskite_types::PostProcessSettings;
 #[derive(Clone, PartialEq, Eq)]
 pub struct PostOptions {
     /// Repair damaged/missing files with PAR2 (verification always runs when PAR2 files
-    /// and the `par2` tool are present).
+    /// are present).
     pub repair: bool,
     /// Extract archives.
     pub extract: bool,
     /// Delete archive volumes after a successful extraction.
     pub cleanup: bool,
     /// Delete leftovers once the data is known good: `.par2` files, the `name.1` backups
-    /// par2 leaves after a repair, and release sidecars (`.sfv`, `.nfo`, ...).
+    /// a PAR2 repair leaves, and release sidecars (`.sfv`, `.nfo`, ...).
     pub remove_leftovers: bool,
     /// Archive password for this job (never logged).
     pub password: Option<String>,
@@ -155,7 +141,8 @@ impl fmt::Debug for PostOptions {
 /// Result of one post-processing step.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Verdict {
-    /// The step did not run (nothing to do, disabled or tool missing); reason attached.
+    /// The step did not run (nothing to do, disabled or PAR2 files unreadable); reason
+    /// attached.
     Skipped(String),
     /// The step ran and everything is fine.
     Ok,
@@ -234,14 +221,12 @@ pub enum PostEvent {
     Stage { stage: PostStage, fraction: Option<f32>, detail: String },
 }
 
-/// Errors that prevent post-processing from running at all. Tool failures are reported
-/// as [`Verdict::Failed`] instead.
+/// Errors that prevent post-processing from running at all. Failures of a step are
+/// reported as [`Verdict::Failed`] instead.
 #[derive(Debug, thiserror::Error)]
 pub enum PostError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("tool error: {0}")]
-    Tool(String),
 }
 
 /// Folder name used for extraction: `job_name` with path separators, control characters
@@ -321,10 +306,9 @@ pub fn process(
     dir: &Path,
     job_name: &str,
     opts: &PostOptions,
-    tools: &Tools,
     log: &mut dyn FnMut(String),
 ) -> Result<PostReport, PostError> {
-    process_with_events(dir, job_name, opts, tools, &mut |e| {
+    process_with_events(dir, job_name, opts, &mut |e| {
         if let PostEvent::Log(l) = e {
             log(l)
         }
@@ -336,21 +320,19 @@ pub fn process_with_events(
     dir: &Path,
     job_name: &str,
     opts: &PostOptions,
-    tools: &Tools,
     on: &mut dyn FnMut(PostEvent),
 ) -> Result<PostReport, PostError> {
     let on = std::cell::RefCell::new(on);
     let mut log = |l: String| (on.borrow_mut())(PostEvent::Log(l));
     let mut progress =
         |stage: PostStage, fraction: Option<f32>, detail: String| (on.borrow_mut())(PostEvent::Stage { stage, fraction, detail });
-    run_all(dir, job_name, opts, tools, &mut log, &mut progress)
+    run_all(dir, job_name, opts, &mut log, &mut progress)
 }
 
 fn run_all(
     dir: &Path,
     job_name: &str,
     opts: &PostOptions,
-    tools: &Tools,
     log: &mut dyn FnMut(String),
     progress: &mut dyn FnMut(PostStage, Option<f32>, String),
 ) -> Result<PostReport, PostError> {
@@ -368,7 +350,7 @@ fn run_all(
         files = list_files(&dir)?;
     }
     let partials = list_partials(&dir)?;
-    let outcome = par2::run(&dir, &files, &partials, tools.par2.as_deref(), opts.repair, log, progress);
+    let outcome = par2::run(&dir, &files, &partials, opts.repair, log, progress);
     let par2_verdict = outcome.verdict.unwrap_or_else(|| Verdict::Skipped(NO_PAR2.into()));
     let backups = outcome.backups;
     log(format!("par2: {par2_verdict}"));
@@ -415,9 +397,9 @@ fn run_all(
     if opts.extract {
         progress(PostStage::Extract, None, "Extracting archives".into());
     }
-    let extracted = extract_phase(&dir, job_name, opts, tools, &mut report, log)?;
+    let extracted = extract_phase(&dir, job_name, opts, &mut report, log)?;
 
-    // 3. Cleanup. `files` is listed after par2 renamed obfuscated files back.
+    // 3. Cleanup. `files` is listed after PAR2 renamed obfuscated files back.
     progress(PostStage::Cleanup, None, "Cleaning up".into());
     let files = list_files(&dir)?;
     let mut doomed: Vec<PathBuf> = Vec::new();
@@ -464,10 +446,10 @@ struct Extracted {
     skipped_any: bool,
 }
 
-/// Parity files, par2 backups and sidecars may go once the data is known good: PAR2
+/// Parity files, repair backups and sidecars may go once the data is known good: PAR2
 /// verified or repaired it (or there was no PAR2 data to begin with) and no archive set
-/// failed or was skipped. With PAR2 skipped for another reason (tool missing) the files
-/// were never checked, so the parity data stays.
+/// failed or was skipped. With PAR2 skipped for another reason (PAR2 files unreadable)
+/// the files were never checked, so the parity data stays.
 fn leftovers_allowed(report: &PostReport, extracted: &Extracted) -> Result<(), String> {
     match &report.par2 {
         Verdict::Ok | Verdict::Repaired => {}
@@ -488,7 +470,6 @@ fn extract_phase(
     dir: &Path,
     job_name: &str,
     opts: &PostOptions,
-    tools: &Tools,
     report: &mut PostReport,
     log: &mut dyn FnMut(String),
 ) -> Result<Extracted, PostError> {
@@ -502,7 +483,7 @@ fn extract_phase(
         log(format!("extract: {}", report.extract));
         return Ok(out);
     }
-    // par2 may have renamed files back to their real names; look again.
+    // PAR2 may have renamed files back to their real names; look again.
     let files = list_files(dir)?;
     let (sets, broken) = detect::find_archive_sets(&files);
     if sets.is_empty() && broken.is_empty() {
@@ -528,7 +509,7 @@ fn extract_phase(
         let password = opts.password.as_deref().filter(|p| !p.is_empty());
         for set in &sets {
             let name = set.first.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            match extract::extract_set(set, &target, tools, password, log) {
+            match extract::extract_set(set, &target, password, log) {
                 extract::SetOutcome::Extracted => {
                     log(format!("extract: {name}: extracted to {}", target.display()));
                     extracted.push(set);
@@ -625,7 +606,7 @@ mod tests {
 
     #[test]
     fn missing_dir_is_io_error() {
-        let r = process(Path::new("/definitely/not/here/nk"), "x", &PostOptions::default(), &Tools::none(), &mut |_| {});
+        let r = process(Path::new("/definitely/not/here/nk"), "x", &PostOptions::default(), &mut |_| {});
         assert!(matches!(r, Err(PostError::Io(_))));
     }
 

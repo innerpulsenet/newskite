@@ -81,13 +81,12 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use newskite_engine::{ConnectionPool, Progress};
 use newskite_nzb::NzbError;
 pub use newskite_postproc::PostStage;
-use newskite_postproc::Tools;
 use newskite_types::{format, EngineEvent, ServerConfig, Settings};
 use tokio::runtime::Handle;
 use tokio::sync::{broadcast, watch};
@@ -356,7 +355,6 @@ pub(crate) struct Inner {
     /// `true` while a run is active (backs [`Service::wait_idle`]).
     pub(crate) running_tx: watch::Sender<bool>,
     pub(crate) speed_bps: AtomicU64,
-    pub(crate) tools: OnceLock<Tools>,
     pub(crate) shutdown_hook: Mutex<Option<ShutdownHook>>,
     /// Watch-folder files that failed to import, with their mtime, so timer scans do not
     /// log the same problem every interval.
@@ -631,7 +629,6 @@ impl Service {
             shutdown: CancellationToken::new(),
             running_tx,
             speed_bps: AtomicU64::new(0),
-            tools: OnceLock::new(),
             shutdown_hook: Mutex::new(None),
             watch_rejected: Mutex::new(HashSet::new()),
             import_lock: Mutex::new(()),

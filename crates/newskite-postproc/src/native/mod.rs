@@ -11,6 +11,7 @@
 
 mod rar;
 mod sevenz;
+mod spanned;
 mod zipfile;
 
 use std::fs::{File, OpenOptions};
@@ -28,8 +29,8 @@ pub(crate) const WRONG_PASSWORD: &str = "wrong password";
 /// Why a native backend could not extract a set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum NativeError {
-    /// The archive uses a feature the backend does not implement (an unknown codec, a
-    /// spanned zip ...). The only error for which an external tool is tried instead.
+    /// The archive uses a feature the backend does not implement (an unknown codec or RAR
+    /// feature ...).
     Unsupported(String),
     PasswordRequired,
     WrongPassword,
@@ -420,21 +421,13 @@ pub(crate) fn apply_mtime(path: &Path, t: Option<std::time::SystemTime>) {
 
 /// The volumes of a zip or 7z set in reading order, checked for gaps. A plain `.7z` /
 /// `.zip` (or a sniffed file) is read alone; numbered volumes (`.7z.001`, `.zip.001`
-/// ...) are chained. Spanned zips (`.z01` ... `.zip`) are [`NativeError::Unsupported`]:
-/// their offsets are relative to each disk, so they cannot be read as one stream.
+/// ...) are chained. Spanned zips (`.z01` ... `.zip`) are not a byte stream split in
+/// pieces (their offsets are relative to each disk); [`spanned`] reads them.
 pub(crate) fn chained_volumes(set: &ArchiveSet) -> Result<Vec<PathBuf>, NativeError> {
     if set.volumes.len() <= 1 {
         return Ok(vec![set.first.clone()]);
     }
     let name_of = |p: &Path| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let spanned = set.kind == ArchiveKind::Zip
-        && set.volumes.iter().any(|v| {
-            let n = name_of(v).to_ascii_lowercase();
-            n.rsplit_once('.').is_some_and(|(_, ext)| ext.len() >= 2 && ext.starts_with('z') && ext[1..].bytes().all(|b| b.is_ascii_digit()))
-        });
-    if spanned {
-        return Err(NativeError::Unsupported("spanned zip archives (.z01, .z02 ...) are not supported natively".into()));
-    }
     let first_order = classify_name(&name_of(&set.first)).map(|c| c.order);
     if first_order == Some(0) {
         // A plain .7z / .zip next to numbered parts of the same name: read it alone.
@@ -478,6 +471,16 @@ impl VolumeReader {
             start += len;
         }
         Ok(Self { parts, total: start, pos: 0, cur: None })
+    }
+
+    /// Offset at which each volume starts.
+    pub fn starts(&self) -> Vec<u64> {
+        self.parts.iter().map(|(_, start, _)| *start).collect()
+    }
+
+    /// Length of all volumes together.
+    pub fn total_len(&self) -> u64 {
+        self.total
     }
 }
 
@@ -616,8 +619,6 @@ mod tests {
         assert_eq!(chained_volumes(&s).unwrap().len(), 3);
         let s = set(ArchiveKind::SevenZip, &["a.7z.001", "a.7z.003"]);
         assert_eq!(chained_volumes(&s), Err(NativeError::MissingVolume));
-        let s = set(ArchiveKind::Zip, &["a.zip", "a.z01", "a.z02"]);
-        assert!(matches!(chained_volumes(&s), Err(NativeError::Unsupported(_))));
         let s = set(ArchiveKind::Zip, &["a.zip.001", "a.zip.002"]);
         assert_eq!(chained_volumes(&s).unwrap(), vec![PathBuf::from("a.zip.001"), PathBuf::from("a.zip.002")]);
         let s = set(ArchiveKind::SevenZip, &["a.7z", "a.7z.001"]);

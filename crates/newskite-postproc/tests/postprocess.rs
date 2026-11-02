@@ -1,8 +1,9 @@
-//! Integration tests for post-processing. Extraction is native: archives are built
-//! in-test with the `zip` and `sevenz-rust2` writers (or taken from small RAR fixtures)
-//! and extracted with [`Tools::none()`]. Tests that need an external tool (to *create*
-//! fixtures with 7-Zip / zip, for the PAR2 steps, or for the unsupported-archive
-//! fallback) print a note and return early when it is not installed.
+//! Integration tests for post-processing, which runs entirely in-process. Archives are
+//! built in-test with the `zip` and `sevenz-rust2` writers (spanned zips are split by hand)
+//! or taken from small RAR fixtures, and PAR2 sets are made with [`newskite_par2::create`].
+//! A few tests check archives and PAR2 sets made by other programs (7-Zip, Info-ZIP `zip`,
+//! par2cmdline): they use the program only to *create* the fixture and print a note and
+//! return early when it is not installed.
 //!
 //! `tests/fixtures/rar/*.rar` come from the `unrar` crate's test data (MIT OR
 //! Apache-2.0); no RAR writer is available, so RAR is tested with those.
@@ -12,16 +13,28 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use newskite_postproc::{detect_tools, find_tool, process, PostOptions, PostReport, Tools, Verdict};
+use newskite_postproc::{process, PostOptions, PostReport, Verdict};
 
-macro_rules! require {
-    ($tools:expr, $($field:ident),+) => {
-        $(
-            if $tools.$field.is_none() {
-                eprintln!("note: skipping test, `{}` tool not installed", stringify!($field));
-                return;
-            }
-        )+
+/// A program used only to create fixtures, looked up on `PATH` under the first of `names`
+/// found. `None` (after printing a note) when none is installed.
+fn fixture_tool(names: &[&str]) -> Option<PathBuf> {
+    let dirs: Vec<PathBuf> = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect()).unwrap_or_default();
+    let found = names
+        .iter()
+        .find_map(|n| dirs.iter().flat_map(|d| [d.join(n), d.join(format!("{n}.exe"))]).find(|p| p.is_file()));
+    if found.is_none() {
+        eprintln!("note: skipping test, `{}` is not installed", names[0]);
+    }
+    found
+}
+
+/// The fixture program's path, or return from the test when it is not installed.
+macro_rules! tool_or_skip {
+    ($($name:expr),+) => {
+        match fixture_tool(&[$($name),+]) {
+            Some(path) => path,
+            None => return,
+        }
     };
 }
 
@@ -75,14 +88,10 @@ fn fixture() -> Fixture {
     Fixture { _tmp: tmp, dl, src }
 }
 
-fn run(dir: &Path, job: &str, opts: &PostOptions, tools: &Tools) -> (PostReport, Vec<String>) {
+fn run(dir: &Path, job: &str, opts: &PostOptions) -> (PostReport, Vec<String>) {
     let mut logs = Vec::new();
-    let report = process(dir, job, opts, tools, &mut |l| logs.push(l)).expect("process");
+    let report = process(dir, job, opts, &mut |l| logs.push(l)).expect("process");
     (report, logs)
-}
-
-fn native(dir: &Path, job: &str, opts: &PostOptions) -> (PostReport, Vec<String>) {
-    run(dir, job, opts, &Tools::none())
 }
 
 fn with_password(pw: &str) -> PostOptions {
@@ -161,7 +170,7 @@ fn zip_extracts_natively_into_job_folder() {
     let zip = f.dl.join("release.zip");
     payload_zip(&f, &zip, None);
 
-    let (r, logs) = native(&f.dl, "My Release: 2024", &PostOptions::default());
+    let (r, logs) = run(&f.dl, "My Release: 2024", &PostOptions::default());
     assert_eq!(r.par2, Verdict::Skipped("no PAR2 files".into()));
     assert_eq!(r.extract, Verdict::Ok, "{logs:#?}");
     let target = f.dl.join("My Release_ 2024");
@@ -179,14 +188,14 @@ fn aes_zip_right_wrong_and_missing_password() {
     let zip = f.dl.join("secret.zip");
     payload_zip(&f, &zip, Some("Correct Horse"));
 
-    let (r, logs) = native(&f.dl, "job", &with_password("wrong one"));
+    let (r, logs) = run(&f.dl, "job", &with_password("wrong one"));
     assert_eq!(r.extract, Verdict::Failed("wrong password".into()), "{logs:#?}");
     assert!(logs.iter().all(|l| !l.contains("wrong one")), "password leaked into logs");
 
-    let (r, logs) = native(&f.dl, "job", &PostOptions::default());
+    let (r, logs) = run(&f.dl, "job", &PostOptions::default());
     assert_failed_with(&r.extract, "password required", &logs);
 
-    let (r, logs) = native(&f.dl, "job", &with_password("Correct Horse"));
+    let (r, logs) = run(&f.dl, "job", &with_password("Correct Horse"));
     assert_eq!(r.extract, Verdict::Ok, "{logs:#?}");
     assert!(logs.iter().all(|l| !l.contains("Correct Horse")), "password leaked into logs");
     assert_payload_extracted(&f.dl.join("job"), &f.src);
@@ -197,7 +206,7 @@ fn aes_zip_right_wrong_and_missing_password() {
 fn password_set_for_unencrypted_zip_is_ignored() {
     let f = fixture();
     payload_zip(&f, &f.dl.join("plain.zip"), None);
-    let (r, logs) = native(&f.dl, "job", &with_password("unused"));
+    let (r, logs) = run(&f.dl, "job", &with_password("unused"));
     assert_eq!(r.extract, Verdict::Ok, "{logs:#?}");
 }
 
@@ -209,23 +218,11 @@ fn split_zip_volumes_are_chained() {
     let volumes = split_volumes(&f.dl, "big.zip", &fs::read(&whole).unwrap(), 40_000);
     assert!(volumes.len() >= 3);
 
-    let (r, logs) = native(&f.dl, "job", &PostOptions::default());
+    let (r, logs) = run(&f.dl, "job", &PostOptions::default());
     assert_eq!(r.extract, Verdict::Ok, "{logs:#?}");
     assert_payload_extracted(&f.dl.join("job"), &f.src);
     assert!(logs.iter().any(|l| l.contains(&format!("zip ({} volumes)", volumes.len()))), "{logs:#?}");
     assert_eq!(r.removed, volumes);
-}
-
-#[test]
-fn spanned_zip_without_tools_fails_clearly() {
-    let f = fixture();
-    // Names are enough: spanned sets are refused before reading.
-    payload_zip(&f, &f.dl.join("span.zip"), None);
-    fs::write(f.dl.join("span.z01"), b"PK\x07\x08").unwrap();
-    let (r, logs) = native(&f.dl, "job", &PostOptions::default());
-    assert_failed_with(&r.extract, "spanned zip", &logs);
-    assert_failed_with(&r.extract, "install 7-Zip", &logs);
-    assert!(r.removed.is_empty());
 }
 
 #[test]
@@ -234,7 +231,7 @@ fn corrupt_zip_fails() {
     let mut data = b"PK\x03\x04".to_vec();
     data.extend(pseudo_random(5000, 9));
     fs::write(f.dl.join("broken.zip"), data).unwrap();
-    let (r, logs) = native(&f.dl, "job", &PostOptions { cleanup: true, ..Default::default() });
+    let (r, logs) = run(&f.dl, "job", &PostOptions { cleanup: true, ..Default::default() });
     assert_failed_with(&r.extract, "corrupt", &logs);
     assert!(f.dl.join("broken.zip").exists());
     assert!(!f.dl.join("job").exists(), "empty target must be removed");
@@ -252,7 +249,7 @@ fn damaged_zip_data_fails_and_leaves_no_partial_file() {
         *b = !*b;
     }
     fs::write(&zip, d).unwrap();
-    let (r, logs) = native(&f.dl, "job", &PostOptions::default());
+    let (r, logs) = run(&f.dl, "job", &PostOptions::default());
     assert_failed_with(&r.extract, "corrupt", &logs);
     assert!(!f.dl.join("job").join("sub").join("b.bin").exists(), "{logs:#?}");
     assert!(zip.exists());
@@ -270,12 +267,180 @@ fn large_set_reports_progress() {
         w.write_all(&block).unwrap();
     }
     w.finish().unwrap();
-    let (r, logs) = native(&f.dl, "job", &PostOptions::default());
+    let (r, logs) = run(&f.dl, "job", &PostOptions::default());
     assert_eq!(r.extract, Verdict::Ok, "{logs:#?}");
     let steps: Vec<_> = logs.iter().filter(|l| l.contains("% (")).collect();
     assert!(steps.len() >= 10, "{logs:#?}");
     assert!(steps.iter().any(|l| l.contains(": 50% (") && l.ends_with("of 40.0 MiB)")), "{steps:#?}");
     assert_eq!(fs::metadata(f.dl.join("job").join("zeros.bin")).unwrap().len(), 40 * 1024 * 1024);
+}
+
+// ---------------------------------------------------------------- spanned zip
+
+/// Turn a single-disk zip (as written by `zip::ZipWriter`: no comment, no ZIP64) into a
+/// spanned set in `dir` laid out like `zip -s` output: `name.z01`, `name.z02` ... of
+/// `chunk` bytes, then `name.zip` with the rest and the end record. Disk 0 starts with the
+/// `PK\x07\x08` split marker, and every offset is relative to the disk it falls on.
+/// Returns the volumes in disk order.
+fn split_spanned(dir: &Path, name: &str, zip: &[u8], chunk: usize) -> Vec<PathBuf> {
+    let le16 = |b: &[u8], at: usize| usize::from(u16::from_le_bytes([b[at], b[at + 1]]));
+    let le32 = |b: &[u8], at: usize| u32::from_le_bytes(b[at..at + 4].try_into().unwrap()) as usize;
+    let end_at = zip.len() - 22;
+    assert_eq!(&zip[end_at..end_at + 4], b"PK\x05\x06", "unexpected end record");
+    let (cd_size, cd_start) = (le32(zip, end_at + 12), le32(zip, end_at + 16));
+    // (disk, offset on that disk) of a position in `zip`, which moves by the marker.
+    let place = |pos: usize| ((pos + 4) / chunk, (pos + 4) % chunk);
+    let mut cd = zip[cd_start..cd_start + cd_size].to_vec();
+    let mut p = 0;
+    while p < cd.len() {
+        assert_eq!(&cd[p..p + 4], b"PK\x01\x02");
+        let (disk, offset) = place(le32(&cd, p + 42));
+        cd[p + 34..p + 36].copy_from_slice(&(disk as u16).to_le_bytes());
+        cd[p + 42..p + 46].copy_from_slice(&(offset as u32).to_le_bytes());
+        p += 46 + le16(&cd, p + 28) + le16(&cd, p + 30) + le16(&cd, p + 32);
+    }
+    let mut stream = b"PK\x07\x08".to_vec();
+    stream.extend_from_slice(&zip[..cd_start]);
+    stream.extend_from_slice(&cd);
+    let mut disks: Vec<Vec<u8>> = stream.chunks(chunk).map(<[u8]>::to_vec).collect();
+    let mut end = zip[end_at..].to_vec();
+    let (cd_disk, cd_offset) = place(cd_start);
+    end[4..6].copy_from_slice(&((disks.len() - 1) as u16).to_le_bytes());
+    end[6..8].copy_from_slice(&(cd_disk as u16).to_le_bytes());
+    end[16..20].copy_from_slice(&(cd_offset as u32).to_le_bytes());
+    disks.last_mut().unwrap().extend_from_slice(&end);
+    let count = disks.len();
+    disks
+        .into_iter()
+        .enumerate()
+        .map(|(i, data)| {
+            let p = if i + 1 == count { dir.join(format!("{name}.zip")) } else { dir.join(format!("{name}.z{:02}", i + 1)) };
+            fs::write(&p, data).unwrap();
+            p
+        })
+        .collect()
+}
+
+/// The smallest volume size from `min` on for which the central directory of `zip`
+/// (split as by [`split_spanned`]) crosses from one volume into the next.
+fn chunk_splitting_central_directory(zip: &[u8], min: usize) -> usize {
+    let end_at = zip.len() - 22;
+    let le32 = |at: usize| u32::from_le_bytes(zip[at..at + 4].try_into().unwrap()) as usize;
+    let (first, last) = (le32(end_at + 16) + 4, le32(end_at + 16) + le32(end_at + 12) + 3);
+    (min..).find(|n| first / n != last / n).unwrap()
+}
+
+/// The fixture payload plus a few more entries, as a spanned set of `span.*` volumes in
+/// `f.dl` whose central directory crosses a volume boundary.
+fn spanned_payload(f: &Fixture, password: Option<&str>) -> Vec<PathBuf> {
+    let whole = f.src.join("whole.zip");
+    payload_zip(f, &whole, password);
+    let zip = fs::read(&whole).unwrap();
+    let chunk = chunk_splitting_central_directory(&zip, 30_000);
+    let volumes = split_spanned(&f.dl, "span", &zip, chunk);
+    assert!(volumes.len() >= 4, "{volumes:?}");
+    volumes
+}
+
+#[test]
+fn spanned_zip_extracts_natively() {
+    let f = fixture();
+    let volumes = spanned_payload(&f, None);
+    let (r, logs) = run(&f.dl, "job", &PostOptions::default());
+    assert_eq!(r.extract, Verdict::Ok, "{logs:#?}");
+    assert_payload_extracted(&f.dl.join("job"), &f.src);
+    assert!(logs.iter().any(|l| l.contains(&format!("via native zip ({} spanned volumes)", volumes.len()))), "{logs:#?}");
+    assert_eq!(r.removed, volumes);
+}
+
+#[test]
+fn aes_spanned_zip_right_wrong_and_missing_password() {
+    let f = fixture();
+    let volumes = spanned_payload(&f, Some("Correct Horse"));
+    let (r, logs) = run(&f.dl, "job", &with_password("wrong one"));
+    assert_eq!(r.extract, Verdict::Failed("wrong password".into()), "{logs:#?}");
+    let (r, logs) = run(&f.dl, "job", &PostOptions::default());
+    assert_failed_with(&r.extract, "password required", &logs);
+    let (r, logs) = run(&f.dl, "job", &with_password("Correct Horse"));
+    assert_eq!(r.extract, Verdict::Ok, "{logs:#?}");
+    assert!(logs.iter().all(|l| !l.contains("Correct Horse")), "password leaked into logs");
+    assert_payload_extracted(&f.dl.join("job"), &f.src);
+    assert_eq!(r.removed, volumes);
+}
+
+#[test]
+fn spanned_zip_with_missing_volume_fails_without_cleanup() {
+    // A gap in the numbering, and a missing last `.zNN` (no gap, but the end record
+    // counts one disk more).
+    for missing in ["span.z02", "LAST"] {
+        let f = fixture();
+        let volumes = spanned_payload(&f, None);
+        let gone = if missing == "LAST" { volumes[volumes.len() - 2].clone() } else { f.dl.join(missing) };
+        fs::remove_file(&gone).unwrap();
+        let (r, logs) = run(&f.dl, "job", &PostOptions { cleanup: true, ..Default::default() });
+        assert_failed_with(&r.extract, "missing or incomplete archive volume", &logs);
+        assert!(r.removed.is_empty(), "{missing}");
+        assert!(volumes.iter().filter(|v| **v != gone).all(|v| v.exists()), "{missing}");
+        assert!(!f.dl.join("job").exists(), "{missing}: {logs:#?}");
+    }
+}
+
+#[test]
+fn damaged_spanned_zip_end_record_fails() {
+    let f = fixture();
+    let volumes = spanned_payload(&f, None);
+    let last = volumes.last().unwrap();
+    let mut d = fs::read(last).unwrap();
+    let n = d.len();
+    // The central directory offset now points past the archive data.
+    d[n - 6..n - 2].copy_from_slice(&u32::MAX.to_le_bytes());
+    fs::write(last, d).unwrap();
+    let (r, logs) = run(&f.dl, "job", &PostOptions::default());
+    assert_failed_with(&r.extract, "corrupt", &logs);
+    assert!(r.removed.is_empty());
+}
+
+/// Spanned sets made by Info-ZIP (`zip -s`), stored and deflated, with several entries
+/// one of which crosses volume boundaries.
+#[test]
+fn spanned_zips_made_by_info_zip_extract_natively() {
+    let zip_tool = tool_or_skip!("zip");
+    for method in ["-0", "-6"] {
+        let f = fixture();
+        fs::write(f.src.join("c.txt"), "compressible text\n".repeat(5_000)).unwrap();
+        fs::write(f.src.join("sub").join("d.bin"), pseudo_random(90_000, 13)).unwrap();
+        let archive = f.dl.join("span.zip");
+        sh(&zip_tool, &["-q", "-r", method, "-s", "64k", archive.to_str().unwrap(), "a.txt", "c.txt", "sub"], &f.src);
+        let mut volumes: Vec<PathBuf> = fs::read_dir(&f.dl).unwrap().map(|e| e.unwrap().path()).collect();
+        volumes.sort();
+        assert!(volumes.len() >= 4 && f.dl.join("span.z03").exists(), "{method}: {volumes:?}");
+
+        let (r, logs) = run(&f.dl, "job", &PostOptions::default());
+        assert_eq!(r.extract, Verdict::Ok, "{method}: {logs:#?}");
+        let job = f.dl.join("job");
+        assert_payload_extracted(&job, &f.src);
+        for rel in ["c.txt", "sub/d.bin"] {
+            assert_eq!(fs::read(job.join(rel)).unwrap(), fs::read(f.src.join(rel)).unwrap(), "{method}: {rel}");
+        }
+        assert_eq!(r.removed, volumes, "{method}");
+    }
+}
+
+#[test]
+fn passworded_spanned_zip_made_by_info_zip() {
+    let zip_tool = tool_or_skip!("zip");
+    let f = fixture();
+    let archive = f.dl.join("span.zip");
+    // ZipCrypto, the only encryption Info-ZIP writes.
+    sh(&zip_tool, &["-q", "-r", "-P", "Correct Horse", "-s", "64k", archive.to_str().unwrap(), "a.txt", "sub"], &f.src);
+    assert!(f.dl.join("span.z02").exists());
+    let (r, logs) = run(&f.dl, "job", &with_password("wrong one"));
+    assert_eq!(r.extract, Verdict::Failed("wrong password".into()), "{logs:#?}");
+    let (r, logs) = run(&f.dl, "job", &PostOptions::default());
+    assert_failed_with(&r.extract, "password required", &logs);
+    let (r, logs) = run(&f.dl, "job", &with_password("Correct Horse"));
+    assert_eq!(r.extract, Verdict::Ok, "{logs:#?}");
+    assert_payload_extracted(&f.dl.join("job"), &f.src);
 }
 
 // ---------------------------------------------------------------- native 7z
@@ -285,7 +450,7 @@ fn sevenz_extracts_natively() {
     let f = fixture();
     let archive = f.dl.join("payload.7z");
     payload_7z(&f, fs::File::create(&archive).unwrap(), None, false);
-    let (r, logs) = native(&f.dl, "job", &PostOptions::default());
+    let (r, logs) = run(&f.dl, "job", &PostOptions::default());
     assert_eq!(r.extract, Verdict::Ok, "{logs:#?}");
     assert_payload_extracted(&f.dl.join("job"), &f.src);
     assert!(logs.iter().any(|l| l.contains("via native 7z")), "{logs:#?}");
@@ -299,14 +464,14 @@ fn encrypted_7z_right_wrong_and_missing_password_natively() {
         let archive = f.dl.join("secret.7z");
         payload_7z(&f, fs::File::create(&archive).unwrap(), Some("Correct Horse"), header_encryption);
 
-        let (r, logs) = native(&f.dl, "job", &with_password("wrong one"));
+        let (r, logs) = run(&f.dl, "job", &with_password("wrong one"));
         assert_eq!(r.extract, Verdict::Failed("wrong password".into()), "hdr={header_encryption} {logs:#?}");
         assert!(logs.iter().all(|l| !l.contains("wrong one")), "password leaked into logs");
 
-        let (r, logs) = native(&f.dl, "job", &PostOptions::default());
+        let (r, logs) = run(&f.dl, "job", &PostOptions::default());
         assert_failed_with(&r.extract, "password required", &logs);
 
-        let (r, logs) = native(&f.dl, "job", &with_password("Correct Horse"));
+        let (r, logs) = run(&f.dl, "job", &with_password("Correct Horse"));
         assert_eq!(r.extract, Verdict::Ok, "hdr={header_encryption} {logs:#?}");
         assert!(logs.iter().all(|l| !l.contains("Correct Horse")), "password leaked into logs");
         assert_payload_extracted(&f.dl.join("job"), &f.src);
@@ -323,7 +488,7 @@ fn multi_volume_7z_is_chained_and_cleaned_up() {
     let volumes = split_volumes(&f.dl, "big.7z", whole.get_ref(), 40_000);
     assert!(volumes.len() >= 3, "{volumes:?}");
 
-    let (r, logs) = native(&f.dl, "Big Job", &PostOptions::default());
+    let (r, logs) = run(&f.dl, "Big Job", &PostOptions::default());
     assert_eq!(r.extract, Verdict::Ok, "{logs:#?}");
     assert_payload_extracted(&f.dl.join("Big Job"), &f.src);
     assert!(logs.iter().any(|l| l.contains(&format!("7z ({} volumes)", volumes.len()))), "{logs:#?}");
@@ -337,7 +502,7 @@ fn missing_middle_volume_fails_without_cleanup() {
     payload_7z(&f, &mut whole, None, false);
     split_volumes(&f.dl, "big.7z", whole.get_ref(), 40_000);
     fs::remove_file(f.dl.join("big.7z.002")).unwrap();
-    let (r, logs) = native(&f.dl, "job", &PostOptions { cleanup: true, ..Default::default() });
+    let (r, logs) = run(&f.dl, "job", &PostOptions { cleanup: true, ..Default::default() });
     assert_failed_with(&r.extract, "missing or incomplete archive volume", &logs);
     assert!(r.removed.is_empty());
     assert!(f.dl.join("big.7z.001").exists());
@@ -350,7 +515,7 @@ fn missing_last_volume_fails() {
     payload_7z(&f, &mut whole, None, false);
     let volumes = split_volumes(&f.dl, "big.7z", whole.get_ref(), 40_000);
     fs::remove_file(volumes.last().unwrap()).unwrap();
-    let (r, logs) = native(&f.dl, "job", &PostOptions::default());
+    let (r, logs) = run(&f.dl, "job", &PostOptions::default());
     assert_failed_with(&r.extract, "missing or incomplete archive volume", &logs);
     assert!(r.removed.is_empty());
 }
@@ -362,7 +527,7 @@ fn missing_first_volume_is_reported() {
     payload_7z(&f, &mut whole, None, false);
     split_volumes(&f.dl, "big.7z", whole.get_ref(), 40_000);
     fs::remove_file(f.dl.join("big.7z.001")).unwrap();
-    let (r, logs) = native(&f.dl, "job", &PostOptions::default());
+    let (r, logs) = run(&f.dl, "job", &PostOptions::default());
     assert_failed_with(&r.extract, "first volume missing", &logs);
 }
 
@@ -373,7 +538,7 @@ fn obfuscated_archive_detected_by_magic() {
     // A real document that happens to be a zip container must not be touched.
     let docx = f.dl.join("notes.docx");
     payload_zip(&f, &docx, None);
-    let (r, logs) = native(&f.dl, "job", &PostOptions::default());
+    let (r, logs) = run(&f.dl, "job", &PostOptions::default());
     assert_eq!(r.extract, Verdict::Ok, "{logs:#?}");
     assert_payload_extracted(&f.dl.join("job"), &f.src);
     assert!(logs.iter().all(|l| !l.contains("notes.docx")), "{logs:#?}");
@@ -395,7 +560,7 @@ fn rar4_and_rar5_extract_natively() {
     let v = rar_fixture(&f, "version.rar"); // RAR 1.5 format
     rar_fixture(&f, "solid.rar"); // RAR 5, solid
     rar_fixture(&f, "unicode.rar"); // RAR 5, non-ASCII entry name
-    let (r, logs) = native(&f.dl, "job", &PostOptions::default());
+    let (r, logs) = run(&f.dl, "job", &PostOptions::default());
     assert_eq!(r.extract, Verdict::Ok, "{logs:#?}");
     let job = f.dl.join("job");
     assert_eq!(fs::read_to_string(job.join("VERSION")).unwrap(), "unrar-0.4.0");
@@ -413,15 +578,15 @@ fn encrypted_rar_right_wrong_and_missing_password() {
         let f = fixture();
         let archive = rar_fixture(&f, file);
 
-        let (r, logs) = native(&f.dl, "job", &with_password("not it"));
+        let (r, logs) = run(&f.dl, "job", &with_password("not it"));
         assert_eq!(r.extract, Verdict::Failed("wrong password".into()), "{file}: {logs:#?}");
         assert!(logs.iter().all(|l| !l.contains("not it")), "password leaked into logs");
         assert!(!f.dl.join("job").join(".gitignore").exists(), "{file}: no output for a wrong password");
 
-        let (r, logs) = native(&f.dl, "job", &PostOptions::default());
+        let (r, logs) = run(&f.dl, "job", &PostOptions::default());
         assert_failed_with(&r.extract, "password required", &logs);
 
-        let (r, logs) = native(&f.dl, "job", &with_password(pw));
+        let (r, logs) = run(&f.dl, "job", &with_password(pw));
         assert_eq!(r.extract, Verdict::Ok, "{file}: {logs:#?}");
         // (The second fixture's file name contains its password.)
         assert!(logs.iter().all(|l| !l.replace(file, "").contains(pw)), "password leaked into logs");
@@ -434,7 +599,7 @@ fn encrypted_rar_right_wrong_and_missing_password() {
 fn rar_with_missing_volume_fails_without_output() {
     let f = fixture();
     let first = rar_fixture(&f, "archive.part1.rar");
-    let (r, logs) = native(&f.dl, "job", &PostOptions::default());
+    let (r, logs) = run(&f.dl, "job", &PostOptions::default());
     assert_failed_with(&r.extract, "missing or incomplete archive volume", &logs);
     assert!(r.removed.is_empty());
     assert!(first.exists());
@@ -443,11 +608,11 @@ fn rar_with_missing_volume_fails_without_output() {
 }
 
 #[test]
-fn junk_rar_fails_without_any_tools() {
+fn junk_rar_fails() {
     let f = fixture();
     fs::write(f.dl.join("x.par2"), b"PAR2\0PKT").unwrap();
     fs::write(f.dl.join("x.rar"), b"Rar!\x1a\x07\x01\x00junk").unwrap();
-    let (r, logs) = native(&f.dl, "job", &PostOptions { cleanup: true, ..Default::default() });
+    let (r, logs) = run(&f.dl, "job", &PostOptions { cleanup: true, ..Default::default() });
     assert_eq!(r.par2, Verdict::Skipped("PAR2 files unreadable".into()));
     assert!(r.extract.is_failed(), "{logs:#?}");
     assert!(r.removed.is_empty());
@@ -459,12 +624,11 @@ fn junk_rar_fails_without_any_tools() {
 
 #[test]
 fn no_archives_and_no_par2_is_skipped() {
-    let tools = detect_tools();
     let f = fixture();
     fs::write(f.dl.join("movie.mkv"), pseudo_random(10_000, 3)).unwrap();
     fs::write(f.dl.join("movie.mkv.nkpart"), b"partial").unwrap();
     let opts = PostOptions { cleanup: true, ..Default::default() };
-    let (r, _) = run(&f.dl, "job", &opts, &tools);
+    let (r, _) = run(&f.dl, "job", &opts);
     assert_eq!(r.par2, Verdict::Skipped("no PAR2 files".into()));
     assert_eq!(r.extract, Verdict::Skipped("no archives found".into()));
     assert_eq!(r.extracted_to, None);
@@ -477,17 +641,15 @@ fn extraction_disabled_is_skipped() {
     let f = fixture();
     fs::write(f.dl.join("x.zip"), b"PK\x03\x04").unwrap();
     let opts = PostOptions { extract: false, ..Default::default() };
-    let (r, _) = native(&f.dl, "job", &opts);
+    let (r, _) = run(&f.dl, "job", &opts);
     assert_eq!(r.extract, Verdict::Skipped("extraction disabled".into()));
 }
 
-// ------------------------------------------------- archives made by 7-Zip / zip
+// ------------------------------------------------------- archives made by 7-Zip
 
 #[test]
 fn archives_made_by_7zip_extract_natively() {
-    let tools = detect_tools();
-    require!(tools, sevenz);
-    let seven = tools.sevenz.clone().unwrap();
+    let seven = tool_or_skip!("7z", "7zz", "7za");
     let sub = sub_path("b.bin");
     let cases: [(&str, &[&str]); 5] = [
         ("deflate.zip", &["-tzip"]),
@@ -503,7 +665,7 @@ fn archives_made_by_7zip_extract_natively() {
         args.extend_from_slice(switches);
         args.extend([archive.to_str().unwrap(), "a.txt", sub.as_str()]);
         sh(&seven, &args, &f.src);
-        let (r, logs) = native(&f.dl, "job", &PostOptions::default());
+        let (r, logs) = run(&f.dl, "job", &PostOptions::default());
         assert_eq!(r.extract, Verdict::Ok, "{name}: {logs:#?}");
         assert_payload_extracted(&f.dl.join("job"), &f.src);
     }
@@ -511,9 +673,7 @@ fn archives_made_by_7zip_extract_natively() {
 
 #[test]
 fn passworded_archives_made_by_7zip() {
-    let tools = detect_tools();
-    require!(tools, sevenz);
-    let seven = tools.sevenz.clone().unwrap();
+    let seven = tool_or_skip!("7z", "7zz", "7za");
     let sub = sub_path("b.bin");
     // 7-Zip writes ZipCrypto for zip by default and AES for 7z; -mhe hides the names.
     for (name, extra) in [("zc.zip", "-tzip"), ("aes.zip", "-mem=AES256"), ("hdr.7z", "-mhe=on"), ("data.7z", "-t7z")] {
@@ -526,11 +686,11 @@ fn passworded_archives_made_by_7zip() {
         args.extend([archive.to_str().unwrap(), "a.txt", sub.as_str()]);
         sh(&seven, &args, &f.src);
 
-        let (r, logs) = native(&f.dl, "job", &with_password("wrong one"));
+        let (r, logs) = run(&f.dl, "job", &with_password("wrong one"));
         assert_eq!(r.extract, Verdict::Failed("wrong password".into()), "{name}: {logs:#?}");
-        let (r, logs) = native(&f.dl, "job", &PostOptions::default());
+        let (r, logs) = run(&f.dl, "job", &PostOptions::default());
         assert_failed_with(&r.extract, "password required", &logs);
-        let (r, logs) = native(&f.dl, "job", &with_password("Correct Horse"));
+        let (r, logs) = run(&f.dl, "job", &with_password("Correct Horse"));
         assert_eq!(r.extract, Verdict::Ok, "{name}: {logs:#?}");
         assert_payload_extracted(&f.dl.join("job"), &f.src);
     }
@@ -538,44 +698,17 @@ fn passworded_archives_made_by_7zip() {
 
 #[test]
 fn volumes_made_by_7zip_are_chained() {
-    let tools = detect_tools();
-    require!(tools, sevenz);
+    let seven = tool_or_skip!("7z", "7zz", "7za");
     let f = fixture();
     let base = f.dl.join("big.7z");
-    sh(
-        tools.sevenz.as_ref().unwrap(),
-        &["a", "-mx0", "-v40k", base.to_str().unwrap(), "a.txt", &sub_path("b.bin")],
-        &f.src,
-    );
+    sh(&seven, &["a", "-mx0", "-v40k", base.to_str().unwrap(), "a.txt", &sub_path("b.bin")], &f.src);
     let mut volumes: Vec<PathBuf> = fs::read_dir(&f.dl).unwrap().map(|e| e.unwrap().path()).collect();
     volumes.sort();
     assert!(volumes.len() >= 3, "expected several volumes, got {volumes:?}");
-    let (r, logs) = native(&f.dl, "Big Job", &PostOptions::default());
+    let (r, logs) = run(&f.dl, "Big Job", &PostOptions::default());
     assert_eq!(r.extract, Verdict::Ok, "{logs:#?}");
     assert_payload_extracted(&f.dl.join("Big Job"), &f.src);
     assert_eq!(r.removed, volumes);
-}
-
-/// A spanned zip (`.z01` + `.zip`) is not supported natively and goes to 7-Zip.
-#[test]
-fn spanned_zip_falls_back_to_7zip() {
-    let tools = detect_tools();
-    require!(tools, sevenz);
-    let dirs: Vec<PathBuf> = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect()).unwrap_or_default();
-    let Some(zip_tool) = find_tool(&["zip"], &dirs) else {
-        eprintln!("note: skipping test, `zip` tool not installed");
-        return;
-    };
-    let f = fixture();
-    let archive = f.dl.join("span.zip");
-    sh(&zip_tool, &["-q", "-0", "-s", "64k", archive.to_str().unwrap(), "a.txt", &sub_path("b.bin")], &f.src);
-    assert!(f.dl.join("span.z01").exists());
-
-    let only7z = Tools { sevenz: tools.sevenz.clone(), ..Tools::none() };
-    let (r, logs) = run(&f.dl, "job", &PostOptions::default(), &only7z);
-    assert_eq!(r.extract, Verdict::Ok, "{logs:#?}");
-    assert!(logs.iter().any(|l| l.contains("falling back to 7z")), "{logs:#?}");
-    assert_payload_extracted(&f.dl.join("job"), &f.src);
 }
 
 // ---------------------------------------------------------------- zip-slip
@@ -623,7 +756,7 @@ fn write_raw_zip_modes(path: &Path, entries: &[(&str, &[u8], u32)]) {
         out.extend(*data);
 
         central.extend(0x0201_4b50u32.to_le_bytes());
-        // version made by: 2.0, host 3 (Unix) when a mode is given so tools honor it
+        // version made by: 2.0, host 3 (Unix) when a mode is given so readers honor it
         central.extend(if *mode != 0 { 0x0314u16 } else { 20u16 }.to_le_bytes());
         central.extend(&hdr[4..]); // version needed .. extra len (26 bytes)
         central.extend(0u16.to_le_bytes()); // comment len
@@ -650,7 +783,7 @@ fn write_raw_zip_modes(path: &Path, entries: &[(&str, &[u8], u32)]) {
 fn raw_zip_writer_produces_valid_archives() {
     let f = fixture();
     write_raw_zip(&f.dl.join("ok.zip"), &[("dir/good.txt", b"fine")]);
-    let (r, logs) = native(&f.dl, "job", &PostOptions::default());
+    let (r, logs) = run(&f.dl, "job", &PostOptions::default());
     assert_eq!(r.extract, Verdict::Ok, "{logs:#?}");
     assert_eq!(fs::read(f.dl.join("job").join("dir").join("good.txt")).unwrap(), b"fine");
 }
@@ -660,7 +793,7 @@ fn zip_slip_archive_is_refused() {
     for evil in ["../escaped.txt", "/tmp/nk-escaped.txt", "a/../../escaped.txt", "..\\escaped.txt"] {
         let f = fixture();
         write_raw_zip(&f.dl.join("evil.zip"), &[("good.txt", b"fine"), (evil, b"pwned")]);
-        let (r, logs) = native(&f.dl, "job", &PostOptions { cleanup: true, ..Default::default() });
+        let (r, logs) = run(&f.dl, "job", &PostOptions { cleanup: true, ..Default::default() });
         assert_failed_with(&r.extract, "unsafe path", &logs);
         assert!(!f.dl.join("escaped.txt").exists(), "{evil}: file escaped the target");
         assert!(!f.dl.join("job").join("good.txt").exists(), "{evil}: nothing may be extracted");
@@ -678,7 +811,7 @@ fn internal_link_entry_is_skipped() {
         &f.dl.join("a.zip"),
         &[("real.txt", b"data", 0o100_644), ("alias.txt", b"real.txt", S_IFLNK | 0o777)],
     );
-    let (r, logs) = native(&f.dl, "job", &PostOptions::default());
+    let (r, logs) = run(&f.dl, "job", &PostOptions::default());
     assert_eq!(r.extract, Verdict::Ok, "{logs:#?}");
     let target = f.dl.join("job");
     assert_eq!(fs::read(target.join("real.txt")).unwrap(), b"data");
@@ -701,7 +834,7 @@ fn escaping_link_from_failed_set_is_never_written_through() {
             &[("link", dest.as_bytes(), S_IFLNK | 0o777), ("link/x", b"x", 0o100_644)],
         );
         write_raw_zip(&f.dl.join("b.zip"), &[("link/pwn.txt", b"owned")]);
-        let (r, logs) = native(&f.dl, "job", &PostOptions::default());
+        let (r, logs) = run(&f.dl, "job", &PostOptions::default());
         assert!(!outside.join("pwn.txt").exists(), "{link_dest}: file written outside the target {logs:#?}");
         assert!(!outside.join("x").exists(), "{link_dest}: file written outside the target {logs:#?}");
         assert_failed_with(&r.extract, "link pointing outside", &logs);
@@ -714,7 +847,7 @@ fn escaping_link_from_failed_set_is_never_written_through() {
         let _ = fs::remove_dir_all(target.join("link"));
         std::os::unix::fs::symlink(&outside, target.join("link")).unwrap();
         fs::remove_file(f.dl.join("a.zip")).unwrap();
-        let (_r, logs) = native(&f.dl, "job", &PostOptions::default());
+        let (_r, logs) = run(&f.dl, "job", &PostOptions::default());
         assert!(!outside.join("pwn.txt").exists(), "{link_dest} retry: file written outside the target {logs:#?}");
         assert_eq!(fs::read(target.join("link").join("pwn.txt")).unwrap(), b"owned", "{link_dest} retry {logs:#?}");
         // No staging folders are left behind.
@@ -729,19 +862,28 @@ fn escaping_link_from_failed_set_is_never_written_through() {
 
 // ---------------------------------------------------------------- PAR2
 
-/// par2cmdline uses every core with spinning worker threads; several instances at once
-/// slow each other down dramatically, so PAR2 tests run one at a time.
-static PAR2_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-fn par2_guard() -> std::sync::MutexGuard<'static, ()> {
-    PAR2_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+/// A PAR2 set `<base>.par2` + `<base>.vol00+NN.par2` for `files` in `dir`, made natively:
+/// 4 KiB slices and `recovery` recovery slices. Returns the PAR2 files.
+fn par2_create(dir: &Path, base: &str, files: &[&str], recovery: u32) -> Vec<PathBuf> {
+    let mut made = newskite_par2::create(dir, files, 4096, recovery, &dir.join(base)).unwrap();
+    made.sort();
+    made
 }
 
-fn par2_create(tools: &Tools, dir: &Path, base: &str, files: &[&str]) {
+/// A PAR2 set made by par2cmdline (`base` names the main file), with 25% redundancy.
+fn par2cmdline_create(par2: &Path, dir: &Path, base: &str, files: &[&str]) {
     let mut args = vec!["c", "-q", "-q", "-r25", "-n2"];
     args.push(base);
     args.extend(files);
-    sh(tools.par2.as_ref().unwrap(), &args, dir);
+    sh(par2, &args, dir);
+}
+
+/// par2cmdline uses every core with spinning worker threads; several instances at once
+/// slow each other down dramatically, so the tests that run it go one at a time.
+static PAR2CMDLINE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn par2cmdline_guard() -> std::sync::MutexGuard<'static, ()> {
+    PAR2CMDLINE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 fn damage(path: &Path, offset: usize, len: usize) {
@@ -754,32 +896,49 @@ fn damage(path: &Path, offset: usize, len: usize) {
 
 #[test]
 fn par2_intact_set_is_ok() {
-    let tools = detect_tools();
-    require!(tools, par2);
-    let _guard = par2_guard();
     let f = fixture();
     fs::write(f.dl.join("data.bin"), pseudo_random(200_000, 11)).unwrap();
-    par2_create(&tools, &f.dl, "data.par2", &["data.bin"]);
-    let (r, logs) = run(&f.dl, "job", &PostOptions::default(), &tools);
+    par2_create(&f.dl, "data", &["data.bin"], 10);
+    let (r, logs) = run(&f.dl, "job", &PostOptions::default());
     assert_eq!(r.par2, Verdict::Ok, "{logs:#?}");
 }
 
+/// Sets made by par2cmdline are verified and repaired natively too.
 #[test]
-fn par2_repairs_damaged_and_renamed_files() {
-    let tools = detect_tools();
-    require!(tools, par2);
-    let _guard = par2_guard();
+fn par2cmdline_sets_are_verified_and_repaired() {
+    let par2 = tool_or_skip!("par2");
+    let _guard = par2cmdline_guard();
     let f = fixture();
     let one = pseudo_random(300_000, 21);
     let two = pseudo_random(120_000, 22);
     fs::write(f.dl.join("one.bin"), &one).unwrap();
     fs::write(f.dl.join("two.bin"), &two).unwrap();
-    par2_create(&tools, &f.dl, "set.par2", &["one.bin", "two.bin"]);
+    par2cmdline_create(&par2, &f.dl, "set.par2", &["one.bin", "two.bin"]);
+    let (r, logs) = run(&f.dl, "job", &PostOptions { remove_leftovers: false, ..Default::default() });
+    assert_eq!(r.par2, Verdict::Ok, "{logs:#?}");
+
     damage(&f.dl.join("one.bin"), 5_000, 4_096);
-    // Obfuscated name: par2 must find it by content and rename it back.
+    // Obfuscated name: found by content and renamed back.
+    fs::rename(f.dl.join("two.bin"), f.dl.join("x7f3a9c1")).unwrap();
+    let (r, logs) = run(&f.dl, "job", &PostOptions::default());
+    assert_eq!(r.par2, Verdict::Repaired, "{logs:#?}");
+    assert_eq!(fs::read(f.dl.join("one.bin")).unwrap(), one);
+    assert_eq!(fs::read(f.dl.join("two.bin")).unwrap(), two);
+}
+
+#[test]
+fn par2_repairs_damaged_and_renamed_files() {
+    let f = fixture();
+    let one = pseudo_random(300_000, 21);
+    let two = pseudo_random(120_000, 22);
+    fs::write(f.dl.join("one.bin"), &one).unwrap();
+    fs::write(f.dl.join("two.bin"), &two).unwrap();
+    par2_create(&f.dl, "set", &["one.bin", "two.bin"], 10);
+    damage(&f.dl.join("one.bin"), 5_000, 4_096);
+    // Obfuscated name: found by content and renamed back.
     fs::rename(f.dl.join("two.bin"), f.dl.join("x7f3a9c1")).unwrap();
 
-    let (r, logs) = run(&f.dl, "job", &PostOptions::default(), &tools);
+    let (r, logs) = run(&f.dl, "job", &PostOptions::default());
     assert_eq!(r.par2, Verdict::Repaired, "{logs:#?}");
     assert_eq!(fs::read(f.dl.join("one.bin")).unwrap(), one);
     assert_eq!(fs::read(f.dl.join("two.bin")).unwrap(), two);
@@ -787,30 +946,24 @@ fn par2_repairs_damaged_and_renamed_files() {
 
 #[test]
 fn par2_repair_disabled_reports_failure_and_skips_extraction() {
-    let tools = detect_tools();
-    require!(tools, par2);
-    let _guard = par2_guard();
     let f = fixture();
     fs::write(f.dl.join("data.bin"), pseudo_random(200_000, 31)).unwrap();
-    par2_create(&tools, &f.dl, "data.par2", &["data.bin"]);
+    par2_create(&f.dl, "data", &["data.bin"], 10);
     damage(&f.dl.join("data.bin"), 1_000, 100);
     let opts = PostOptions { repair: false, ..Default::default() };
-    let (r, _) = run(&f.dl, "job", &opts, &tools);
+    let (r, _) = run(&f.dl, "job", &opts);
     assert!(r.par2.is_failed(), "{:?}", r.par2);
     assert!(matches!(r.extract, Verdict::Skipped(ref s) if s.contains("PAR2")));
 }
 
 #[test]
 fn par2_not_repairable_fails() {
-    let tools = detect_tools();
-    require!(tools, par2);
-    let _guard = par2_guard();
     let f = fixture();
     fs::write(f.dl.join("data.bin"), pseudo_random(200_000, 41)).unwrap();
-    par2_create(&tools, &f.dl, "data.par2", &["data.bin"]);
-    // Destroy far more than the 25% redundancy.
+    par2_create(&f.dl, "data", &["data.bin"], 10);
+    // Destroy far more than the 10 recovery slices can rebuild.
     damage(&f.dl.join("data.bin"), 0, 150_000);
-    let (r, logs) = run(&f.dl, "job", &PostOptions::default(), &tools);
+    let (r, logs) = run(&f.dl, "job", &PostOptions::default());
     match &r.par2 {
         Verdict::Failed(reason) => assert!(reason.contains("repair not possible"), "{reason} {logs:#?}"),
         other => panic!("expected failure, got {other:?}"),
@@ -819,37 +972,26 @@ fn par2_not_repairable_fails() {
 
 #[test]
 fn par2_repair_then_extract_then_cleanup() {
-    let tools = detect_tools();
-    require!(tools, par2, sevenz);
-    let _guard = par2_guard();
     let f = fixture();
     let zip = f.dl.join("release.zip");
-    sh(tools.sevenz.as_ref().unwrap(), &["a", "-tzip", "-mx0", zip.to_str().unwrap(), "a.txt", &sub_path("b.bin")], &f.src);
-    par2_create(&tools, &f.dl, "release.par2", &["release.zip"]);
-    let par2_files: Vec<PathBuf> = {
-        let mut v: Vec<PathBuf> = fs::read_dir(&f.dl)
-            .unwrap()
-            .map(|e| e.unwrap().path())
-            .filter(|p| p.extension().is_some_and(|e| e == "par2"))
-            .collect();
-        v.sort();
-        v
-    };
-    assert!(par2_files.len() >= 2);
+    payload_zip(&f, &zip, None);
+    let par2_files = par2_create(&f.dl, "release", &["release.zip"], 4);
+    assert_eq!(par2_files.len(), 2);
+    // Inside the stored sub/b.bin data.
     damage(&zip, 20_000, 2_000);
     // Release sidecars go with the archives; an unarchived payload file stays.
     fs::write(f.dl.join("info.nfo"), b"release notes").unwrap();
     fs::write(f.dl.join("extra.mkv"), b"payload").unwrap();
 
     let opts = PostOptions { cleanup: true, ..Default::default() };
-    let (r, logs) = run(&f.dl, "Release", &opts, &tools);
+    let (r, logs) = run(&f.dl, "Release", &opts);
     assert_eq!(r.par2, Verdict::Repaired, "{logs:#?}");
     assert_eq!(r.extract, Verdict::Ok, "{logs:#?}");
     assert_payload_extracted(&f.dl.join("Release"), &f.src);
 
     let mut expected = par2_files.clone();
     expected.push(zip.clone());
-    expected.push(f.dl.join("release.zip.1")); // par2's backup of the damaged copy
+    expected.push(f.dl.join("release.zip.1")); // the repair's backup of the damaged copy
     expected.push(f.dl.join("info.nfo"));
     expected.sort();
     assert_eq!(r.removed, expected, "{logs:#?}");
@@ -861,19 +1003,13 @@ fn par2_repair_then_extract_then_cleanup() {
 
 #[test]
 fn fully_obfuscated_release_is_renamed_by_par2_then_extracted() {
-    // Mirrors common posts: every file (archive volumes AND the .par2 files) has a random
-    // name with no extension. par2cmdline only accepts a main file ending in .par2, so the
-    // PAR2 files must be found by magic bytes and named before repair can rename the rest.
-    let tools = detect_tools();
-    require!(tools, par2, sevenz);
-    let _guard = par2_guard();
+    // Mirrors common posts: every file (archive volumes AND the PAR2 files) has a random
+    // name with no extension. The PAR2 files are found by their packets and named, the
+    // volumes are matched by content and renamed back.
     let f = fixture();
-    let archive = f.dl.join("release.7z");
-    sh(
-        tools.sevenz.as_ref().unwrap(),
-        &["a", "-t7z", "-mx0", "-v60k", archive.to_str().unwrap(), "a.txt", &sub_path("b.bin")],
-        &f.src,
-    );
+    let mut whole = std::io::Cursor::new(Vec::new());
+    payload_7z(&f, &mut whole, None, false);
+    split_volumes(&f.dl, "release.7z", whole.get_ref(), 60_000);
     let volumes: Vec<String> = {
         let mut v: Vec<String> = fs::read_dir(&f.dl)
             .unwrap()
@@ -884,7 +1020,7 @@ fn fully_obfuscated_release_is_renamed_by_par2_then_extracted() {
     };
     assert!(volumes.len() >= 3, "{volumes:?}");
     let refs: Vec<&str> = volumes.iter().map(String::as_str).collect();
-    par2_create(&tools, &f.dl, "release.par2", &refs);
+    par2_create(&f.dl, "release", &refs, 4);
 
     let mut all: Vec<PathBuf> = fs::read_dir(&f.dl).unwrap().map(|e| e.unwrap().path()).collect();
     all.sort();
@@ -892,10 +1028,10 @@ fn fully_obfuscated_release_is_renamed_by_par2_then_extracted() {
         fs::rename(p, f.dl.join(format!("Qx{i:02}obf9ZkL{}", i * 7))).unwrap();
     }
 
-    let (r, logs) = run(&f.dl, "Release", &PostOptions::default(), &tools);
+    let (r, logs) = run(&f.dl, "Release", &PostOptions::default());
     assert_eq!(r.par2, Verdict::Repaired, "{logs:#?}");
     assert_eq!(r.extract, Verdict::Ok, "{logs:#?}");
-    // par2 renamed every volume back to its real name (then cleanup removed it).
+    // Every volume was renamed back to its real name (then cleanup removed it).
     for v in &volumes {
         assert!(r.removed.contains(&f.dl.join(v)), "{v} should be renamed back: {logs:#?}");
     }
@@ -907,18 +1043,15 @@ fn fully_obfuscated_release_is_renamed_by_par2_then_extracted() {
 
 #[test]
 fn cleanup_removes_sidecars_but_keeps_unarchived_payload() {
-    let tools = detect_tools();
-    require!(tools, par2, sevenz);
-    let _guard = par2_guard();
     let f = fixture();
     let zip = f.dl.join("release.zip");
-    sh(tools.sevenz.as_ref().unwrap(), &["a", "-tzip", "-mx0", zip.to_str().unwrap(), "a.txt", &sub_path("b.bin")], &f.src);
-    par2_create(&tools, &f.dl, "release.par2", &["release.zip"]);
+    payload_zip(&f, &zip, None);
+    par2_create(&f.dl, "release", &["release.zip"], 2);
     fs::write(f.dl.join("release.sfv"), b"release.zip 00000000\n").unwrap();
     fs::write(f.dl.join("GROUP.NFO"), b"info").unwrap();
     fs::write(f.dl.join("sample.mkv"), b"unarchived payload").unwrap();
 
-    let (r, logs) = run(&f.dl, "Release", &PostOptions::default(), &tools);
+    let (r, logs) = run(&f.dl, "Release", &PostOptions::default());
     assert_eq!(r.extract, Verdict::Ok, "{logs:#?}");
     let mut left: Vec<String> = fs::read_dir(&f.dl).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
     left.sort();
@@ -928,23 +1061,20 @@ fn cleanup_removes_sidecars_but_keeps_unarchived_payload() {
 
 #[test]
 fn obfuscated_target_in_subfolder_is_renamed_into_it() {
-    // Releases often carry Sample/<name>-sample.mkv in the PAR2 set. par2cmdline does not
-    // create the folder, so the rename failed with an I/O error and aborted the others.
-    let tools = detect_tools();
-    require!(tools, par2);
-    let _guard = par2_guard();
+    // Releases often carry Sample/<name>-sample.mkv in the PAR2 set; the folder is created
+    // when the file is renamed back into it.
     let f = fixture();
     let main = pseudo_random(200_000, 51);
     let sample = pseudo_random(60_000, 52);
     fs::create_dir(f.dl.join("Sample")).unwrap();
     fs::write(f.dl.join("main.bin"), &main).unwrap();
     fs::write(f.dl.join("Sample").join("s.mkv"), &sample).unwrap();
-    par2_create(&tools, &f.dl, "set.par2", &["main.bin", &Path::new("Sample").join("s.mkv").to_string_lossy()]);
+    par2_create(&f.dl, "set", &["main.bin", "Sample/s.mkv"], 4);
     fs::rename(f.dl.join("main.bin"), f.dl.join("obfA")).unwrap();
     fs::rename(f.dl.join("Sample").join("s.mkv"), f.dl.join("obfB")).unwrap();
     fs::remove_dir(f.dl.join("Sample")).unwrap();
 
-    let (r, logs) = run(&f.dl, "job", &PostOptions::default(), &tools);
+    let (r, logs) = run(&f.dl, "job", &PostOptions::default());
     assert_eq!(r.par2, Verdict::Repaired, "{logs:#?}");
     assert_eq!(fs::read(f.dl.join("main.bin")).unwrap(), main);
     assert_eq!(fs::read(f.dl.join("Sample").join("s.mkv")).unwrap(), sample);

@@ -69,17 +69,16 @@ copyright = "2026, Pat"
 license-file = ["../../packaging/debian/copyright", "0"]
 section = "net"
 priority = "optional"
-# $auto finds the libraries linked at build time (libc, libgcc). winit/glutin load the
-# windowing libraries with dlopen, so those are listed explicitly.
+# $auto finds the libraries linked at build time (libc, libgcc, libstdc++ for the bundled
+# UnRAR library). winit/glutin load the windowing libraries with dlopen, so those are
+# listed explicitly.
 depends = "$auto, libgl1, libegl1, libxkbcommon0, libwayland-client0, libwayland-cursor0, libwayland-egl1, libx11-6, libxcursor1, libxrandr2, libxi6, libxkbcommon-x11-0"
-# Fallbacks only, for sets the native post-processing cannot read (see newskite-postproc).
-recommends = "par2, 7zip | p7zip-full, unzip"
-suggests = "unrar"
 extended-description = """\
 Newskite is a desktop Usenet (NZB) download client. It downloads the binary articles \
 listed in an NZB file from an NNTP server over TLS, decodes them, writes the original \
-files to disk and verifies, repairs and extracts them using the external par2, 7z, unrar \
-and unzip tools when they are installed. It keeps a resumable, reorderable queue with per-job \
+files to disk, then verifies and repairs them with PAR2 and extracts RAR, 7z and ZIP \
+archives (including split and spanned volumes and passwords) with built-in code; no \
+external tools are needed. It keeps a resumable, reorderable queue with per-job \
 pause and start, a download history and live throughput statistics, follows the desktop light or dark color scheme, and includes a \
 headless command-line mode (newskite --headless) that drives the same queue engine. \
 Server passwords are stored unencrypted in the local database."""

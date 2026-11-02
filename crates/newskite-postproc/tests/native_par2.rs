@@ -1,9 +1,9 @@
-//! Post-processing with native PAR2 (no external tools needed).
+//! Post-processing with native PAR2.
 
 use std::fs;
 use std::path::Path;
 
-use newskite_postproc::{process_with_events, PostEvent, PostOptions, PostStage, Tools, Verdict};
+use newskite_postproc::{process_with_events, PostEvent, PostOptions, PostStage, Verdict};
 
 fn bytes(len: usize, seed: u64) -> Vec<u8> {
     let mut x = seed | 1;
@@ -36,7 +36,7 @@ fn setup(names: &[(&str, usize)], recovery: u32) -> (tempfile::TempDir, std::pat
 fn go(dir: &Path, opts: &PostOptions) -> (newskite_postproc::PostReport, Vec<String>, Vec<PostStage>) {
     let mut logs = Vec::new();
     let mut stages = Vec::new();
-    let r = process_with_events(dir, "job", opts, &Tools::none(), &mut |e| match e {
+    let r = process_with_events(dir, "job", opts, &mut |e| match e {
         PostEvent::Log(l) => logs.push(l),
         PostEvent::Stage { stage, .. } => {
             if stages.last() != Some(&stage) {

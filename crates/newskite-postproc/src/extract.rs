@@ -1,149 +1,11 @@
-//! Archive extraction: the native backends (see [`crate::native`]) first, with 7-Zip /
-//! unrar / unzip as a fallback for archives a backend reports as unsupported; shared
-//! safety checks (entry paths, staging, link removal, merging into the target).
+//! Archive extraction through the native backends (see [`crate::native`]) and the shared
+//! safety steps around them: a private staging folder per set, the link sweep and the
+//! merge into the target folder.
 
-use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
-use std::time::Duration;
 
-use crate::detect::{ArchiveKind, ArchiveSet};
-use crate::native::{self, NativeError};
-use crate::tools::{ToolCommand, ToolRun, Tools};
-
-/// Listing is fast; a stuck listing almost certainly means a tool waiting on something.
-const LIST_TIMEOUT: Duration = Duration::from_secs(10 * 60);
-/// Extraction of very large sets on slow disks can take hours.
-const EXTRACT_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
-/// Listings must be complete to be checked; refuse archives with absurdly long listings.
-const LIST_CAPTURE: usize = 64 * 1024 * 1024;
-const EXTRACT_CAPTURE: usize = 1024 * 1024;
-
-/// Placeholder password used when the job has none. Passing *some* password guarantees
-/// that 7-Zip and unzip never fall back to an interactive prompt (unrar has `-p-` for
-/// this). For an unencrypted archive the value is ignored; for an encrypted one it simply
-/// fails like a wrong password, which is reported as "password required".
-const NO_PASSWORD_PLACEHOLDER: &str = "newskite-no-password";
-
-/// Which external program handles a set.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Extractor {
-    SevenZip(PathBuf),
-    Unrar(PathBuf),
-    Unzip(PathBuf),
-}
-
-impl Extractor {
-    fn name(&self) -> &'static str {
-        match self {
-            Extractor::SevenZip(_) => "7z",
-            Extractor::Unrar(_) => "unrar",
-            Extractor::Unzip(_) => "unzip",
-        }
-    }
-}
-
-/// Fallback tool for a set the native backend cannot read: unrar for RAR, 7-Zip for
-/// everything else, unzip for single-volume zip when 7-Zip is missing. (7-Zip can also
-/// read RAR when unrar is absent.)
-pub(crate) fn choose_extractor(set: &ArchiveSet, tools: &Tools) -> Option<Extractor> {
-    let sevenz = tools.sevenz.clone().map(Extractor::SevenZip);
-    match set.kind {
-        ArchiveKind::Rar => tools.unrar.clone().map(Extractor::Unrar).or(sevenz),
-        ArchiveKind::SevenZip => sevenz,
-        ArchiveKind::Zip => sevenz.or_else(|| {
-            let single = set.volumes.len() == 1;
-            if single { tools.unzip.clone().map(Extractor::Unzip) } else { None }
-        }),
-    }
-}
-
-fn path_arg(p: &Path) -> OsString {
-    p.as_os_str().to_os_string()
-}
-
-/// Command that lists entry paths of `archive`.
-pub(crate) fn list_command(ex: &Extractor, archive: &Path, password: Option<&str>) -> ToolCommand {
-    match ex {
-        Extractor::SevenZip(p) => ToolCommand::new(p)
-            .arg("l")
-            .arg("-slt")
-            .secret_arg("-p", password.unwrap_or(NO_PASSWORD_PLACEHOLDER))
-            .arg("--")
-            .arg(path_arg(archive)),
-        Extractor::Unrar(p) => {
-            let c = ToolCommand::new(p).arg("lb").arg("-c-");
-            let c = match password {
-                Some(pw) => c.secret_arg("-p", pw),
-                None => c.arg("-p-"),
-            };
-            c.arg("--").arg(path_arg(archive))
-        }
-        // zipinfo mode: one entry name per line; names are never encrypted in zip.
-        Extractor::Unzip(p) => ToolCommand::new(p).arg("-Z1").arg(path_arg(archive)),
-    }
-}
-
-/// Command that extracts `archive` into `target` (overwriting, never prompting).
-pub(crate) fn extract_command(ex: &Extractor, archive: &Path, target: &Path, password: Option<&str>) -> ToolCommand {
-    match ex {
-        Extractor::SevenZip(p) => {
-            let mut out = OsString::from("-o");
-            out.push(target.as_os_str());
-            ToolCommand::new(p)
-                .arg("x")
-                .arg("-y")
-                .arg("-aoa")
-                .arg("-bd")
-                .secret_arg("-p", password.unwrap_or(NO_PASSWORD_PLACEHOLDER))
-                .arg(out)
-                .arg("--")
-                .arg(path_arg(archive))
-        }
-        Extractor::Unrar(p) => {
-            let c = ToolCommand::new(p).arg("x").arg("-y").arg("-o+").arg("-c-");
-            let c = match password {
-                Some(pw) => c.secret_arg("-p", pw),
-                None => c.arg("-p-"),
-            };
-            // unrar treats the destination as a folder only with a trailing separator.
-            let mut dest = target.as_os_str().to_os_string();
-            dest.push(std::path::MAIN_SEPARATOR_STR);
-            c.arg("--").arg(path_arg(archive)).arg(dest)
-        }
-        Extractor::Unzip(p) => ToolCommand::new(p)
-            .arg("-o")
-            .arg("-P")
-            .secret_arg("", password.unwrap_or(NO_PASSWORD_PLACEHOLDER))
-            .arg(path_arg(archive))
-            .arg("-d")
-            .arg(path_arg(target)),
-    }
-}
-
-/// Entry paths from `7z l -slt` output (the `Path = ` lines after the `----------`
-/// separator; the block before it describes the archive itself).
-pub fn parse_7z_listing(out: &str) -> Vec<String> {
-    let mut entries = Vec::new();
-    let mut in_entries = false;
-    for line in out.lines() {
-        let line = line.trim_end_matches('\r');
-        if !in_entries {
-            if line.trim() == "----------" {
-                in_entries = true;
-            }
-            continue;
-        }
-        if let Some(p) = line.strip_prefix("Path = ") {
-            entries.push(p.to_string());
-        }
-    }
-    entries
-}
-
-/// Entry paths from `unrar lb` / `unzip -Z1` output: one per non-empty line.
-pub fn parse_bare_listing(out: &str) -> Vec<String> {
-    out.lines().map(|l| l.trim_end_matches('\r')).filter(|l| !l.is_empty()).map(str::to_string).collect()
-}
+use crate::detect::ArchiveSet;
+use crate::native;
 
 /// True when an archive entry path could escape the extraction folder: absolute paths
 /// (`/x`, `\x`, `C:...`, UNC) or any `..` component, with both `/` and `\` treated as
@@ -159,88 +21,6 @@ pub fn is_unsafe_entry(name: &str) -> bool {
     name.split(['/', '\\']).any(|c| c == "..")
 }
 
-/// Short failure reason from a tool run.
-pub(crate) fn failure_reason(tool: &str, run: &ToolRun, password_given: bool) -> String {
-    if run.timed_out {
-        return format!("{tool} timed out");
-    }
-    let lower = run.combined().to_lowercase();
-    let password_problem = ["wrong password", "incorrect password", "password is incorrect", "password incorrect"]
-        .iter()
-        .any(|p| lower.contains(p))
-        || (tool == "unrar" && run.code == Some(11))
-        || (tool == "unzip" && run.code == Some(82));
-    if password_problem {
-        return if password_given {
-            native::WRONG_PASSWORD.into()
-        } else {
-            native::PASSWORD_REQUIRED.into()
-        };
-    }
-    if [
-        "missing volume",
-        "unexpected end of archive",
-        "start extraction from a previous volume",
-        "cannot find volume",
-        "insert disk",
-    ]
-    .iter()
-    .any(|p| lower.contains(p))
-    {
-        return "missing or incomplete archive volume".into();
-    }
-    if lower.contains("no space left") || lower.contains("disk full") || lower.contains("not enough space") {
-        return "not enough disk space".into();
-    }
-    if [
-        "crc failed",
-        "checksum error",
-        "data error",
-        "headers error",
-        "can't open as archive",
-        "cannot open the file as archive",
-        "is not rar archive",
-        "end-of-central-directory signature not found",
-        "corrupt",
-        "unsupported method",
-    ]
-    .iter()
-    .any(|p| lower.contains(p))
-    {
-        return "archive is corrupt or damaged".into();
-    }
-    let detail = run
-        .combined()
-        .lines()
-        .map(str::trim)
-        .find(|l| l.to_lowercase().contains("error"))
-        .map(|l| {
-            let short: String = l.chars().take(160).collect();
-            format!(": {short}")
-        })
-        .unwrap_or_default();
-    match run.code {
-        Some(c) => format!("{tool} exited with code {c}{detail}"),
-        None => format!("{tool} was terminated{detail}"),
-    }
-}
-
-/// Exit code 0 is success; 1 (warning) is accepted unless the output names a real
-/// problem; anything else fails.
-fn run_succeeded(tool: &str, run: &ToolRun) -> bool {
-    if run.timed_out {
-        return false;
-    }
-    match run.code {
-        Some(0) => true,
-        Some(1) => {
-            let reason = failure_reason(tool, run, true);
-            reason.starts_with(tool) // only the generic fallback reason => plain warning
-        }
-        _ => false,
-    }
-}
-
 /// Outcome of one archive set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SetOutcome {
@@ -251,45 +31,27 @@ pub(crate) enum SetOutcome {
     Failed(String),
 }
 
-/// List, check and extract one set into `target` (which must exist): natively, or with
-/// an external tool when the native backend reports the archive as unsupported and a
-/// suitable tool is installed.
+/// List, check and extract one set into `target` (which must exist). The backend writes
+/// into a fresh private staging folder inside `target`, so nothing it writes can pass
+/// through a link left in the target by an earlier set, a failed run or a previous
+/// attempt. Whatever the outcome (a failed run can leave partial output), the staging
+/// folder is swept for links, merged into `target` without following any link already
+/// there and removed, and the whole target is checked once more. A set the backend
+/// reports as unsupported (an unknown codec or RAR feature) fails with that reason.
 pub(crate) fn extract_set(
     set: &ArchiveSet,
     target: &Path,
-    tools: &Tools,
     password: Option<&str>,
     log: &mut dyn FnMut(String),
 ) -> SetOutcome {
-    let name = set.first.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let staging = match make_staging_dir(target) {
         Ok(p) => p,
         Err(e) => return SetOutcome::Failed(format!("could not create a staging folder in {}: {e}", target.display())),
     };
     let native = native::extract(set, &staging, password, log);
 
-    if let Err(NativeError::Unsupported(why)) = &native {
-        // Nothing of a run that stopped on an unsupported feature is kept; the tool
-        // starts over in a staging folder of its own.
-        if let Err(e) = std::fs::remove_dir_all(&staging) {
-            log(format!("extract: could not remove staging folder {}: {e}", staging.display()));
-        }
-        let Some(ex) = choose_extractor(set, tools) else {
-            let hint = match set.kind {
-                ArchiveKind::Rar => "unrar or 7-Zip",
-                ArchiveKind::SevenZip => "7-Zip",
-                ArchiveKind::Zip => "7-Zip",
-            };
-            let reason = format!("{why}; install {hint} to extract it");
-            log(format!("extract: {name}: {reason}"));
-            return SetOutcome::Failed(reason);
-        };
-        log(format!("extract: {name}: native extraction not possible ({why}); falling back to {}", ex.name()));
-        return extract_with_tool(set, target, &ex, password, log);
-    }
-
-    // Same finishing steps as for a tool (see `extract_with_tool`). The native sink
-    // never creates links, so the link sweep is a second line of defense only.
+    // The native sink never creates links, so the link sweeps are a second line of
+    // defense only (and catch links an earlier run left in the target).
     let staged_links = remove_links_outside(&staging, true, log);
     let merged = merge_into(&staging, target, log);
     if let Err(e) = std::fs::remove_dir_all(&staging) {
@@ -303,78 +65,6 @@ pub(crate) fn extract_set(
     };
     if let Some(link) = summary.escaping_link {
         return SetOutcome::Failed(format!("archive contained a link pointing outside the target ({link})"));
-    }
-    if let Err(reason) = staged_links.and(merged).and(target_links) {
-        return SetOutcome::Failed(reason);
-    }
-    SetOutcome::Extracted
-}
-
-/// The pre-native extraction path through an external tool: list, check, extract into
-/// a private staging folder, then sweep links and merge into `target`.
-fn extract_with_tool(
-    set: &ArchiveSet,
-    target: &Path,
-    ex: &Extractor,
-    password: Option<&str>,
-    log: &mut dyn FnMut(String),
-) -> SetOutcome {
-    let name = set.first.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let ex = ex.clone();
-    let tool = ex.name();
-
-    // 1. List and refuse entries that could escape the target folder.
-    let list = list_command(&ex, &set.first, password);
-    log(format!("extract: {}", list.display()));
-    let lrun = match list.run(LIST_TIMEOUT, LIST_CAPTURE) {
-        Ok(r) => r,
-        Err(e) => return SetOutcome::Failed(e.to_string()),
-    };
-    if !run_succeeded(tool, &lrun) {
-        return SetOutcome::Failed(failure_reason(tool, &lrun, password.is_some()));
-    }
-    if lrun.truncated {
-        return SetOutcome::Failed("archive listing is too large to check".into());
-    }
-    let entries = match ex {
-        Extractor::SevenZip(_) => parse_7z_listing(&lrun.stdout),
-        _ => parse_bare_listing(&lrun.stdout),
-    };
-    if let Some(bad) = entries.iter().find(|e| is_unsafe_entry(e)) {
-        let shown: String = bad.chars().take(120).collect();
-        log(format!("extract: {name}: refusing unsafe entry path {shown:?}"));
-        return SetOutcome::Failed(format!("archive contains an unsafe path ({shown})"));
-    }
-    log(format!("extract: {name}: {} entries via {tool}", entries.len()));
-
-    // 2. Extract into a fresh private staging folder inside the target, so nothing the
-    //    tool writes can pass through a link left in the target by an earlier set, a
-    //    failed run or a previous attempt.
-    let staging = match make_staging_dir(target) {
-        Ok(p) => p,
-        Err(e) => return SetOutcome::Failed(format!("could not create a staging folder in {}: {e}", target.display())),
-    };
-    let cmd = extract_command(&ex, &set.first, &staging, password);
-    log(format!("extract: {}", cmd.display()));
-    let xrun = cmd.run(EXTRACT_TIMEOUT, EXTRACT_CAPTURE);
-
-    // 3. Whatever the outcome (a failed run can leave partial output, including links):
-    //    drop links leaving the staging folder, move the rest into the target without
-    //    following any link already there, remove the staging folder and check the
-    //    whole target once more.
-    let staged_links = remove_links_outside(&staging, true, log);
-    let merged = merge_into(&staging, target, log);
-    if let Err(e) = std::fs::remove_dir_all(&staging) {
-        log(format!("extract: could not remove staging folder {}: {e}", staging.display()));
-    }
-    let target_links = remove_escaping_links(target, log);
-
-    let xrun = match xrun {
-        Ok(r) => r,
-        Err(e) => return SetOutcome::Failed(e.to_string()),
-    };
-    if !run_succeeded(tool, &xrun) {
-        return SetOutcome::Failed(failure_reason(tool, &xrun, password.is_some()));
     }
     if let Err(reason) = staged_links.and(merged).and(target_links) {
         return SetOutcome::Failed(reason);
@@ -415,7 +105,7 @@ fn remove_non_dir(p: &Path) -> std::io::Result<()> {
 }
 
 /// Move everything in `src` into `dst`, merging folders. Existing files and links in
-/// `dst` are replaced (like the tools' overwrite mode); a link in `dst` is never followed,
+/// `dst` are replaced (an archive overwrites older output); a link in `dst` is never followed,
 /// so a folder from `src` replaces a link of the same name instead of being merged
 /// through it. A non-folder in `src` never replaces a real folder in `dst` (reported).
 fn merge_into(src: &Path, dst: &Path, log: &mut dyn FnMut(String)) -> Result<(), String> {
@@ -543,98 +233,6 @@ mod tests {
         for ok in ["a.txt", "dir/a.txt", "dir\\a.txt", "..hidden", "a..b/c", "...", "dir/.../x"] {
             assert!(!is_unsafe_entry(ok), "{ok}");
         }
-    }
-
-    #[test]
-    fn parses_7z_slt_listing_and_detects_zip_slip() {
-        let out = "\n7-Zip 26.00 (x64)\n\nListing archive: evil.zip\n\n--\nPath = evil.zip\nType = zip\nPhysical Size = 300\n\n----------\nPath = good.txt\nFolder = -\nSize = 5\n\nPath = ../evil.txt\nFolder = -\nSize = 4\n\n";
-        let entries = parse_7z_listing(out);
-        assert_eq!(entries, vec!["good.txt".to_string(), "../evil.txt".to_string()]);
-        assert!(entries.iter().any(|e| is_unsafe_entry(e)));
-        // The archive's own Path line before the separator is not an entry.
-        assert!(!entries.contains(&"evil.zip".to_string()));
-    }
-
-    #[test]
-    fn parses_bare_listing_and_detects_zip_slip() {
-        let out = "docs/readme.txt\r\n/abs/path\r\n\r\nok.bin\n";
-        let entries = parse_bare_listing(out);
-        assert_eq!(entries, vec!["docs/readme.txt", "/abs/path", "ok.bin"]);
-        let bad: Vec<_> = entries.iter().filter(|e| is_unsafe_entry(e)).collect();
-        assert_eq!(bad, vec!["/abs/path"]);
-    }
-
-    fn run(code: i32, out: &str) -> ToolRun {
-        ToolRun { code: Some(code), stdout: out.into(), ..Default::default() }
-    }
-
-    #[test]
-    fn failure_reasons() {
-        let r = run(2, "ERROR: Wrong password : a.bin");
-        assert_eq!(failure_reason("7z", &r, true), "wrong password");
-        assert!(failure_reason("7z", &r, false).contains("set a password"));
-        let r = run(2, "ERROR: enc.7z : Cannot open encrypted archive. Wrong password?");
-        assert_eq!(failure_reason("7z", &r, true), "wrong password");
-        assert_eq!(failure_reason("unrar", &run(11, "The specified password is incorrect."), true), "wrong password");
-        assert_eq!(failure_reason("unzip", &run(82, "skipping: a.bin  incorrect password"), true), "wrong password");
-        assert_eq!(failure_reason("7z", &run(2, "ERROR: Missing volume : x.7z.002"), false), "missing or incomplete archive volume");
-        assert_eq!(failure_reason("7z", &run(2, "ERROR: x.7z\nCan't open as archive: 1"), false), "archive is corrupt or damaged");
-        assert_eq!(failure_reason("7z", &run(7, "Command Line Error:\nUnknown switch"), false), "7z exited with code 7: Command Line Error:");
-        let t = ToolRun { timed_out: true, ..Default::default() };
-        assert_eq!(failure_reason("unrar", &t, false), "unrar timed out");
-    }
-
-    #[test]
-    fn warning_exit_accepted_only_without_problems() {
-        assert!(run_succeeded("7z", &run(0, "Everything is Ok")));
-        assert!(run_succeeded("7z", &run(1, "WARNING: cannot set times")));
-        assert!(!run_succeeded("unzip", &run(1, "skipping: a  incorrect password")));
-        assert!(!run_succeeded("7z", &run(2, "")));
-    }
-
-    fn set(kind: ArchiveKind, vols: usize) -> ArchiveSet {
-        let volumes: Vec<PathBuf> = (0..vols).map(|i| PathBuf::from(format!("v{i}"))).collect();
-        ArchiveSet { kind, first: volumes[0].clone(), volumes }
-    }
-
-    #[test]
-    fn extractor_choice() {
-        let all = Tools {
-            par2: None,
-            sevenz: Some("7z".into()),
-            unrar: Some("unrar".into()),
-            unzip: Some("unzip".into()),
-        };
-        assert_eq!(choose_extractor(&set(ArchiveKind::Rar, 1), &all), Some(Extractor::Unrar("unrar".into())));
-        assert_eq!(choose_extractor(&set(ArchiveKind::Zip, 1), &all), Some(Extractor::SevenZip("7z".into())));
-        let no7z = Tools { sevenz: None, ..all.clone() };
-        assert_eq!(choose_extractor(&set(ArchiveKind::Zip, 1), &no7z), Some(Extractor::Unzip("unzip".into())));
-        assert_eq!(choose_extractor(&set(ArchiveKind::Zip, 2), &no7z), None);
-        assert_eq!(choose_extractor(&set(ArchiveKind::SevenZip, 1), &no7z), None);
-        let only7z = Tools { sevenz: Some("7z".into()), ..Tools::none() };
-        assert_eq!(choose_extractor(&set(ArchiveKind::Rar, 3), &only7z), Some(Extractor::SevenZip("7z".into())));
-    }
-
-    #[test]
-    fn commands_never_prompt_and_redact_password() {
-        let a = Path::new("a.rar");
-        let t = Path::new("out");
-        let unrar = Extractor::Unrar("unrar".into());
-        let c = extract_command(&unrar, a, t, None);
-        assert!(c.args.iter().any(|x| x == "-p-"));
-        let c = extract_command(&unrar, a, t, Some("s3cret"));
-        assert!(!c.display().contains("s3cret"));
-        assert!(c.args.last().is_some_and(|d| d.to_string_lossy().ends_with(std::path::MAIN_SEPARATOR)));
-        let z = Extractor::SevenZip("7z".into());
-        let c = extract_command(&z, a, t, None);
-        assert!(c.args.iter().any(|x| x.to_string_lossy().starts_with("-p") && x.len() > 2));
-        assert!(c.args.iter().any(|x| x == "-y"));
-        let c = list_command(&z, a, Some("s3cret"));
-        assert!(!c.display().contains("s3cret"));
-        let u = Extractor::Unzip("unzip".into());
-        let c = extract_command(&u, a, t, Some("s3cret"));
-        assert!(!c.display().contains("s3cret"));
-        assert!(c.display().contains("-P ***"));
     }
 
     #[cfg(unix)]
