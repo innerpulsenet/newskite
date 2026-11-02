@@ -1,7 +1,9 @@
 //! Post-processing for finished downloads (outline F5): PAR2 verify/repair, archive
-//! extraction and cleanup, implemented by driving external tools (`par2`, `7z`/`7zz`/`7za`,
-//! `unrar`, `unzip`). Missing tools degrade gracefully: the step is reported as
-//! [`Verdict::Skipped`] with a reason.
+//! extraction and cleanup. Archives are extracted in-process (zip, 7z and RAR need no
+//! installed program); PAR2 drives the external `par2` tool, and `7z`/`7zz`/`7za`,
+//! `unrar` and `unzip` are only a fallback for archives the native code cannot read.
+//! Missing tools degrade gracefully: the step is reported as [`Verdict::Skipped`] with a
+//! reason.
 //!
 //! The API is blocking; callers on an async runtime should use `spawn_blocking`.
 //!
@@ -18,30 +20,59 @@
 //!    Archive sets are detected by name (`.rar`, `.partNN.rar`, `.rNN`, `.7z`,
 //!    `.7z.NNN`, `.zip`, `.zNN`, `.zip.NNN`) and magic bytes (files with no or a
 //!    random-looking extension are sniffed; the magic of each set's first volume also
-//!    decides the tool when it disagrees with the extension). Only the first volume is
-//!    handed to the tool. unrar is preferred for RAR, 7-Zip for everything else, unzip
-//!    for single-volume zip when 7-Zip is missing.
+//!    decides the format when it disagrees with the extension).
+//!
+//!    **Native backends.** zip uses the `zip` crate (deflate, deflate64, bzip2, LZMA,
+//!    XZ, zstd, PPMd; AES and ZipCrypto passwords), 7z uses `sevenz-rust2` (LZMA/LZMA2,
+//!    PPMd, bzip2, deflate, zstd, BCJ/BCJ2/delta filters; AES passwords, encrypted
+//!    headers) and RAR (RAR 1.5 to RAR 7) uses the bundled UnRAR library in test mode,
+//!    so it decompresses and verifies while every byte is written by our own code.
+//!    Split `.7z.NNN` and
+//!    `.zip.NNN` volumes are read as one chained stream (a gap in the numbering is a
+//!    missing volume); UnRAR follows `.partNN.rar` / `.rNN` volumes from the first one.
+//!    Spanned zips (`.z01` ... `.zip`) cannot be read natively. Progress is logged every
+//!    5% for sets of 32 MiB or more.
+//!
+//!    **External fallback.** Only when a native backend reports the archive as
+//!    *unsupported* (a spanned zip, an unknown codec or RAR feature) is the set handed to
+//!    a tool: unrar for RAR, 7-Zip for everything else, unzip for single-volume zip when
+//!    7-Zip is missing. Without a suitable tool such a set fails with a reason naming
+//!    what to install. Any other native error (corrupt data, missing volume, password)
+//!    is final.
 //!
 //!    Every set is extracted into **`dir/<sanitized job_name>/`** (see
 //!    [`extraction_dir_name`]); if a *file* of that name already exists,
 //!    `dir/<name>.extracted/` is used instead. Before extracting, the archive is listed
-//!    (`7z l -slt`, `unrar lb`, `unzip -Z1`) and refused if any entry is absolute or has
-//!    a `..` component. Each set is then extracted into a fresh private staging folder
-//!    (`.newskite-staging-*`) inside the extraction folder. Whether the tool succeeds or
-//!    fails, symbolic links in the staging folder that point outside it (or use an
-//!    absolute destination) are deleted, the remaining output is moved into the
-//!    extraction folder without following any link already there (an existing file or
-//!    link of the same name is replaced; a file never replaces a real folder), the
-//!    staging folder is removed and the whole extraction folder is checked again for
-//!    links pointing outside it. Any deleted link reports the set as failed. Links are
-//!    judged by their fully resolved destination when it exists, else lexically.
+//!    (natively, or `7z l -slt`, `unrar lb`, `unzip -Z1` for a tool) and refused if any
+//!    entry is absolute or has a `..` component; an archive without entries counts as
+//!    damaged. Each set is then extracted into a fresh private staging folder
+//!    (`.newskite-staging-*`) inside the extraction folder. The native backends sanitize
+//!    every entry path again before writing, create folders one component at a time
+//!    without following links, open files with `create_new` (a duplicate entry unlinks
+//!    the earlier file first, so data never goes through a link or a hard link) and
+//!    **never create links**: symbolic links, junctions and hard links in an archive are
+//!    skipped and logged, and one pointing outside the extraction folder (absolute or
+//!    climbing out with `..`) reports the set as failed. A file that fails to decode is
+//!    removed. Whether extraction succeeds or fails, symbolic links in the staging folder
+//!    that point outside it (or use an absolute destination; only a tool can create
+//!    them) are deleted, the remaining output is moved into the extraction folder
+//!    without following any link already there (an existing file or link of the same
+//!    name is replaced; a file never replaces a real folder), the staging folder is
+//!    removed and the whole extraction folder is checked again for links pointing
+//!    outside it. Any deleted link reports the set as failed. Links are judged by their
+//!    fully resolved destination when it exists, else lexically.
 //!
-//!    **Passwords** are passed on the tool's command line (`-p<pw>` for 7-Zip/unrar,
-//!    `-P <pw>` for unzip), which other local users can see in the process list while the
-//!    tool runs. Passwords are never logged (commands are logged with `-p***`). Without a
+//!    **Passwords.** A wrong password fails the set with "wrong password", a missing
+//!    one with "password required ..."; nothing ever prompts or waits. Natively the
+//!    password stays in memory (UnRAR receives it through its callback as a wide
+//!    string). Formats without a password check value (RAR 4, ZipCrypto, 7z data) can
+//!    only tell a wrong password from damage by the failed integrity check of encrypted
+//!    data, which is reported as a wrong password. For the tool fallback, passwords are
+//!    passed on the tool's command line (`-p<pw>` for 7-Zip/unrar, `-P <pw>` for unzip),
+//!    which other local users can see in the process list while the tool runs; without a
 //!    password the tools are made non-interactive (`-p-` for unrar, a placeholder
-//!    password for 7-Zip/unzip), and stdin is always the null device, so a tool can never
-//!    hang on a prompt.
+//!    password for 7-Zip/unzip) and stdin is always the null device. Passwords are never
+//!    logged (commands are logged with `-p***`).
 //! 3. **Cleanup** (when [`PostOptions::cleanup`] is set) runs only when the extraction
 //!    verdict is [`Verdict::Ok`]: volumes of every extracted set are deleted and, when no
 //!    set was skipped, also all `.par2` files and the `name.1` backups par2 left after a
@@ -49,6 +80,7 @@
 
 mod detect;
 mod extract;
+mod native;
 mod par2;
 mod tools;
 
