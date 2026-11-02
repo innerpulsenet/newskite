@@ -1,22 +1,46 @@
-//! zip backend (`zip` crate): single archives and byte-split `.zip.NNN` volumes.
+//! zip backend (`zip` crate): single archives, byte-split `.zip.NNN` volumes and spanned
+//! `.z01` ... `.zip` sets (see [`super::spanned`]).
 
-use std::io::{self, BufReader, Read};
+use std::io::{self, BufReader, Read, Seek};
 
+use zip::read::{ArchiveOffset, Config};
 use zip::result::ZipError;
 use zip::ZipArchive;
 
-use super::{apply_mode, apply_mtime, chained_volumes, check_listing, safe_relative, volume_label, CopyError, NativeError, Sink, VolumeReader};
+use super::{apply_mode, apply_mtime, chained_volumes, check_listing, safe_relative, spanned, volume_label, CopyError, NativeError, Sink, VolumeReader};
 use crate::detect::ArchiveSet;
 
 /// Longest link destination read from a link entry (only used to judge it).
 const LINK_TARGET_MAX: u64 = 4096;
 
+/// Read buffer in front of the volumes.
+const BUFFER: usize = 64 * 1024;
+
 pub(super) fn extract(set: &ArchiveSet, sink: &mut Sink<'_>, password: Option<&str>) -> Result<(), NativeError> {
+    if let Some(volumes) = spanned::volumes(set) {
+        let volumes = volumes?;
+        let reader = spanned::open(&volumes)?;
+        // The rewritten archive starts at offset 0 by construction; nothing to detect.
+        let config = Config { archive_offset: ArchiveOffset::Known(0) };
+        let za = ZipArchive::with_config(config, BufReader::with_capacity(BUFFER, reader)).map_err(|e| open_error(e, true))?;
+        return extract_entries(za, sink, password, &format!("zip ({} spanned volumes)", volumes.len()), true);
+    }
     let volumes = chained_volumes(set)?;
     let multi = volumes.len() > 1;
     let reader = VolumeReader::open(&volumes).map_err(|e| NativeError::Io(format!("could not open the archive: {e}")))?;
-    let mut za = ZipArchive::new(BufReader::with_capacity(64 * 1024, reader)).map_err(|e| open_error(e, multi))?;
+    let za = ZipArchive::new(BufReader::with_capacity(BUFFER, reader)).map_err(|e| open_error(e, multi))?;
+    extract_entries(za, sink, password, &volume_label("zip", volumes.len()), multi)
+}
 
+/// List and extract every entry of an opened archive. `backend` names it in the log;
+/// `multi`: it spans several volumes (a short read means a missing volume).
+fn extract_entries<R: Read + Seek>(
+    mut za: ZipArchive<R>,
+    sink: &mut Sink<'_>,
+    password: Option<&str>,
+    backend: &str,
+    multi: bool,
+) -> Result<(), NativeError> {
     // 1. List.
     let mut entries = Vec::with_capacity(za.len());
     let mut total = 0u64;
@@ -28,7 +52,7 @@ pub(super) fn extract(set: &ArchiveSet, sink: &mut Sink<'_>, password: Option<&s
         }
         entries.push(name);
     }
-    check_listing(sink, entries.iter().map(String::as_str), total, &volume_label("zip", volumes.len()))?;
+    check_listing(sink, entries.iter().map(String::as_str), total, backend)?;
 
     // 2. Extract.
     for (i, name) in entries.iter().enumerate() {

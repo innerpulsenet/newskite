@@ -11,7 +11,7 @@
 Newskite is a desktop Usenet (NZB) download client written in Rust. You give it an NZB file;
 it downloads the listed articles from your news server (NNTP, usually over TLS), decodes the
 yEnc payloads, writes the original files to disk byte for byte, then verifies, repairs and
-extracts them when the right tools are installed. It keeps a resumable, reorderable queue
+extracts them without any external program. It keeps a resumable, reorderable queue
 where every job can be started, paused or moved on its own, a download history, per-file
 progress, a filterable log and a live throughput graph, and it follows the desktop's light
 or dark color scheme (KDE Plasma first).
@@ -70,7 +70,7 @@ crates it depends on.
 | `newskite-engine` | Downloads one job: concurrent segment fetches, decoding, positioned writes, speed limit |
 | `newskite-store` | SQLite persistence (bundled SQLite): jobs, files, bookmarks, throughput, settings |
 | `newskite-par2` | Native PAR2 verify and repair (Reed-Solomon over GF(2^16)) |
-| `newskite-postproc` | Post-processing: PAR2, native archive extraction (external tools as fallback), cleanup |
+| `newskite-postproc` | Post-processing: PAR2, native archive extraction (RAR, 7z, ZIP including spanned sets), cleanup |
 | `newskite-service` | The queue shared by the GUI and the CLI: runs jobs, persists progress, watch folder, scheduler, auto-shutdown |
 | `newskite-theme` | Reads the desktop color scheme (KDE `kdeglobals`, XDG portal, fallback) into color tokens |
 | `newskite-cli` | Headless mode (`newskite --headless ...`) |
@@ -162,35 +162,24 @@ backup of the files, or anyone who can watch your processes, can recover these:
   username and password, are kept as plain JSON in the `settings` table of the database in
   `~/.local/share/newskite/db`.
 - **Archive passwords** you enter for a job are stored in plain text with that job (the `jobs`
-  table). Extraction is built in and keeps the password in memory. Only when an archive
-  needs the external fallback (see below) is the password passed to `7z`/`unrar` (or
-  `unzip`) on the command line, where other local users can see it in the process list
-  while the tool runs. The log shows those commands with the password masked as `-p***`.
+  table). Extraction is built in, so the password never leaves the Newskite process: it is
+  kept in memory while an archive is extracted and never handed to another program or put on
+  a command line.
 - **Headless CLI:** prefer the `NEWSKITE_PASS` environment variable over `--pass`, because a
   password given on the command line is visible to other users in the process list. Passwords given with `--server`/`--pass`/`NEWSKITE_PASS` are kept only in
   memory and never written to the database.
 
 Passwords are never written to the message log.
 
-## Post-processing tools
+## Post-processing
 
-PAR2 verify/repair and RAR, 7z and ZIP extraction (including split volumes and passwords)
-are built into Newskite; no program needs to be installed. A download with missing
-articles is still repaired when its PAR2 data covers the gap. The tools below are an
-optional fallback: `par2` only when no PAR2 recovery set can be read natively, the archive
-tools only for archives the built-in extraction cannot read (spanned `.z01` ZIP sets,
-rare codecs).
-
-| Tool | Used for | Debian/Ubuntu package |
-|---|---|---|
-| `par2` | fallback for unreadable PAR2 sets | `par2` |
-| `7z` (or `7zz`, `7za`) | fallback for 7z, ZIP and RAR archives | `7zip` (or `p7zip-full` on older releases) |
-| `unrar` | fallback for RAR archives (preferred for RAR) | `unrar` (non-free) |
-| `unzip` | fallback for single ZIP archives when 7-Zip is missing | `unzip` |
-
-```sh
-sudo apt install par2 7zip     # optional fallbacks only
-```
+PAR2 verify/repair and RAR, 7z and ZIP extraction (including split volumes, spanned
+`.z01` ... `.zip` sets and passwords) are built into Newskite. It never starts an external
+program, so `par2`, `7z`, `unrar` and `unzip` are not needed and not used even when they are
+installed. A download with missing articles is still repaired when its PAR2 data covers the
+gap. An archive that uses a feature the built-in extraction does not support (a rare codec)
+fails with a message naming it; a PAR2 set whose main packet cannot be read is reported as
+unverified, and extraction still runs and checks the archive's own checksums.
 
 Building from source compiles the bundled UnRAR library, so a C++ compiler (`g++` or
 `clang++`) is needed.
@@ -226,8 +215,8 @@ sudo apt install ./target/debian/newskite_0.1.0-1_amd64.deb
 
 The metadata is in `[package.metadata.deb]` in `crates/newskite-app/Cargo.toml`. The package
 installs the binary to `/usr/bin/newskite` plus the desktop entry, AppStream file, MIME type
-and icons under `/usr/share`, depends on the windowing libraries listed above, and recommends
-`par2`, `7zip` and `unzip`. The glibc dependency comes from the build machine, so build on the
+and icons under `/usr/share` and depends on the windowing libraries listed above; it needs no
+post-processing tools. The glibc dependency comes from the build machine, so build on the
 oldest release you want to support.
 
 ### AppImage

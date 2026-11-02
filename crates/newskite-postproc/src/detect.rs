@@ -142,8 +142,8 @@ pub(crate) struct NameClass {
     pub key: String,
     /// Volume order inside the set (lower = earlier).
     pub order: u32,
-    /// True when this file can be the one handed to the tool (given it has the lowest
-    /// order in its set).
+    /// True when this file can be the one an extraction starts from (given it has the
+    /// lowest order in its set).
     pub can_lead: bool,
 }
 
@@ -210,7 +210,7 @@ pub(crate) fn classify_name(name: &str) -> Option<NameClass> {
         }
     }
     if let Some(stem) = strip_suffix_ci(name, ".zip") {
-        // Spanned zip (.z01, .z02, ..., .zip): the .zip is what the tool opens.
+        // Spanned zip (.z01, .z02, ..., .zip): the .zip holds the central directory.
         return mk(ArchiveKind::Zip, stem, 0, true);
     }
     if let Some((stem, n)) = numbered_ext(name, "z") {
@@ -272,7 +272,7 @@ pub(crate) fn find_archive_sets(files: &[PathBuf]) -> (Vec<ArchiveSet>, Vec<Brok
             match sniff_file(path) {
                 Some(Magic::Rar { first: false, .. }) => {
                     // A later volume of an obfuscated multi-volume set; it can only be
-                    // reached through its first volume, which unrar finds by name.
+                    // reached through its first volume, which UnRAR finds by name.
                 }
                 Some(m) => sets.push(ArchiveSet { kind: m.kind(), first: path.clone(), volumes: vec![path.clone()] }),
                 None => {}
@@ -297,13 +297,6 @@ pub(crate) fn find_archive_sets(files: &[PathBuf]) -> (Vec<ArchiveSet>, Vec<Brok
     (sets, broken)
 }
 
-/// One PAR2 set: the main file passed to `par2` and every file of the set.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Par2Set {
-    pub main: PathBuf,
-    pub files: Vec<PathBuf>,
-}
-
 /// `name.par2` -> `name`; `name.vol07+08.par2` -> `name`. Returns (key, is_volume).
 pub(crate) fn par2_key(name: &str) -> Option<(String, bool)> {
     let stem = strip_suffix_ci(name, ".par2")?;
@@ -320,29 +313,6 @@ pub(crate) fn par2_key(name: &str) -> Option<(String, bool)> {
         }
     }
     Some((stem.to_lowercase(), false))
-}
-
-/// Group `.par2` files into sets and pick each set's main file (the one without a
-/// `.volNN+MM` suffix, else the smallest).
-pub(crate) fn find_par2_sets(files: &[PathBuf]) -> Vec<Par2Set> {
-    let mut groups: BTreeMap<String, Vec<(bool, u64, PathBuf)>> = BTreeMap::new();
-    for p in files {
-        let Some(name) = p.file_name().map(|n| n.to_string_lossy().into_owned()) else { continue };
-        if let Some((key, is_vol)) = par2_key(&name) {
-            let size = std::fs::metadata(p).map(|m| m.len()).unwrap_or(u64::MAX);
-            groups.entry(key).or_default().push((is_vol, size, p.clone()));
-        }
-    }
-    groups
-        .into_values()
-        .filter_map(|mut members| {
-            members.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then_with(|| a.2.cmp(&b.2)));
-            let main = members.first()?.2.clone();
-            let mut files: Vec<PathBuf> = members.into_iter().map(|m| m.2).collect();
-            files.sort();
-            Some(Par2Set { main, files })
-        })
-        .collect()
 }
 
 /// Every PAR2 packet starts with this magic.
@@ -502,17 +472,5 @@ mod tests {
         assert_eq!(sets[2].volumes.len(), 2);
         assert_eq!(broken.len(), 1);
         assert!(broken[0].name.starts_with("lost"));
-    }
-
-    #[test]
-    fn par2_main_selection() {
-        let files: Vec<PathBuf> =
-            ["/nx/a.vol01+02.par2", "/nx/a.par2", "/nx/b.vol00+01.par2", "/nx/b.vol01+02.par2"].iter().map(PathBuf::from).collect();
-        let sets = find_par2_sets(&files);
-        assert_eq!(sets.len(), 2);
-        assert_eq!(sets[0].main, PathBuf::from("/nx/a.par2"));
-        assert_eq!(sets[0].files.len(), 2);
-        // No plain .par2 for b: sizes unknown (both u64::MAX) -> name order.
-        assert_eq!(sets[1].main, PathBuf::from("/nx/b.vol00+01.par2"));
     }
 }
