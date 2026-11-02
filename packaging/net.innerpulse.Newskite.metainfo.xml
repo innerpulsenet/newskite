@@ -13,13 +13,13 @@
     <p>
       Newskite is a desktop Usenet download client. Give it an NZB file and it fetches the
       binary articles from your news server over TLS, decodes them and writes the original
-      files to disk, then verifies, repairs and extracts them when the matching tools are
-      installed.
+      files to disk, then verifies, repairs and extracts them with built-in code; no
+      external tools are needed.
     </p>
     <ul>
       <li>Download queue with precise progress that resumes after a restart</li>
       <li>Multiple servers with priorities, per-server connection counts and a connection test</li>
-      <li>PAR2 verify and repair plus RAR, 7z and ZIP extraction using external tools</li>
+      <li>Built-in PAR2 verify and repair plus RAR, 7z and ZIP extraction, including split and spanned volumes and passwords</li>
       <li>Watch folder, speed limit, scheduler window and optional shutdown when done</li>
       <li>Live throughput graph, activity log and bookmarks</li>
       <li>Follows the desktop light or dark color scheme</li>

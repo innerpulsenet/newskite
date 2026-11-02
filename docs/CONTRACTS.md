@@ -7,9 +7,9 @@ unless unavoidable and commented, `thiserror` for error enums, American English 
 
 Stack: **egui/eframe** GUI (pure Rust, cross-platform), **tokio** async engine, **rustls**
 TLS (`ring` provider, native roots + webpki-roots fallback), **rusqlite** (bundled SQLite)
-store, native archive extraction (`zip`, `sevenz-rust2`, bundled UnRAR via `unrar_sys`)
-native PAR2 (`newskite-par2`), with optional `par2`/`7z`/`unrar`/`unzip` fallback binaries for
-post-processing (detected at runtime; missing tools degrade gracefully). Linux (KDE) first; must still compile on
+store, in-process post-processing: native PAR2 (`newskite-par2`) and archive extraction
+(`zip`, `sevenz-rust2`, bundled UnRAR via `unrar_sys`); no external program is ever started.
+Linux (KDE) first; must still compile on
 Windows/macOS (use `cfg` for platform code, never assume `/`).
 
 Dependency graph (arrows = depends on):
@@ -292,26 +292,25 @@ Status colors (positive/warning/negative) are nudged toward black/white until �
 
 ## newskite-postproc — PAR2 / extraction / cleanup (blocking API)
 ```rust
-pub struct Tools { pub par2:Option<PathBuf>, pub sevenz:Option<PathBuf>, pub unrar:Option<PathBuf>, pub unzip:Option<PathBuf> }
-pub fn detect_tools() -> Tools;                           // PATH lookup (par2, 7z/7za/7zz, unrar, unzip)
-pub struct PostOptions { pub repair:bool, pub extract:bool, pub cleanup:bool, pub password:Option<String> }
+pub struct PostOptions { pub repair:bool, pub extract:bool, pub cleanup:bool, pub remove_leftovers:bool, pub password:Option<String> }
 pub enum Verdict { Skipped(String), Ok, Repaired, Failed(String) }
 pub struct PostReport { pub par2:Verdict, pub extract:Verdict, pub extracted_to:Option<PathBuf>, pub removed:Vec<PathBuf> }
-#[derive(thiserror::Error)] pub enum PostError { Io(std::io::Error), Tool(String) }
-pub fn process(dir:&Path, job_name:&str, opts:&PostOptions, tools:&Tools, log:&mut dyn FnMut(String)) -> Result<PostReport,PostError>;
+#[derive(thiserror::Error)] pub enum PostError { Io(std::io::Error) }
+pub fn process(dir:&Path, job_name:&str, opts:&PostOptions, log:&mut dyn FnMut(String)) -> Result<PostReport,PostError>;
+pub fn process_with_events(dir:&Path, job_name:&str, opts:&PostOptions, on:&mut dyn FnMut(PostEvent)) -> Result<PostReport,PostError>;
 ```
-Detection by extension and magic bytes (`.rar`/`.partNN.rar`/`.r00`, `.7z`/`.7z.001`, `.zip`);
-only the first volume is passed to the tool; extract into `dir/<sanitized job_name>/` (or
-straight into `dir` if it is already the job folder — implementer's call, document it);
-password passed to the tool as an argument (documented); never extract outside the target
-(tools invoked with explicit output dir, reject archive entries with `..`/absolute paths
-where the tool allows listing). Cleanup only after a successful extraction. Commands are
-spawned with argument vectors, never through a shell.
+Detection by extension and magic bytes (`.rar`/`.partNN.rar`/`.r00`, `.7z`/`.7z.001`,
+`.zip`/`.z01`/`.zip.001`); extraction starts at the first volume (the `.zip` of a spanned
+set); extract into `dir/<sanitized job_name>/` (or straight into `dir` if it is already the
+job folder — implementer's call, document it); the password stays in memory and is never
+logged or handed to another program; never extract outside the target (every entry is
+listed and checked before anything is written; entries with `..`/absolute paths are
+refused). Cleanup only after a successful extraction. No external program is ever started.
 
 Implementation notes (additive API, see crate docs in `src/lib.rs`): extraction is native
-(in-process zip / 7z / RAR, works with `Tools::none()`); an external tool is used only when
-the native backend reports an archive as unsupported (spanned `.zNN` zip, unknown codec),
-and such a set fails with an "install ..." reason when no tool is found. The native writer
+(in-process zip, including spanned `.z01` ... `.zip` sets read through an in-memory rewrite of
+the central directory, 7z and RAR); an archive a backend reports as unsupported (unknown
+codec or RAR feature) fails with an `unsupported archive: ...` reason. The native writer
 sanitizes every entry path, never follows or creates links (link entries are skipped and
 logged; an escaping one fails the set) and reports progress every 5% through `log`.
 Extraction always goes
@@ -323,17 +322,17 @@ deleted, the output is merged into the extraction folder without following exist
 folder is rescanned for escaping links. A deleted link makes the set `Failed`. So a link
 planted by a failed set or an earlier attempt can never be written through by a later set
 or a retry.
-PAR2 verify runs natively whenever PAR2 packets are present (the `par2` tool only when no
-set parses); `.nkpart` partial files are used as slice sources. `repair:false` turns a
-damaged set into `Failed`; a failed PAR2 step skips extraction. `cleanup` deletes archive
-volumes when the extract verdict is `Ok`; `remove_leftovers` deletes `.par2` files, par2
-`name.1` backups and sidecars once PAR2 verified/repaired (or there was none) and no set
-failed or was skipped. Extra public items: `Tools::{none, can_extract, summary}`, `detect_tools_in`,
-`find_tool`, `PostOptions::from_settings(&PostProcessSettings, Option<String>)` + `Default`
-+ password-redacting `Debug`, `Verdict::{is_failed, is_success}` + `Display`,
-`extraction_dir_name`, `is_unsafe_entry`, `parse_7z_listing`, `parse_bare_listing`,
-`sniff_bytes`, `sniff_file`, `ArchiveKind`, `Magic`. Run post-processing jobs one at a
-time (par2 uses every core).
+PAR2 verify runs natively whenever PAR2 packets are present (when no recovery set parses,
+the verdict is `Skipped("PAR2 files unreadable")` and extraction still runs);
+`.nkpart` partial files are used as slice sources. `repair:false` turns a damaged set into
+`Failed`; a failed PAR2 step skips extraction. `cleanup` deletes archive volumes when the
+extract verdict is `Ok`; `remove_leftovers` deletes `.par2` files, the repair's `name.1`
+backups and sidecars once PAR2 verified/repaired (or there was none) and no set failed or
+was skipped. Extra public items: `PostOptions::from_settings(&PostProcessSettings,
+Option<String>)` + `Default` + password-redacting `Debug`, `Verdict::{is_failed,
+is_success}` + `Display`, `extraction_dir_name`, `is_unsafe_entry`, `has_par2`,
+`Par2Stats`, `PostEvent`, `PostStage`, `sniff_bytes`, `sniff_file`, `ArchiveKind`, `Magic`.
+Run post-processing jobs one at a time (the PAR2 repair uses several cores).
 
 ## newskite-service — queue engine shared by GUI and CLI
 ```rust
