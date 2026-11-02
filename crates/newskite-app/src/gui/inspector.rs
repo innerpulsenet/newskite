@@ -1,7 +1,6 @@
-//! The inspector: everything about the selected job in one place, as a side panel on
-//! wide windows (the Details dock shows a compact version on narrow ones).
+//! The detail pane: everything about the selected job in one place, beside the list.
 //!
-//! * **Header**: state chip, name, NZB and when it was added.
+//! * **Header**: a progress ring, the name, the folder and what the job is doing.
 //! * **Problem card** for failed jobs: what went wrong (by [`FailureKind`]), the full
 //!   reason (selectable, with Copy), what to do, and the matching buttons.
 //! * **Lifecycle**: Added → Download → Verify → Repair → Extract → Clean up → result,
@@ -10,8 +9,10 @@
 //!   and the live post-processing stage, never from guesses.
 //! * **Numbers**: size, average speed, time spent, articles, repaired slices; a number is
 //!   shown only when it was measured.
-//! * **Files** and **Log** tabs: per-file progress (failed first) and the job's own log,
-//!   which survives restarts.
+//! * **Article map** and **files**: every article of the job as recorded by its runs, and
+//!   one lane of cells per file with `n / N` downloaded (per-file byte progress when the
+//!   job has no map yet).
+//! * **Log** tab: the job's own log, which survives restarts.
 
 use eframe::egui::{self, Align, Color32, CornerRadius, Layout, Pos2, Rect, RichText, Sense, Stroke, Ui, Vec2};
 use newskite_service::{FailureKind, Job, JobState, PostProgress, PostStage, StepRecord, StepState};
@@ -22,7 +23,7 @@ use super::fonts;
 use super::icons::{paint_icon, Icon};
 use super::queue::eta_secs;
 use super::theme::Palette;
-use super::widgets::{icon_button, kit_button, progress_ring, section_title, segment_track, state_badge, ButtonKind};
+use super::widgets::{icon_button, kit_button, progress_ring, section_title, segment_track, ButtonKind};
 
 /// Width of the side panel when it first opens.
 pub const PANEL_DEFAULT_W: f32 = 400.0;
@@ -36,7 +37,6 @@ pub const SIDE_PANEL_MIN_WINDOW: f32 = 1100.0;
 pub enum InspectorTab {
     #[default]
     Overview,
-    Files,
     Log,
 }
 
@@ -289,7 +289,6 @@ pub fn show(ui: &mut Ui, pal: &Palette, data: &Data, job: &Job, state: &mut Insp
             ui.set_max_width(ui.available_width());
             match state.tab {
                 InspectorTab::Overview => overview(ui, pal, data, job, reduced, actions),
-                InspectorTab::Files => files(ui, pal, data),
                 InspectorTab::Log => log(ui, pal, data, actions),
             }
         });
@@ -297,7 +296,8 @@ pub fn show(ui: &mut Ui, pal: &Palette, data: &Data, job: &Job, state: &mut Insp
 
 fn header(ui: &mut Ui, pal: &Palette, data: &Data, job: &Job, reduced: bool, actions: &mut Vec<Action>) {
     ui.horizontal(|ui| {
-        state_badge(ui, pal, job.state);
+        let (word, color) = super::center::state_word(pal, data, job);
+        ui.label(RichText::new(word).font(fonts::semibold_id(13.0)).color(color));
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             if icon_button(ui, pal, Icon::Close, pal.muted, "Close (Esc)").clicked() {
                 actions.push(Action::Select(None));
@@ -317,11 +317,11 @@ fn header(ui: &mut Ui, pal: &Palette, data: &Data, job: &Job, reduced: bool, act
         let color = match job.state {
             JobState::Done => pal.positive,
             JobState::Failed => pal.negative,
-            JobState::Paused => pal.muted,
+            JobState::Paused => pal.faint,
             _ => pal.accent,
         };
-        let (r, _) = ui.allocate_exact_size(Vec2::splat(50.0), Sense::hover());
-        progress_ring(ui.painter(), pal, r.center(), 21.0, 4.5, f, color);
+        let (r, _) = ui.allocate_exact_size(Vec2::splat(64.0), Sense::hover());
+        progress_ring(ui.painter(), pal, r.center(), 26.0, 6.0, f, color);
         match job.state {
             JobState::Done => paint_icon(ui.painter(), Rect::from_center_size(r.center(), Vec2::splat(18.0)), Icon::StatusOk, color),
             JobState::Failed => paint_icon(ui.painter(), Rect::from_center_size(r.center(), Vec2::splat(18.0)), Icon::StatusErr, color),
@@ -330,7 +330,7 @@ fn header(ui: &mut Ui, pal: &Palette, data: &Data, job: &Job, reduced: bool, act
                     r.center(),
                     egui::Align2::CENTER_CENTER,
                     format!("{:.0}%", (f * 100.0).floor()),
-                    fonts::mono_id(11.0),
+                    fonts::mono_id(13.0),
                     pal.text,
                 );
             }
@@ -338,10 +338,10 @@ fn header(ui: &mut Ui, pal: &Palette, data: &Data, job: &Job, reduced: bool, act
         ui.vertical(|ui| {
             ui.set_max_width(ui.available_width());
             ui.spacing_mut().item_spacing.y = 3.0;
-            ui.add(egui::Label::new(RichText::new(&job.name).font(fonts::semibold_id(15.0)).color(pal.text)).wrap());
-            let nzb = job.source_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            ui.add(egui::Label::new(RichText::new(nzb).small().color(pal.muted)).truncate())
-                .on_hover_text(job.source_path.display().to_string());
+            ui.add_space(10.0);
+            ui.add(egui::Label::new(RichText::new(&job.name).font(fonts::semibold_id(17.0)).color(pal.text)).wrap());
+            ui.add(egui::Label::new(RichText::new(super::queue::home_relative(&job.dest_dir)).small().color(pal.muted)).truncate())
+                .on_hover_text(format!("{}\nNZB: {}", job.dest_dir.display(), job.source_path.display()));
         });
     });
 }
@@ -353,12 +353,7 @@ fn tabs(ui: &mut Ui, pal: &Palette, data: &Data, job: &Job, state: &mut Inspecto
         let failed = data.selected_files.iter().filter(|f| f.state == "failed").count();
         let warn = data.selected_log.iter().filter(|l| l.level != "info").count();
         let items = [
-            (InspectorTab::Overview, "Overview".to_string(), None),
-            (
-                InspectorTab::Files,
-                format!("Files {}", data.selected_files.len()),
-                (failed > 0).then_some(pal.negative),
-            ),
+            (InspectorTab::Overview, "Overview".to_string(), (failed > 0).then_some(pal.negative)),
             (InspectorTab::Log, format!("Log {}", data.selected_log.len()), (warn > 0).then_some(pal.warning)),
         ];
         for (tab, label, dot) in items {
@@ -404,18 +399,6 @@ fn overview(ui: &mut Ui, pal: &Palette, data: &Data, job: &Job, reduced: bool, a
         problem(ui, pal, data, job, actions);
         ui.add_space(12.0);
     }
-    // Every article of the job, as recorded by its last run.
-    if let Some(map) = data.article_maps.get(&job.id).filter(|m| !m.is_empty()) {
-        section_title(ui, pal, "Articles");
-        ui.add_space(6.0);
-        let w = ui.available_width();
-        let size = Vec2::new(w, super::articles::fit_height(map.len(), w, 120.0));
-        super::articles::grid(ui, pal, egui::Id::new(("inspector-articles", job.id)), map, size, reduced);
-        ui.add_space(4.0);
-        ui.label(RichText::new(super::articles::summary(&map.counts())).font(fonts::mono_id(11.0)).color(pal.muted));
-        super::articles::legend(ui, pal, super::articles::per_cell(map, size));
-        ui.add_space(12.0);
-    }
     let post = data.status.post.as_ref().filter(|p| p.job_id == job.id);
     let speed = if job.state == JobState::Downloading { data.speed() } else { 0 };
     section_title(ui, pal, "Lifecycle");
@@ -423,6 +406,40 @@ fn overview(ui: &mut Ui, pal: &Palette, data: &Data, job: &Job, reduced: bool, a
     let steps = timeline(job, post, done, speed, now);
     lifecycle(ui, pal, &steps, reduced);
     ui.add_space(12.0);
+
+    // Every article of the job as recorded by its runs, then one lane per file.
+    let held = job.state == JobState::Paused;
+    match data.article_maps.get(&job.id).filter(|m| !m.is_empty()) {
+        Some(map) => {
+            let w = ui.available_width();
+            let size = Vec2::new(w, super::articles::fit_height(map.len(), w, 132.0));
+            let per = super::articles::per_cell(map, size);
+            ui.horizontal(|ui| {
+                section_title(ui, pal, "Article map");
+                if per > 1 {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(RichText::new(format!("1 cell = {per} articles")).font(fonts::mono_id(10.5)).color(pal.faint));
+                    });
+                }
+            });
+            ui.add_space(6.0);
+            super::articles::grid(ui, pal, egui::Id::new(("inspector-articles", job.id)), map, size, held, pal.raised, reduced);
+            ui.add_space(6.0);
+            ui.label(RichText::new(super::articles::summary(&map.counts())).font(fonts::mono_id(11.0)).color(pal.muted));
+            super::articles::legend(ui, pal, pal.raised);
+            ui.add_space(12.0);
+            section_title(ui, pal, "Files");
+            ui.add_space(6.0);
+            super::articles::lanes(ui, pal, map, held, pal.raised);
+            ui.add_space(12.0);
+        }
+        None => {
+            section_title(ui, pal, "Files");
+            ui.add_space(6.0);
+            files(ui, pal, data);
+            ui.add_space(12.0);
+        }
+    }
 
     section_title(ui, pal, "Numbers");
     ui.add_space(6.0);

@@ -1,34 +1,27 @@
-//! Center area: the Queue and History tabs.
-//!
-//! The Queue tab lists pending jobs (queued, downloading, held) in the order a run
-//! downloads them; every row has its own start/pause toggle, a menu (move, password,
-//! folder, remove) and a context menu with the same entries. History lists finished jobs
-//! newest first. A click selects a row; its details show in the Details dock.
+//! The queue's state and the pieces its views share (see [`super::center`]): queue order
+//! and summaries, the start/pause toggle of a job, the row controls (move, password,
+//! folder, remove, with their inline confirmations), the context menu, the name filter
+//! and the empty queue. Queue rows list pending jobs in the order a run downloads them;
+//! History lists finished jobs newest first.
 
 use std::collections::HashMap;
 
-use eframe::egui::{self, Align, Id, Layout, RichText, Sense, TextEdit, Ui};
-use egui_extras::{Column, TableBuilder};
+use eframe::egui::{self, Align, Layout, RichText, Sense, TextEdit, Ui};
 use newskite_service::{Job, JobMove, JobState};
 use newskite_types::format;
 
 use super::app::{Action, Data, Tab, ViewState};
 use super::brand;
 use super::fonts;
-use super::motion::{self, Beat};
+use super::motion::Beat;
 use super::theme::Palette;
 use super::widgets::{
     article_grid, compact_button, icon_button, icon_button_enabled, keycap, kit_button,
-    paint_icon, segment_track_live, spaced, state_badge, ButtonKind, Icon, EYEBROW_TRACKING,
+    paint_icon, ButtonKind, Icon,
 };
 
-/// Seconds the just-imported job's name stays in the accent before settling.
-const HIGHLIGHT_SECS: f64 = 2.5;
 /// Seconds a row's finish (done or failed) wash takes to fade.
 const FLASH_SECS: f64 = 1.6;
-/// Seconds the tab underline takes to slide to a newly selected tab.
-const TAB_SLIDE_SECS: f32 = 0.18;
-
 /// Seconds left at the current speed for `remaining` bytes, if a speed is known.
 pub fn eta_secs(remaining: u64, speed_bps: u64) -> Option<u64> {
     if speed_bps == 0 {
@@ -42,101 +35,13 @@ pub const EMPTY_QUEUE: &str = "The queue is empty. Add an NZB to begin.";
 /// Exact empty-state text of the History tab.
 pub const EMPTY_HISTORY: &str = "Nothing has finished yet.";
 
-/// Queue table column widths (logical px). Only Name and Progress give way on narrow
-/// windows; Controls keeps room for the "Remove?" Yes/No confirmation and the inline
-/// archive-password field.
-const POS_W: f32 = 30.0;
-const STATE_W: f32 = 108.0;
-const SIZE_W: f32 = 78.0;
-const CONTROLS_W: f32 = 160.0;
-const NAME_MIN: f32 = 150.0;
-const PROGRESS_MIN: f32 = 110.0;
-const PROGRESS_MAX: f32 = 240.0;
-/// History table: actions column (up to six icon buttons).
-const HISTORY_ACTIONS_W: f32 = 184.0;
-/// History table: result chip plus its qualifier.
-const RESULT_W: f32 = 120.0;
-/// History table: finish time.
-const FINISHED_W: f32 = 92.0;
 /// Width of the name filter field.
 const FILTER_W: f32 = 220.0;
-
-/// Progress column width and the table's minimum width for `available` px with
-/// `gap` px between columns. When the minimum exceeds `available`, the table scrolls
-/// sideways instead of being clipped.
-pub fn table_widths(available: f32, gap: f32) -> (f32, f32) {
-    let fixed = POS_W + STATE_W + SIZE_W + CONTROLS_W + 5.0 * gap;
-    let progress = (available - fixed - NAME_MIN).clamp(PROGRESS_MIN, PROGRESS_MAX);
-    (progress, fixed + NAME_MIN + progress)
-}
-
-/// Height of a job row.
-const ROW_H: f32 = 48.0;
-/// Space at the start of a row's first cell, beside the selection rail.
-const RAIL_ROOM: f32 = 10.0;
-/// Seconds a job's progress takes to glide to a new figure.
-const PROGRESS_GLIDE_SECS: f32 = 0.6;
-
-/// A job row's background, painted under its cells once they are laid out: a rounded
-/// wash that fades in on hover, the selection tint with an accent rail at the left edge,
-/// and the brief finish wash (done or failed) across the whole row.
-struct RowBg {
-    painter: egui::Painter,
-    slot: egui::layers::ShapeIdx,
-}
-
-impl RowBg {
-    /// Reserves the slot from inside the row's first cell, so the background lands under
-    /// every cell; `clip` is the table's clip rect (a cell's own clip is too narrow).
-    fn reserve(ui: &Ui, clip: egui::Rect) -> Self {
-        let mut painter = ui.painter().clone();
-        painter.set_clip_rect(clip);
-        let slot = painter.add(egui::Shape::Noop);
-        Self { painter, slot }
-    }
-
-    fn paint(&self, pal: &Palette, resp: &egui::Response, selected: bool, flash: Option<(JobState, f32)>) {
-        let ctx = &resp.ctx;
-        let hover = ctx.animate_bool(resp.id.with("row-hover"), resp.contains_pointer());
-        let sel = ctx.animate_bool(resp.id.with("row-selected"), selected);
-        // Inside the visible part of the table, clear of its right edge (an open
-        // inspector borders it there).
-        let mut rect = resp.rect.intersect(self.painter.clip_rect()).shrink2(egui::vec2(0.0, 2.0));
-        rect.max.x -= 6.0;
-        let radius = egui::CornerRadius::same(8);
-        // A faint hairline between rows; the washes below cover it.
-        let mut shapes = vec![egui::Shape::hline(
-            (rect.left() + 10.0)..=(rect.right() - 10.0),
-            resp.rect.bottom() - 0.5,
-            egui::Stroke::new(1.0, Palette::fade(pal.border, 0.6)),
-        )];
-        if sel > 0.0 {
-            shapes.push(egui::Shape::rect_filled(rect, radius, Palette::fade(pal.accent_soft, sel)));
-        }
-        if hover > 0.0 {
-            let wash = if selected { 0.5 } else { 1.0 };
-            shapes.push(egui::Shape::rect_filled(rect, radius, Palette::fade(pal.hover, hover * wash)));
-        }
-        if let Some((state, strength)) = flash {
-            let tint = match state {
-                JobState::Failed => pal.negative_soft,
-                _ => pal.positive_soft,
-            };
-            shapes.push(egui::Shape::rect_filled(rect, radius, Palette::fade(tint, strength)));
-        }
-        if sel > 0.0 {
-            let h = (rect.height() - 16.0) * (0.4 + 0.6 * sel);
-            let rail = egui::Rect::from_center_size(egui::pos2(rect.left() + 3.5, rect.center().y), egui::vec2(3.0, h));
-            shapes.push(egui::Shape::rect_filled(rail, egui::CornerRadius::same(2), Palette::fade(pal.accent, sel)));
-        }
-        self.painter.set(self.slot, egui::Shape::Vec(shapes));
-    }
-}
 
 /// Center-area UI state.
 #[derive(Default)]
 pub struct QueueState {
-    /// The selected job (its details show in the Details dock).
+    /// The selected job (its details show in the detail pane).
     pub selected: Option<i64>,
     /// Job awaiting removal confirmation.
     pub confirm_remove: Option<i64>,
@@ -209,7 +114,7 @@ pub fn toggle_action(data: &Data, job: &Job) -> Option<Action> {
 }
 
 /// Icon and tooltip of the toggle for `job` (see [`toggle_action`]).
-fn toggle_look(data: &Data, job: &Job) -> Option<(Icon, &'static str)> {
+pub(crate) fn toggle_look(data: &Data, job: &Job) -> Option<(Icon, &'static str)> {
     Some(match job.state {
         JobState::Downloading => (
             Icon::Pause,
@@ -268,135 +173,7 @@ pub fn queue_bytes(data: &Data) -> (u64, u64) {
     })
 }
 
-/// Draws the tab strip, the filter and the selected tab.
-pub fn show_center(
-    ui: &mut Ui,
-    pal: &Palette,
-    data: &Data,
-    view: &mut ViewState,
-    actions: &mut Vec<Action>,
-) {
-    let queue_n = data.queue().len();
-    let history_n = data.history().len();
-    let mut selected_rect = None;
-    ui.horizontal(|ui| {
-        for (tab, label, n) in [
-            (Tab::Queue, "Queue", queue_n),
-            (Tab::History, "History", history_n),
-        ] {
-            let rect = tab_button(ui, pal, label, n, view.tab == tab, || {
-                actions.push(Action::SetTab(tab))
-            });
-            if view.tab == tab {
-                selected_rect = Some(rect);
-            }
-        }
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            filter_box(ui, pal, view);
-        });
-    });
-    if let Some(rect) = selected_rect {
-        // The accent rule slides from the previous tab to the new one.
-        let (left, right) = if view.reduced_motion {
-            (rect.left() + 6.0, rect.right() - 6.0)
-        } else {
-            let ctx = ui.ctx();
-            (
-                ctx.animate_value_with_time(
-                    Id::new("tab-rule-left"),
-                    rect.left() + 6.0,
-                    TAB_SLIDE_SECS,
-                ),
-                ctx.animate_value_with_time(
-                    Id::new("tab-rule-right"),
-                    rect.right() - 6.0,
-                    TAB_SLIDE_SECS,
-                ),
-            )
-        };
-        let rule = egui::Rect::from_x_y_ranges(left..=right, (rect.bottom() - 3.0)..=rect.bottom());
-        ui.painter().rect_filled(rule, egui::CornerRadius::same(2), pal.accent);
-    }
-    let r = ui.available_rect_before_wrap();
-    ui.painter().line_segment(
-        [r.left_top(), r.right_top()],
-        egui::Stroke::new(1.0, pal.border),
-    );
-    ui.add_space(8.0);
-
-    let now = ui.input(|i| i.time);
-    view.queue.note_finishes(&data.jobs, now);
-    match view.tab {
-        Tab::Queue => queue_tab(ui, pal, data, view, actions),
-        Tab::History => history_tab(ui, pal, data, view, actions),
-    }
-}
-
-fn tab_button(
-    ui: &mut Ui,
-    pal: &Palette,
-    label: &str,
-    count: usize,
-    selected: bool,
-    mut on_click: impl FnMut(),
-) -> egui::Rect {
-    let font = egui::TextStyle::Button.resolve(ui.style());
-    let color = if selected { pal.text } else { pal.muted };
-    let galley = ui.painter().layout_no_wrap(label.to_owned(), font, color);
-    let count_text = count.to_string();
-    let count_galley =
-        ui.painter()
-            .layout_no_wrap(count_text.clone(), fonts::mono_id(11.0), pal.muted);
-    let pill_w = count_galley.size().x + 12.0;
-    let size = egui::vec2(galley.size().x + 6.0 + pill_w + 24.0, 30.0);
-    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
-    let hover = ui.ctx().animate_bool(resp.id.with("tab-hover"), resp.hovered() && !selected);
-    if hover > 0.0 {
-        ui.painter().rect_filled(
-            rect.shrink2(egui::vec2(2.0, 3.0)),
-            egui::CornerRadius::same(6),
-            Palette::fade(pal.hover, hover),
-        );
-    }
-    if resp.has_focus() {
-        super::widgets::focus_ring(ui, pal, rect.shrink(2.0), 5);
-    }
-    let x = rect.left() + 12.0;
-    ui.painter().galley(
-        egui::pos2(x, rect.center().y - galley.size().y / 2.0),
-        galley.clone(),
-        color,
-    );
-    let pill = egui::Rect::from_min_size(
-        egui::pos2(x + galley.size().x + 6.0, rect.center().y - 9.0),
-        egui::vec2(pill_w, 18.0),
-    );
-    let on = ui.ctx().animate_bool(resp.id.with("tab-on"), selected);
-    ui.painter().rect_filled(
-        pill,
-        egui::CornerRadius::same(9),
-        pal.sunken.lerp_to_gamma(pal.accent_soft, on),
-    );
-    let count_color = pal.muted.lerp_to_gamma(pal.accent_fg, on);
-    ui.painter().galley(
-        pill.center() - count_galley.size() / 2.0,
-        count_galley,
-        count_color,
-    );
-    let name = format!("{label} ({count})");
-    resp.widget_info(|| {
-        egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, selected, &name)
-    });
-    if resp
-        .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .clicked()
-    {
-        on_click();
-    }
-    rect
-}
-
-fn filter_box(ui: &mut Ui, pal: &Palette, view: &mut ViewState) {
+pub(crate) fn filter_box(ui: &mut Ui, pal: &Palette, view: &mut ViewState) {
     let width = FILTER_W.min(ui.available_width() - 8.0).max(120.0);
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 28.0), Sense::hover());
     let mut child = ui.new_child(
@@ -435,108 +212,7 @@ fn filter_box(ui: &mut Ui, pal: &Palette, view: &mut ViewState) {
     resp.on_hover_text("Show only jobs whose name contains this text (Ctrl+F)");
 }
 
-fn summary_row(ui: &mut Ui, pal: &Palette, text: &str, right: impl FnOnce(&mut Ui)) {
-    ui.horizontal(|ui| {
-        ui.set_min_height(30.0);
-        ui.label(
-            RichText::new(text)
-                .font(fonts::mono_id(12.0))
-                .color(pal.muted),
-        );
-        ui.with_layout(Layout::right_to_left(Align::Center), right);
-    });
-    ui.add_space(6.0);
-}
-
-fn queue_tab(
-    ui: &mut Ui,
-    pal: &Palette,
-    data: &Data,
-    view: &mut ViewState,
-    actions: &mut Vec<Action>,
-) {
-    let jobs: Vec<&Job> = data
-        .queue()
-        .into_iter()
-        .filter(|j| matches_filter(&j.name, &view.filter))
-        .collect();
-    let all = data.queue();
-    if all.is_empty() {
-        empty_queue(ui, pal, data, view, actions);
-        return;
-    }
-    // A run started for single jobs leaves the rest queued: offer the whole queue.
-    let outside = data.status.run_scope.is_some()
-        && all
-            .iter()
-            .any(|j| j.state == JobState::Queued && !data.in_run(j));
-    let (done, total) = queue_bytes(data);
-    let busy = Beat::new(
-        ui.ctx(),
-        data.status.running && data.speed() > 0,
-        view.reduced_motion,
-        brand::PERIOD_BUSY * 2.0,
-    );
-    summary_row(ui, pal, &queue_summary(data), |ui| {
-        if outside
-            && kit_button(
-                ui,
-                pal,
-                ButtonKind::Outline,
-                Some(Icon::Play),
-                "Start all",
-                true,
-            )
-            .on_hover_text("Download every queued job, in queue order")
-            .clicked()
-        {
-            actions.push(Action::Start);
-        }
-        // The whole queue as one segment track: every pending byte, done ones lit.
-        if total > 0 {
-            let width = (ui.available_width() * 0.4).clamp(120.0, 280.0);
-            let sweep = busy.moving.then_some(busy.phase);
-            segment_track_live(
-                ui,
-                pal,
-                format::fraction(done, total),
-                pal.accent,
-                width,
-                sweep,
-            )
-            .on_hover_text(format!(
-                "Queue: {}% · {} of {} downloaded",
-                format::percent(done, total),
-                format::bytes(done),
-                format::bytes(total)
-            ));
-            // The track's figure, so it reads without hovering.
-            ui.label(
-                RichText::new(format!("{}%", format::percent(done, total)))
-                    .font(fonts::mono_id(12.0))
-                    .color(pal.muted),
-            );
-        }
-    });
-    if jobs.is_empty() {
-        no_match(ui, pal, &view.filter);
-        return;
-    }
-    let (progress_w, min_width) = table_widths(ui.available_width(), ui.spacing().item_spacing.x);
-    if min_width > ui.available_width() + 0.5 {
-        egui::ScrollArea::horizontal()
-            .id_salt("queue-hscroll")
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                ui.set_min_width(min_width);
-                queue_table(ui, pal, data, &jobs, view, actions, progress_w);
-            });
-    } else {
-        queue_table(ui, pal, data, &jobs, view, actions, progress_w);
-    }
-}
-
-fn empty_queue(
+pub(crate) fn empty_queue(
     ui: &mut Ui,
     pal: &Palette,
     data: &Data,
@@ -658,357 +334,13 @@ pub(crate) fn rounded_outline(rect: egui::Rect, radius: f32) -> Vec<egui::Pos2> 
     pts
 }
 
-fn no_match(ui: &mut Ui, pal: &Palette, filter: &str) {
+pub(crate) fn no_match(ui: &mut Ui, pal: &Palette, filter: &str) {
     ui.add_space(24.0);
     ui.vertical_centered(|ui| {
         ui.label(
             RichText::new(format!("No jobs match “{}”.", filter.trim()))
                 .size(14.0)
                 .color(pal.muted),
-        );
-    });
-}
-
-/// The eyebrow header row of a job table.
-fn header_labels(h: &mut egui_extras::TableRow<'_, '_>, pal: &Palette, labels: &[&str]) {
-    for (i, t) in labels.iter().enumerate() {
-        h.col(|ui| {
-            let job = spaced(
-                &t.to_uppercase(),
-                fonts::mono_id(11.0),
-                pal.faint,
-                EYEBROW_TRACKING,
-            );
-            if *t == "#" {
-                // Over the right-aligned positions.
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.add_space(4.0);
-                    ui.add(egui::Label::new(job).selectable(false));
-                });
-                return;
-            }
-            if i == 0 {
-                // Lines up with the rows' first cell (see RAIL_ROOM).
-                ui.add_space(RAIL_ROOM);
-            }
-            ui.add(egui::Label::new(job).selectable(false));
-        });
-    }
-}
-
-fn queue_table(
-    ui: &mut Ui,
-    pal: &Palette,
-    data: &Data,
-    jobs: &[&Job],
-    view: &mut ViewState,
-    actions: &mut Vec<Action>,
-    progress_w: f32,
-) {
-    let now = ui.input(|i| i.time);
-    if view.queue.highlight.is_some() && view.queue.highlight_at.is_none() {
-        view.queue.highlight_at = Some(now);
-    }
-    if let (Some(_), Some(at)) = (view.queue.highlight, view.queue.highlight_at) {
-        if now - at >= HIGHLIGHT_SECS {
-            view.queue.highlight = None;
-            view.queue.highlight_at = None;
-        }
-    }
-    let busy = Beat::new(
-        ui.ctx(),
-        data.status.running && data.speed() > 0,
-        view.reduced_motion,
-        brand::PERIOD_BUSY * 2.0,
-    );
-    if view.queue.highlight.is_some() {
-        ui.ctx().request_repaint_after(super::motion::FRAME);
-    }
-    let reduced = view.reduced_motion;
-    let order = &data.queue_order;
-    let last = order.len().saturating_sub(1);
-    // An exact Name width: a remainder column keeps the width it had before the
-    // inspector opened beside the table.
-    let gap = ui.spacing().item_spacing.x;
-    let name_w = (ui.available_width() - (POS_W + STATE_W + SIZE_W + progress_w + CONTROLS_W + 5.0 * gap)).max(NAME_MIN);
-    TableBuilder::new(ui)
-        .id_salt("queue-table")
-        .striped(false)
-        .resizable(false)
-        .sense(Sense::click())
-        .cell_layout(Layout::left_to_right(Align::Center))
-        .column(Column::exact(POS_W))
-        .column(Column::exact(name_w).clip(true))
-        .column(Column::exact(STATE_W))
-        .column(Column::exact(SIZE_W))
-        .column(Column::exact(progress_w))
-        .column(Column::exact(CONTROLS_W))
-        .header(24.0, |mut h| {
-            header_labels(&mut h, pal, &["#", "Name", "State", "Size", "Progress", ""])
-        })
-        .body(|mut body| {
-            let clip = body.ui_mut().clip_rect();
-            for &job in jobs {
-                let pos = order.iter().position(|&id| id == job.id);
-                body.row(ROW_H, |mut row| {
-                    // The row paints its own hover and selection (see RowBg).
-                    row.set_hovered(false);
-                    let mut bg = None;
-                    row.col(|ui| {
-                        bg = Some(RowBg::reserve(ui, clip));
-                        // Positions sit at the right of their column, clear of the
-                        // selection rail at the row's left edge.
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            ui.add_space(4.0);
-                            ui.label(
-                                RichText::new(pos.map_or("–".to_owned(), |p| (p + 1).to_string()))
-                                    .font(fonts::mono_id(12.0))
-                                    .color(pal.faint),
-                            );
-                        });
-                    });
-                    row.col(|ui| {
-                        let highlight = if view.queue.highlight == Some(job.id) {
-                            // Accent at first, settling to the text color over the span.
-                            let at = view.queue.highlight_at.unwrap_or(now);
-                            let t = ((now - at) / HIGHLIGHT_SECS).clamp(0.0, 1.0) as f32;
-                            Some(if reduced { 0.0 } else { t })
-                        } else {
-                            None
-                        };
-                        let live = live_subline(job, data.shown_done(job), data.speed());
-                        name_cell(ui, pal, job, highlight, live);
-                    });
-                    row.col(|ui| {
-                        let r = state_badge(ui, pal, job.state);
-                        if job.state == JobState::Paused {
-                            r.on_hover_text("Held: queue runs skip it until you start it");
-                        } else if job.state == JobState::Queued && !data.in_run(job) {
-                            r.on_hover_text("Waiting for Start");
-                        }
-                    });
-                    row.col(|ui| {
-                        ui.label(
-                            RichText::new(format::bytes(job.bytes_total))
-                                .font(fonts::mono_id(12.0))
-                                .color(pal.text),
-                        );
-                    });
-                    row.col(|ui| progress_cell(ui, pal, data, job, progress_w - 8.0, busy));
-                    row.col(|ui| controls_cell(ui, pal, data, job, &mut view.queue, actions));
-                    let resp = row.response();
-                    if let Some(bg) = &bg {
-                        bg.paint(pal, &resp, view.queue.selected == Some(job.id), None);
-                    }
-                    if resp.clicked() {
-                        actions.push(Action::Select(Some(job.id)));
-                    }
-                    let place = pos.map(|p| (p == 0, p == last));
-                    resp.context_menu(|ui| {
-                        job_menu(ui, data, job, place, &mut view.queue, actions)
-                    });
-                });
-            }
-        });
-}
-
-fn history_tab(
-    ui: &mut Ui,
-    pal: &Palette,
-    data: &Data,
-    view: &mut ViewState,
-    actions: &mut Vec<Action>,
-) {
-    let all = data.history();
-    if all.is_empty() {
-        ui.add_space(36.0);
-        ui.vertical_centered(|ui| {
-            ui.label(RichText::new(EMPTY_HISTORY).size(14.0).color(pal.muted));
-            ui.add_space(4.0);
-            ui.label(
-                RichText::new("Finished and failed downloads are listed here.")
-                    .small()
-                    .color(pal.faint),
-            );
-        });
-        return;
-    }
-    let failed = all.iter().filter(|j| j.state == JobState::Failed).count();
-    let text = if failed > 0 {
-        format!("{} finished  ·  {failed} failed", all.len() - failed)
-    } else {
-        format!("{} finished", all.len())
-    };
-    let q = &mut view.queue;
-    summary_row(ui, pal, &text, |ui| {
-        let n = all.len();
-        let s = if n == 1 { "" } else { "s" };
-        if q.confirm_clear_files {
-            if kit_button(ui, pal, ButtonKind::Text, None, "Cancel", true).clicked() {
-                q.confirm_clear_files = false;
-            }
-            if kit_button(ui, pal, ButtonKind::Outline, Some(Icon::Trash), "Delete", true).clicked() {
-                actions.push(Action::ClearHistoryAndFiles);
-                q.confirm_clear_files = false;
-            }
-            ui.label(
-                RichText::new(format!(
-                    "Permanently delete the download folder{s} of {n} job{s}? This cannot be undone."
-                ))
-                .color(pal.negative),
-            );
-        } else if q.confirm_clear {
-            if kit_button(ui, pal, ButtonKind::Text, None, "Cancel", true).clicked() {
-                q.confirm_clear = false;
-            }
-            if kit_button(ui, pal, ButtonKind::Text, Some(Icon::Trash), "Delete files too…", true)
-                .on_hover_text("Also delete each job's download folder from disk")
-                .clicked()
-            {
-                q.confirm_clear = false;
-                q.confirm_clear_files = true;
-            }
-            if kit_button(ui, pal, ButtonKind::Outline, None, "Clear", true).clicked() {
-                actions.push(Action::ClearHistory);
-                q.confirm_clear = false;
-            }
-            ui.label(
-                RichText::new(format!(
-                    "Remove {} job{} from the list? Files stay on disk.",
-                    all.len(),
-                    if all.len() == 1 { "" } else { "s" }
-                ))
-                .color(pal.text),
-            );
-        } else if kit_button(
-            ui,
-            pal,
-            ButtonKind::Outline,
-            Some(Icon::Close),
-            "Clear history",
-            true,
-        )
-        .on_hover_text("Remove finished jobs from the list (files stay on disk)")
-        .clicked()
-        {
-            q.confirm_clear = true;
-        }
-    });
-    let jobs: Vec<&Job> = all
-        .into_iter()
-        .filter(|j| matches_filter(&j.name, &view.filter))
-        .collect();
-    if jobs.is_empty() {
-        no_match(ui, pal, &view.filter);
-        return;
-    }
-    let now = ui.input(|i| i.time);
-    if !view.queue.flashes.is_empty() {
-        ui.ctx().request_repaint_after(super::motion::FRAME);
-    }
-    let reduced = view.reduced_motion;
-    let gap = ui.spacing().item_spacing.x;
-    let name_w = (ui.available_width() - (RESULT_W + SIZE_W + FINISHED_W + HISTORY_ACTIONS_W + 4.0 * gap)).max(NAME_MIN);
-    let now_unix = now_unix();
-    TableBuilder::new(ui)
-        .id_salt("history-table")
-        .striped(false)
-        .resizable(false)
-        .sense(Sense::click())
-        .cell_layout(Layout::left_to_right(Align::Center))
-        .column(Column::exact(name_w).clip(true))
-        .column(Column::exact(RESULT_W))
-        .column(Column::exact(SIZE_W))
-        .column(Column::exact(FINISHED_W))
-        .column(Column::exact(HISTORY_ACTIONS_W))
-        .header(24.0, |mut h| {
-            header_labels(&mut h, pal, &["Name", "Result", "Size", "Finished", ""])
-        })
-        .body(|mut body| {
-            let clip = body.ui_mut().clip_rect();
-            for job in jobs {
-                body.row(ROW_H, |mut row| {
-                    row.set_hovered(false);
-                    let mut bg = None;
-                    row.col(|ui| {
-                        bg = Some(RowBg::reserve(ui, clip));
-                        ui.add_space(RAIL_ROOM);
-                        name_cell(ui, pal, job, None, None);
-                    });
-                    row.col(|ui| {
-                        ui.vertical(|ui| {
-                            ui.spacing_mut().item_spacing.y = 2.0;
-                            let r = state_badge(ui, pal, job.state);
-                            if let Some(e) = &job.error {
-                                r.on_hover_text(e);
-                            }
-                            if let Some((q, color)) = result_qualifier(pal, job) {
-                                ui.label(RichText::new(q).font(fonts::mono_id(10.5)).color(color));
-                            }
-                        });
-                    });
-                    row.col(|ui| {
-                        ui.label(
-                            RichText::new(format::bytes(job.bytes_total))
-                                .font(fonts::mono_id(12.0))
-                                .color(pal.text),
-                        );
-                    });
-                    row.col(|ui| match job.stats.finished_at {
-                        Some(t) => {
-                            ui.label(RichText::new(format::ago(t, now_unix)).small().color(pal.muted))
-                                .on_hover_text(format::timestamp_utc(t));
-                        }
-                        None => {
-                            ui.label(RichText::new("—").small().color(pal.faint))
-                                .on_hover_text("Finished before finish times were recorded");
-                        }
-                    });
-                    row.col(|ui| history_actions(ui, pal, data, job, &mut view.queue, actions));
-                    let resp = row.response();
-                    if let Some(bg) = &bg {
-                        let flash = if reduced { None } else { view.queue.flash(job.id, now) };
-                        bg.paint(pal, &resp, view.queue.selected == Some(job.id), flash);
-                    }
-                    if resp.double_clicked() {
-                        actions.push(Action::OpenJobFolder(job.id));
-                    } else if resp.clicked() {
-                        actions.push(Action::Select(Some(job.id)));
-                    }
-                    resp.context_menu(|ui| job_menu(ui, data, job, None, &mut view.queue, actions));
-                });
-            }
-        });
-}
-
-/// The name and its subline. `highlight` is the just-imported fade (0 = full accent, 1 =
-/// settled). A finish wash is painted by the row (see [`RowBg`]).
-fn name_cell(ui: &mut Ui, pal: &Palette, job: &Job, highlight: Option<f32>, live: Option<String>) {
-    ui.vertical(|ui| {
-        ui.spacing_mut().item_spacing.y = 1.0;
-        let color = match highlight {
-            Some(t) => pal.accent_fg.lerp_to_gamma(pal.text, t),
-            None => pal.text,
-        };
-        ui.add(
-            egui::Label::new(RichText::new(&job.name).font(fonts::semibold_id(13.5)).color(color))
-                .truncate()
-                .selectable(false),
-        )
-        .on_hover_text(job.source_path.display().to_string());
-        // While downloading at a measured speed the subline is the live figure (the
-        // destination stays on hover); a failed job's subline is its error; a finished
-        // one's is how long it took and how fast it went.
-        let (sub, color) = match (&job.error, job.state, live) {
-            (Some(e), JobState::Failed, _) => (e.clone(), pal.negative),
-            (_, _, Some(l)) => (l, pal.accent_fg),
-            (_, JobState::Done, _) if job.stats.download_ms >= 1000 => (finished_subline(job), pal.muted),
-            _ => (home_relative(&job.dest_dir), pal.muted),
-        };
-        ui.add(
-            egui::Label::new(RichText::new(sub).small().color(color))
-                .truncate()
-                .selectable(false),
         );
     });
 }
@@ -1039,7 +371,7 @@ pub fn finished_subline(job: &Job) -> String {
 }
 
 /// The word under a history row's chip: what made the result what it is.
-fn result_qualifier(pal: &Palette, job: &Job) -> Option<(String, egui::Color32)> {
+pub(crate) fn result_qualifier(pal: &Palette, job: &Job) -> Option<(String, egui::Color32)> {
     let o = job.stats.outcome.as_ref()?;
     match job.state {
         JobState::Failed => o.failure.map(|k| (k.label().to_string(), pal.negative)),
@@ -1052,71 +384,10 @@ fn result_qualifier(pal: &Palette, job: &Job) -> Option<(String, egui::Color32)>
     }
 }
 
-fn now_unix() -> i64 {
+pub(crate) fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64)
-}
-
-fn progress_cell(ui: &mut Ui, pal: &Palette, data: &Data, job: &Job, width: f32, busy: Beat) {
-    // After the download: the post-processing stage replaces the byte figures.
-    if let Some(p) = data.status.post.as_ref().filter(|p| p.job_id == job.id) {
-        let fraction = p.permille.map(|m| m as f32 / 1000.0);
-        let color = match p.stage {
-            newskite_service::PostStage::Repair => pal.warning,
-            _ => pal.accent,
-        };
-        let sweep = (fraction.is_none() && busy.moving).then_some(busy.phase);
-        ui.vertical(|ui| {
-            ui.spacing_mut().item_spacing.y = 4.0;
-            segment_track_live(ui, pal, fraction.unwrap_or(1.0), color, width, sweep);
-            let head = match fraction {
-                Some(f) => format!("{} {:.0}%", p.stage.label(), f * 100.0),
-                None => p.stage.label().to_string(),
-            };
-            ui.add(
-                egui::Label::new(
-                    RichText::new(format!("{head}  ·  {}", p.detail))
-                        .font(fonts::mono_id(11.0))
-                        .color(pal.muted),
-                )
-                .truncate(),
-            )
-            .on_hover_text(&p.detail);
-        });
-        return;
-    }
-    let done = data.shown_done(job);
-    // The track glides to each new figure instead of jumping between updates.
-    let shown = motion::ease_to(
-        ui.ctx(),
-        Id::new(("job-progress", job.id)),
-        format::fraction(done, job.bytes_total),
-        PROGRESS_GLIDE_SECS,
-        !busy.animate,
-    );
-    // Segment cells fill in the accent; a held job's cells rest in the muted tone.
-    let color = match job.state {
-        JobState::Failed => pal.negative,
-        JobState::Paused => pal.muted,
-        _ => pal.accent,
-    };
-    let downloading = job.state == JobState::Downloading;
-    let sweep = (downloading && busy.moving).then_some(busy.phase);
-    ui.vertical(|ui| {
-        ui.spacing_mut().item_spacing.y = 4.0;
-        segment_track_live(ui, pal, shown, color, width, sweep);
-        ui.label(
-            RichText::new(format!(
-                "{}%  ·  {} / {}",
-                format::percent(done, job.bytes_total),
-                format::bytes(done),
-                format::bytes(job.bytes_total)
-            ))
-            .font(fonts::mono_id(11.0))
-            .color(pal.muted),
-        );
-    });
 }
 
 /// The live subline of a downloading job: the measured speed and, from it, the time
@@ -1135,7 +406,7 @@ pub fn live_subline(job: &Job, done: u64, speed_bps: u64) -> Option<String> {
 
 /// The inline editors that take over a row's controls cell (password, remove
 /// confirmation). Returns `true` when one was drawn.
-fn inline_editors(
+pub(crate) fn inline_editors(
     ui: &mut Ui,
     pal: &Palette,
     job: &Job,
@@ -1189,7 +460,7 @@ fn inline_editors(
     false
 }
 
-fn controls_cell(
+pub(crate) fn controls_cell(
     ui: &mut Ui,
     pal: &Palette,
     data: &Data,
@@ -1240,7 +511,7 @@ fn controls_cell(
     }
 }
 
-fn history_actions(
+pub(crate) fn history_actions(
     ui: &mut Ui,
     pal: &Palette,
     data: &Data,
@@ -1293,7 +564,7 @@ fn history_actions(
 
 /// The row menu (⋯ button and right click). `place` is `(first, last)` in the queue
 /// order for pending jobs.
-fn job_menu(
+pub(crate) fn job_menu(
     ui: &mut Ui,
     data: &Data,
     job: &Job,
@@ -1480,20 +751,6 @@ mod tests {
         };
         assert_eq!(queue_bytes(&d), (50, 200));
         assert_eq!(queue_bytes(&Data::default()), (0, 0));
-    }
-
-    #[test]
-    fn queue_table_fits_the_minimum_window() {
-        // 960 px window, 14 px panel margins: about 930 px.
-        let (progress, min) = table_widths(930.0, 8.0);
-        assert!(min <= 930.0 + 0.5, "{min}");
-        assert!((PROGRESS_MIN..=PROGRESS_MAX).contains(&progress));
-        // Wide windows get the full progress column.
-        assert_eq!(table_widths(1600.0, 8.0).0, PROGRESS_MAX);
-        // Too narrow: the minimum is reported so the table can scroll.
-        let (p, min) = table_widths(500.0, 8.0);
-        assert_eq!(p, PROGRESS_MIN);
-        assert!(min > 500.0);
     }
 
     #[test]

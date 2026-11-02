@@ -27,6 +27,8 @@ const SIZE: egui::Vec2 = egui::vec2(1280.0, 800.0);
 /// Free space shown in every test window (the real filesystem's figure would change the
 /// snapshots from run to run).
 const FIXED_FREE: u64 = 128 * 1024 * 1024 * 1024;
+/// Size of the download disk in every test window (for the sidebar's meter).
+const FIXED_TOTAL: u64 = 512 * 1024 * 1024 * 1024;
 
 /// Desktop-like themes: the theme crate's Breeze fixtures when present, else the
 /// built-in fallback palette.
@@ -122,6 +124,7 @@ impl Fixture {
                             },
                         );
                         a.data.disk_free = Some(FIXED_FREE);
+                        a.data.disk_total = Some(FIXED_TOTAL);
                         a
                     });
                     app.ui(ctx);
@@ -390,7 +393,6 @@ fn empty_state_renders_cleanly() {
         h.get_by_label("Add NZB…");
         h.get_by_label("No throughput history yet");
         h.get_by_label("No server configured");
-        h.get_by_label(newskite_app::gui::docks::NO_ARTICLES);
         h.get_by_label("No server");
         h.get_by_label("Idle");
         h.get_by_label("128 GB free");
@@ -412,15 +414,16 @@ fn populated_window_renders() {
     for (t, look) in looks() {
         let mut h = fx.harness_themed(t, SIZE, true, None, true, 0.25);
         h.run_steps(4);
-        // The queue holds the pending jobs only, in queue order.
+        // The queue holds the pending jobs, in queue order; what finished in the last day
+        // is listed under it.
         h.get_by_label("Open.Movie.Project.2160p");
         h.get_by_label("Public.Domain.Archive");
-        assert!(
-            h.query_by_label("Debian.12.Netinst.amd64").is_none(),
-            "done is history"
-        );
-        h.get_by_label("queued");
-        h.get_by_label("paused");
+        let recent = h.get_by_label("RECENTLY FINISHED").rect();
+        assert!(h.get_by_label("Debian.12.Netinst.amd64").rect().top() > recent.bottom(), "done is listed under the queue");
+        assert!(h.get_by_label("Public.Domain.Archive").rect().bottom() < recent.top());
+        h.get_by_label("Queued");
+        // The held row's state word, and the filter's Held option.
+        assert_eq!(h.get_all_by_label("Held").count(), 2);
         h.get_by_label("Queue (2)");
         h.get_by_label("History (2)");
         h.get_by_label_contains("2 jobs  ·  ");
@@ -511,9 +514,10 @@ fn import_nzb_switches_to_queue_and_errors_inline() {
         "the new job is selected"
     );
     assert!(a.view.open_nzb.error.is_none());
-    // In the queue and, selected, in the Details and Articles docks.
-    assert_eq!(h.get_all_by_label("Sample Release").count(), 3);
-    h.get_by_label("0%  ·  0 B / 977 KB");
+    // In the queue and, selected, in the detail pane.
+    assert_eq!(h.get_all_by_label("Sample Release").count(), 2);
+    // Not started yet: the row's figure is its size.
+    assert!(h.get_all_by_label("977 KB").count() >= 1);
 }
 
 #[test]
@@ -654,8 +658,8 @@ fn history_lists_finished_jobs_and_clears_them() {
     h.run_steps(3);
     assert_eq!(app(&h).view.tab, Tab::History);
     h.get_by_label("Debian.12.Netinst.amd64");
-    h.get_by_label("done");
-    h.get_by_label("failed");
+    h.get_by_label("Done");
+    h.get_by_label("Failed");
     h.get_by_label("3 missing articles: part1@x, part7@x, part9@x");
     h.get_by_label("1 finished  ·  1 failed");
     assert!(
@@ -716,24 +720,24 @@ fn selecting_a_job_shows_its_details_and_files() {
         .find(|j| j.name == "Open.Movie.Project.2160p")
         .map(|j| j.id);
     assert_eq!(app(&h).view.queue.selected, movie);
-    // A wide window shows the inspector as a side panel; the docks stay throughput and log.
+    // The detail pane opens beside the list: lifecycle, the article map, a lane per file.
     h.get_by_label("LIFECYCLE");
-    h.get_by_label("LOG");
-    assert!(h.query_by_label("DETAILS").is_none());
+    h.get_by_label("ARTICLE MAP");
     h.get_by_label("Waiting in the queue");
-    // The folder: the row's subline and the inspector's link.
+    // The folder: the row's subline, under the name in the detail pane and its link.
     assert_eq!(
         h.get_all_by_label("/home/reader/Downloads/Newskite/Open.Movie.Project.2160p")
             .count(),
-        2
+        3
     );
+    h.get_by_label("2,161 of 3,801 articles");
+    h.get_by_label("open.movie.part01.rar: 1,900 / 1,900 articles");
+    h.get_by_label("open.movie.part02.rar: 260 / 1,900 articles");
     assert_no_bad_numbers(&h);
     snapshot(&mut h, "details-dark");
-    h.get_by_label("Files 3").click();
+    // Further down the pane: the files and the numbers.
+    h.get_by_label("open.movie.par2: 1 / 1 articles").scroll_to_me();
     h.run_steps(3);
-    h.get_by_label("open.movie.part01.rar");
-    h.get_by_label("open.movie.part02.rar");
-    h.get_by_label("2 of 3 done");
     snapshot(&mut h, "inspector-files-dark");
     // Esc clears the selection; the server stays in its strip.
     h.key_press(egui::Key::Escape);
@@ -755,13 +759,16 @@ fn messages_dock_shows_logs_newest_first() {
     h.run_steps(3);
     let logs = &app(&h).data.logs;
     assert_eq!(logs[0].text, "second line");
+    // The log is a view of its own; the sidebar counts its warnings and errors.
+    h.get_by_label("Log (2 warnings or errors)").click();
+    h.run_steps(3);
     h.get_by_label("second line");
     h.get_by_label("first line");
     // A long line wraps under its own text, inside the card.
     let long = h
         .get_by_label("Open.Movie.Project.2160p: par2 repaired 3 blocks, extract ok")
         .rect();
-    let title = h.get_by_label("LOG").rect();
+    let title = h.get_by_label("Log").rect();
     assert!(
         long.left() > title.left() + 60.0,
         "text sits right of the clock column"
@@ -894,7 +901,8 @@ fn downloading_row_shows_eta_and_finish_flash() {
     h.run_steps(1);
     // 100 MB left at 1 MB/s → 100 s.
     h.get_by_label("1.0 MB/s · 1:40 left");
-    h.get_by_label("50%  ·  100 MB / 200 MB");
+    h.get_by_label("50%");
+    h.get_by_label("Articles of Live.Download.Now: 50% downloaded");
     assert_no_bad_numbers(&h);
     snapshot(&mut h, "downloading-dark");
 
@@ -1054,7 +1062,9 @@ fn unreadable_settings_show_a_notice() {
     let mut h = fx.harness_themed(brand_tokens::paper(), SIZE, true, None, true, 0.25);
     h.run_steps(3);
     assert!(app(&h).data.settings_load_error.is_some());
-    // Messages carries the service's report.
+    // The log carries the service's report; the sidebar counts it.
+    h.get_by_label_contains("Log (1 warnings or errors)").click();
+    h.run_steps(3);
     h.get_by_label_contains("settings could not be loaded");
     h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Comma);
     h.run_steps(3);
@@ -1396,6 +1406,9 @@ fn failover_strip_wide_log_and_backup_retry_render() {
         h.run_steps(3);
         feed_failover(&mut h);
         h.run_steps(3);
+        // The log lines are in the Log view.
+        h.state_mut().as_mut().expect("app").push_action(Action::SetTab(Tab::Log));
+        h.run_steps(2);
         // The strip: primary always named, connections and retry-all on the same line, apart.
         assert!(
             h.query_by_label("newshosting.tweaknews.example:563").is_some()
@@ -1420,6 +1433,9 @@ fn failover_strip_wide_log_and_backup_retry_render() {
     h.run_steps(3);
     feed_failover(&mut h);
     h.run_steps(3);
+    // The log lines are in the Log view.
+    h.state_mut().as_mut().expect("app").push_action(Action::SetTab(Tab::Log));
+    h.run_steps(2);
     h.get_all_by_label("▸ Show first ids").next().expect("disclosure").click();
     h.run_steps(2);
     h.get_by_label("<1454628461.31340.2@reader.easyusenet.example>");
@@ -1440,7 +1456,7 @@ fn failover_strip_wide_log_and_backup_retry_render() {
     h.get_by_label("Retry 1 on backup").click();
     h.run_steps(2);
     assert!(app(&h).view.strip.confirm_retry_all);
-    h.get_by_label_contains("incomplete files download again from news.backup-provider.example:563 first");
+    h.get_by_label_contains("Retry 1 failed download");
     snapshot(&mut h, "failover-dark-confirm");
     h.get_by_label("Cancel").click();
     h.run_steps(2);
@@ -1451,6 +1467,9 @@ fn failover_strip_wide_log_and_backup_retry_render() {
     h.run_steps(3);
     feed_failover(&mut h);
     h.run_steps(3);
+    // The log lines are in the Log view.
+    h.state_mut().as_mut().expect("app").push_action(Action::SetTab(Tab::Log));
+    h.run_steps(2);
     assert_disjoint(&h, &strip_labels);
     snapshot(&mut h, "failover-light-wide");
 }

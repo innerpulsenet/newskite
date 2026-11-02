@@ -1,4 +1,5 @@
-//! Free space on the download folder's filesystem (the status bar's reading).
+//! Free space and size of the download folder's filesystem (the sidebar's disk meter and
+//! the status bar's reading).
 
 use std::path::Path;
 
@@ -13,14 +14,34 @@ pub fn free_bytes(dir: &Path) -> Option<u64> {
     statvfs_free(probe)
 }
 
+/// Size in bytes of the filesystem holding `dir` (or its nearest existing ancestor).
+pub fn total_bytes(dir: &Path) -> Option<u64> {
+    if dir.as_os_str().is_empty() {
+        return None;
+    }
+    let probe = dir.ancestors().find(|p| p.is_dir())?;
+    statvfs_total(probe)
+}
+
 #[cfg(unix)]
 fn statvfs_free(p: &Path) -> Option<u64> {
     let st = rustix::fs::statvfs(p).ok()?;
     Some(st.f_bavail.saturating_mul(st.f_frsize))
 }
 
+#[cfg(unix)]
+fn statvfs_total(p: &Path) -> Option<u64> {
+    let st = rustix::fs::statvfs(p).ok()?;
+    Some(st.f_blocks.saturating_mul(st.f_frsize))
+}
+
 #[cfg(not(unix))]
 fn statvfs_free(_p: &Path) -> Option<u64> {
+    None
+}
+
+#[cfg(not(unix))]
+fn statvfs_total(_p: &Path) -> Option<u64> {
     None
 }
 
@@ -34,5 +55,8 @@ mod tests {
         let missing = tmp.join("newskite-no-such-folder").join("deeper");
         assert_eq!(free_bytes(&missing).is_some(), free_bytes(&tmp).is_some());
         assert_eq!(free_bytes(Path::new("")), None);
+        if let (Some(free), Some(total)) = (free_bytes(&tmp), total_bytes(&tmp)) {
+            assert!(free <= total);
+        }
     }
 }

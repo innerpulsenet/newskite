@@ -20,7 +20,7 @@ use super::brand::{self, MarkClock};
 use super::events::{Pending, SharedPending};
 use super::settings::{FolderTarget, SettingsDraft};
 use super::theme::{self, Palette};
-use super::{about, disk, docks, fonts, icons, motion, queue, settings, statusbar, toolbar};
+use super::{about, disk, docks, fonts, icons, motion, queue, settings, statusbar};
 
 /// How often the job list is re-read while a job is downloading (outline §7).
 pub const JOBS_REFRESH: Duration = Duration::from_millis(1500);
@@ -84,6 +84,8 @@ pub enum Tab {
     Queue,
     /// Finished jobs: done and failed.
     History,
+    /// The message log.
+    Log,
 }
 
 /// Messages delivered to the UI thread.
@@ -244,6 +246,11 @@ pub struct Data {
     pub article_maps: HashMap<i64, newskite_service::ArticleMap>,
     /// The job the Articles dock shows: the one downloading, else the selection.
     pub activity_job: Option<i64>,
+    /// Every job's article map folded into strip buckets (see `articles::STRIP_BUCKETS`),
+    /// for the rows' strips; jobs without a map have none.
+    pub strips: HashMap<i64, Vec<newskite_service::ArticleCounts>>,
+    /// Size of the download folder's filesystem, when it can be read.
+    pub disk_total: Option<u64>,
 }
 
 impl Data {
@@ -326,6 +333,8 @@ pub struct ViewState {
     pub queue: queue::QueueState,
     /// Inspector (selected job) state.
     pub inspector: super::inspector::InspectorState,
+    /// Which queued jobs the list shows.
+    pub list_filter: super::center::ListFilter,
     /// The job the inspector last showed, so it can slide away with its content.
     pub inspector_job: Option<Job>,
     /// Settings modal (open when `Some`).
@@ -400,6 +409,8 @@ pub struct NewskiteApp {
     last_maps_reload: Instant,
     /// A run ended or jobs changed: saved article maps may be new.
     maps_dirty: bool,
+    /// Jobs the service has no article map for (not asked again until a run ends).
+    no_map: HashSet<i64>,
     notifications: bool,
     /// Jobs already finished when last notified (so only new completions notify).
     finished_seen: HashSet<i64>,
@@ -478,6 +489,7 @@ impl NewskiteApp {
                 strip: Default::default(),
                 queue: queue::QueueState::default(),
                 inspector: Default::default(),
+                list_filter: Default::default(),
                 inspector_job: None,
                 settings: None,
                 dialog_open: false,
@@ -492,6 +504,7 @@ impl NewskiteApp {
             jobs_dirty: false,
             last_maps_reload: Instant::now(),
             maps_dirty: true,
+            no_map: HashSet::new(),
             notifications: config.notifications,
             finished_seen: HashSet::new(),
             last_notice: None,
@@ -544,6 +557,7 @@ impl NewskiteApp {
     pub fn reload_history(&mut self) {
         self.data.history = self.service.throughput_history(HISTORY_SECS);
         self.data.disk_free = disk::free_bytes(&self.data.settings.download_dir);
+        self.data.disk_total = disk::total_bytes(&self.data.settings.download_dir);
         self.last_history_reload = Instant::now();
     }
 
@@ -565,28 +579,45 @@ impl NewskiteApp {
         self.data.logs = self.service.logs();
     }
 
-    /// Keeps the article maps of the jobs on show: downloading jobs are read every
-    /// [`MAPS_REFRESH`] (their maps change constantly), the selection once, and again
-    /// after a run ends. Maps of jobs no longer on show are dropped.
+    /// Keeps the article maps the window draws: every job's strip, and the full map of
+    /// the downloading jobs and the selection. Downloading jobs are read every
+    /// [`MAPS_REFRESH`] (their maps change constantly); the others once, and again after a
+    /// run ends. Jobs without a map are remembered, so they are not asked for every frame.
     fn refresh_article_maps(&mut self) {
         let downloading: Vec<i64> =
             self.data.jobs.iter().filter(|j| j.state == JobState::Downloading).map(|j| j.id).collect();
         let selected = self.view.queue.selected;
         self.data.activity_job = downloading.first().copied().or(selected);
-        let wanted: HashSet<i64> = downloading.iter().copied().chain(selected).collect();
-        self.data.article_maps.retain(|id, _| wanted.contains(id));
+        let full: HashSet<i64> = downloading.iter().copied().chain(selected).collect();
+        let ids: HashSet<i64> = self.data.jobs.iter().map(|j| j.id).collect();
+        self.data.article_maps.retain(|id, _| full.contains(id));
+        self.data.strips.retain(|id, _| ids.contains(id));
+        if self.maps_dirty {
+            self.no_map.clear();
+        }
+        self.no_map.retain(|id| ids.contains(id));
         let live_due = !downloading.is_empty() && self.last_maps_reload.elapsed() >= MAPS_REFRESH;
-        for &id in &wanted {
-            let due = self.maps_dirty || !self.data.article_maps.contains_key(&id) || (live_due && downloading.contains(&id));
+        for &id in &ids {
+            if self.no_map.contains(&id) && !downloading.contains(&id) {
+                continue;
+            }
+            let missing = !self.data.strips.contains_key(&id) || (full.contains(&id) && !self.data.article_maps.contains_key(&id));
+            let due = self.maps_dirty || missing || (live_due && downloading.contains(&id));
             if !due {
                 continue;
             }
             match self.service.article_map(id) {
                 Some(m) => {
-                    self.data.article_maps.insert(id, m);
+                    self.data.strips.insert(id, m.cells(super::articles::STRIP_BUCKETS).1);
+                    if full.contains(&id) {
+                        self.data.article_maps.insert(id, m);
+                    }
+                    self.no_map.remove(&id);
                 }
                 None => {
+                    self.data.strips.remove(&id);
                     self.data.article_maps.remove(&id);
+                    self.no_map.insert(id);
                 }
             }
         }
@@ -1404,32 +1435,25 @@ impl NewskiteApp {
             ctx.all_styles_mut(|s| s.animation_time = anim);
         }
 
-        let toolbar = egui::TopBottomPanel::top("toolbar")
+        // The sidebar: views and actions on the left (a rail of icons on narrow windows).
+        let rail = width < super::sidebar::RAIL_BELOW;
+        egui::SidePanel::left("sidebar")
+            .resizable(false)
+            .exact_width(if rail { super::sidebar::RAIL_W } else { super::sidebar::WIDE_W })
             .frame(
                 egui::Frame::new()
                     .fill(pal.raised)
-                    .inner_margin(egui::Margin::symmetric(8, 6))
+                    .inner_margin(egui::Margin { left: 10, right: 10, top: 18, bottom: 12 })
                     .stroke(egui::Stroke::new(1.0, pal.border)),
             )
-            .show(ctx, |ui| {
-                toolbar::show(ui, &pal, &self.data, &mut self.view, &mut actions)
-            });
-        // The toolbar casts a short shadow over whatever scrolls beneath it.
-        let edge = toolbar.response.rect;
-        super::widgets::shade_below(
-            &ctx.layer_painter(egui::LayerId::new(egui::Order::Middle, egui::Id::new("toolbar-shade"))),
-            &pal,
-            edge.x_range(),
-            edge.bottom(),
-            7.0,
-        );
+            .show(ctx, |ui| super::sidebar::show(ui, &pal, &self.data, &self.view, rail, &mut actions));
 
         egui::TopBottomPanel::bottom("statusbar")
-            .exact_height(28.0)
+            .exact_height(30.0)
             .frame(
                 egui::Frame::new()
                     .fill(pal.raised)
-                    .inner_margin(egui::Margin::symmetric(10, 3))
+                    .inner_margin(egui::Margin::symmetric(12, 3))
                     .stroke(egui::Stroke::new(1.0, pal.border)),
             )
             .show(ctx, |ui| {
@@ -1442,25 +1466,20 @@ impl NewskiteApp {
             .frame(
                 egui::Frame::new()
                     .fill(pal.surface)
-                    .inner_margin(egui::Margin::symmetric(12, 0))
+                    .inner_margin(egui::Margin::symmetric(14, 0))
                     .stroke(egui::Stroke::new(1.0, pal.border)),
             )
             .show(ctx, |ui| {
                 super::serverstrip::show(ui, &pal, &self.data, &mut self.view.strip, &mut actions)
             });
 
-        // The inspector is a full-height column on wide windows; narrower, the docks show
-        // the selected job's details instead.
-        let side = width >= super::inspector::SIDE_PANEL_MIN_WINDOW;
+        // The detail pane slides in beside the list when a job is selected, and out (still
+        // showing that job) when the selection is cleared.
         let selected_job = self.view.queue.selected.and_then(|id| self.data.jobs.iter().find(|j| j.id == id)).cloned();
-        let inspecting = side && selected_job.is_some();
+        let inspecting = selected_job.is_some();
         if inspecting {
             self.view.inspector_job = selected_job.clone();
-        } else if !side {
-            self.view.inspector_job = None;
         }
-        // It slides in when a job is selected and out (still showing that job) when the
-        // selection is cleared.
         if let Some(job) = self.view.inspector_job.clone() {
             let shown = egui::SidePanel::right("inspector")
                 .resizable(true)
@@ -1470,7 +1489,7 @@ impl NewskiteApp {
                 .frame(
                     egui::Frame::new()
                         .fill(pal.raised)
-                        .inner_margin(egui::Margin::symmetric(16, 14))
+                        .inner_margin(egui::Margin::symmetric(20, 18))
                         .stroke(egui::Stroke::new(1.0, pal.border)),
                 )
                 .show_animated(ctx, inspecting, |ui| {
@@ -1489,46 +1508,17 @@ impl NewskiteApp {
             }
         }
 
-        // One panel id per arrangement so each keeps its own (user-resizable) height. The
-        // 2×2 grid starts at a share of the window height, so a 600 px window still leaves
-        // the queue a few rows.
-        let (dock_id, dock_h) = match docks::layout_for(width) {
-            docks::DockLayout::Row => ("docks-row", 236.0),
-            docks::DockLayout::Stack => ("docks-stack", 250.0),
-        };
-        egui::TopBottomPanel::bottom(dock_id)
-            .resizable(true)
-            .default_height(dock_h)
-            .min_height(150.0)
-            .max_height((ctx.content_rect().height() * 0.6).max(160.0))
-            .frame(
-                egui::Frame::new()
-                    .fill(pal.surface)
-                    .inner_margin(egui::Margin::same(8)),
-            )
-            .show(ctx, |ui| {
-                docks::show(
-                    ui,
-                    &pal,
-                    &self.data,
-                    if side { None } else { self.view.queue.selected },
-                    &mut self.view.docks,
-                    self.reduced_motion,
-                    &mut actions,
-                )
-            });
-
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
                     .fill(pal.surface)
-                    .inner_margin(egui::Margin::symmetric(14, 10)),
+                    .inner_margin(egui::Margin { left: 28, right: 24, top: 22, bottom: 12 }),
             )
             .show(ctx, |ui| {
                 if let Some(secs) = self.data.shutdown_secs {
                     shutdown_banner(ui, &pal, secs, &mut actions);
                 }
-                queue::show_center(ui, &pal, &self.data, &mut self.view, &mut actions);
+                super::center::show(ui, &pal, &self.data, &mut self.view, &mut actions);
             });
 
         let reduced = self.reduced_motion;

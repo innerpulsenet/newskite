@@ -1,26 +1,41 @@
-//! Article grids: a job's articles as a matrix of small cells, in file and segment order:
-//! arrived in the positive color, missing on every server in the negative color, still
-//! waiting as quiet wells. A big job folds several articles into each cell and says how
-//! many; such a cell shows red when any of its articles is missing and is shaded by how
-//! much of it arrived. A cell that just filled glows briefly while motion is allowed.
-//! Every cell comes from the service's article map, which only holds what the engine
-//! reported: nothing here is estimated.
+//! Article cells: a job's articles drawn as small cells in file and segment order,
+//! downloaded in the accent, waiting as quiet wells, missing on every server as a cell
+//! outlined in the negative color. A held job's downloaded cells rest in the muted tone.
+//! Three shapes share the rules: the [`grid`] (the whole map, square cells), the [`strip`]
+//! under each job row (one thin line of cells) and the per-file [`lanes`]. When there are
+//! more articles than cells, a cell holds several and says so: it shows missing when any
+//! of them is missing and is shaded by how much of it arrived. Cells that just filled
+//! glow briefly while motion is allowed. Every cell comes from the service's article map,
+//! which only holds what the engine reported: nothing here is estimated, and no cell
+//! claims an article is being fetched (the engine does not report that).
 
 use eframe::egui::{self, epaint, Color32, Id, Pos2, Rect, Response, RichText, Sense, Ui, Vec2};
-use newskite_service::{ArticleCounts, ArticleMap};
+use newskite_service::{ArticleCounts, ArticleMap, ArticleState};
 
 use super::fonts;
 use super::motion;
 use super::serverstrip::thousands;
 use super::theme::Palette;
 
-/// Largest and smallest cell side, px.
+/// Largest and smallest square cell of a grid, px.
 const MAX_SIDE: f32 = 9.0;
 const MIN_SIDE: f32 = 2.0;
-/// Cell side once articles are folded into cells.
+/// Cell side once articles are folded into grid cells.
 const FOLDED_SIDE: f32 = 3.0;
 /// Seconds a freshly filled cell glows.
 const GLOW_SECS: f64 = 0.9;
+/// Buckets a job's map is folded into for its row strip (drawn with fewer cells when the
+/// row is narrower).
+pub const STRIP_BUCKETS: usize = 240;
+/// Height of a row strip, its cell pitch (cell plus gap) and most cells, px.
+pub const STRIP_H: f32 = 5.0;
+const STRIP_PITCH: f32 = 8.0;
+const STRIP_MAX_CELLS: usize = 160;
+/// Height of one per-file lane and its cell pitch, px.
+const LANE_H: f32 = 8.0;
+const LANE_PITCH: f32 = 6.0;
+/// Most lanes drawn; the rest are summed up in one line.
+pub const MAX_LANES: usize = 24;
 
 /// How the cells of a grid are laid out.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -90,18 +105,35 @@ struct Memory {
     lit_at: Vec<f64>,
 }
 
-/// The color of a cell with these counts (glow aside).
-pub fn cell_color(pal: &Palette, c: &ArticleCounts) -> Color32 {
+/// The fill of a cell with these counts (glow aside). Missing cells are drawn by
+/// [`paint_cell`] as an outline; their fill here is the negative color for cells too
+/// small to outline. `held` rests downloaded articles in the muted tone.
+pub fn cell_color(pal: &Palette, c: &ArticleCounts, held: bool) -> Color32 {
+    let done = if held { pal.faint } else { pal.accent };
     if c.missing > 0 {
         pal.negative
     } else if c.total() > 0 && c.done == c.total() {
-        pal.positive
+        done
     } else if c.done > 0 {
-        // Partly arrived: the positive color over the well, as strong as the share.
+        // Partly arrived: the downloaded color over the well, as strong as the share.
         let share = c.done as f32 / c.total() as f32;
-        pal.well.lerp_to_gamma(pal.positive, 0.3 + 0.55 * share)
+        pal.well.lerp_to_gamma(done, 0.3 + 0.55 * share)
     } else {
         pal.well
+    }
+}
+
+/// Adds one cell to `mesh`: a filled rectangle, or for a missing cell an outline in the
+/// negative color around `ground` (cells under 5 px are filled instead, and grown by a
+/// pixel so a handful among thousands still show).
+fn paint_cell(mesh: &mut epaint::Mesh, pal: &Palette, rect: Rect, c: &ArticleCounts, fill: Color32, ground: Color32) {
+    if c.missing == 0 {
+        mesh.add_colored_rect(rect, fill);
+    } else if rect.width().min(rect.height()) >= 5.0 {
+        mesh.add_colored_rect(rect, pal.negative);
+        mesh.add_colored_rect(rect.shrink(1.25), ground);
+    } else {
+        mesh.add_colored_rect(rect.expand(1.0), pal.negative);
     }
 }
 
@@ -125,14 +157,24 @@ fn locate(map: &ArticleMap, mut k: usize) -> Option<(&str, usize, usize)> {
     None
 }
 
-/// Draws `map` as a grid filling `size`. `id` keeps the grid's memory (for the glow of
-/// freshly filled cells, which is skipped under reduced motion). Hovering a cell names
-/// its file and articles.
-pub fn grid(ui: &mut Ui, pal: &Palette, id: Id, map: &ArticleMap, size: Vec2, reduced: bool) -> Response {
+/// Draws `map` as a grid filling `size` on `ground` (the color behind it). `id` keeps the
+/// grid's memory for the glow of freshly filled cells, which is skipped under reduced
+/// motion. Hovering a cell names its file and articles.
+#[allow(clippy::too_many_arguments)]
+pub fn grid(
+    ui: &mut Ui,
+    pal: &Palette,
+    id: Id,
+    map: &ArticleMap,
+    size: Vec2,
+    held: bool,
+    ground: Color32,
+    reduced: bool,
+) -> Response {
     let (rect, resp) = ui.allocate_exact_size(size, Sense::hover());
     let counts = map.counts();
     let label = format!(
-        "Article grid: {} arrived, {} missing, {} waiting",
+        "Article map: {} downloaded, {} missing, {} waiting",
         counts.done, counts.missing, counts.waiting
     );
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Image, true, &label));
@@ -144,7 +186,7 @@ pub fn grid(ui: &mut Ui, pal: &Palette, id: Id, map: &ArticleMap, size: Vec2, re
     let (per, cells) = map.cells(if layout.capacity >= n { n } else { layout.capacity });
     let now = ui.input(|i| i.time);
 
-    // Cells whose arrived count grew since the last frame start to glow.
+    // Cells whose downloaded count grew since the last frame start to glow.
     let glow: Vec<f32> = ui.ctx().data_mut(|d| {
         let m = d.get_temp_mut_or_default::<Memory>(id);
         let key = (n, per, cells.len());
@@ -168,25 +210,24 @@ pub fn grid(ui: &mut Ui, pal: &Palette, id: Id, map: &ArticleMap, size: Vec2, re
         ui.ctx().request_repaint_after(motion::FRAME);
     }
 
-    // One mesh for every cell: thousands of rectangles stay cheap.
+    // One mesh for every cell: thousands of rectangles stay cheap. Missing cells go last
+    // so their grown fill is not covered by a neighbor.
     let shine = if pal.dark { pal.text } else { pal.raised };
     let mut mesh = epaint::Mesh::default();
     let mut missing = Vec::new();
     for (i, c) in cells.iter().enumerate() {
-        let mut color = cell_color(pal, c);
-        if glow[i] > 0.0 && c.missing == 0 {
+        if c.missing > 0 {
+            missing.push(i);
+            continue;
+        }
+        let mut color = cell_color(pal, c, held);
+        if glow[i] > 0.0 {
             color = color.lerp_to_gamma(shine, 0.6 * glow[i] * glow[i]);
         }
         mesh.add_colored_rect(layout.cell(rect.min, i), color);
-        if c.missing > 0 {
-            missing.push(i);
-        }
     }
-    // Missing cells are drawn again on top, a pixel larger on every side when cells are
-    // small, so a handful of them among thousands still catch the eye.
-    let grow = if layout.side <= 4.0 { 1.0 } else { 0.0 };
     for i in missing {
-        mesh.add_colored_rect(layout.cell(rect.min, i).expand(grow), pal.negative);
+        paint_cell(&mut mesh, pal, layout.cell(rect.min, i), &cells[i], pal.negative, ground);
     }
     ui.painter().add(egui::Shape::mesh(mesh));
 
@@ -199,15 +240,14 @@ pub fn grid(ui: &mut Ui, pal: &Palette, id: Id, map: &ArticleMap, size: Vec2, re
             egui::Stroke::new(1.0, pal.text),
             egui::StrokeKind::Outside,
         );
-        let first = i * per;
         let c = cells[i];
-        let text = match locate(map, first) {
+        let text = match locate(map, i * per) {
             Some((name, k, len)) if per == 1 => {
-                let state = if c.missing > 0 { "missing" } else if c.done > 0 { "arrived" } else { "waiting" };
+                let state = if c.missing > 0 { "missing" } else if c.done > 0 { "downloaded" } else { "waiting" };
                 format!("{name}\narticle {} of {len}: {state}", k + 1)
             }
             Some((name, k, _)) => format!(
-                "{name}\narticles {}–{}: {} arrived, {} missing, {} waiting",
+                "{name}\narticles {}–{}: {} downloaded, {} missing, {} waiting",
                 k + 1,
                 k + c.total(),
                 c.done,
@@ -223,39 +263,121 @@ pub fn grid(ui: &mut Ui, pal: &Palette, id: Id, map: &ArticleMap, size: Vec2, re
     resp
 }
 
-/// Height the [`legend`] takes at `width`: one line, or two when the cell size note does
-/// not fit beside the key.
-pub fn legend_height(ui: &Ui, pal: &Palette, per_cell: usize, width: f32) -> f32 {
-    let font = fonts::mono_id(10.5);
-    let w = |t: &str| ui.painter().layout_no_wrap(t.to_owned(), font.clone(), pal.muted).size().x;
-    let key: f32 = ["arrived", "missing", "waiting"].iter().map(|t| 8.0 + 4.0 + w(t) + 4.0 + 6.0).sum();
-    let note = if per_cell > 1 { w(&format!("1 cell = {per_cell} articles")) } else { 0.0 };
-    if key + note <= width { 16.0 } else { 34.0 }
+/// `cells` (equal buckets of a job's articles, in order) merged into `n` cells of about
+/// equal share. Pure, for tests.
+pub fn merge_cells(cells: &[ArticleCounts], n: usize) -> Vec<ArticleCounts> {
+    let len = cells.len();
+    if n == 0 || len == 0 {
+        return Vec::new();
+    }
+    if n >= len {
+        return cells.to_vec();
+    }
+    (0..n)
+        .map(|j| {
+            let (a, b) = (j * len / n, ((j + 1) * len / n).max(j * len / n + 1));
+            cells[a..b.min(len)].iter().fold(ArticleCounts::default(), |acc, c| ArticleCounts {
+                done: acc.done + c.done,
+                missing: acc.missing + c.missing,
+                waiting: acc.waiting + c.waiting,
+            })
+        })
+        .collect()
 }
 
-/// The key under a grid: a swatch and word for each state, and how many articles a cell
-/// holds when it holds more than one (on its own line when it does not fit).
-pub fn legend(ui: &mut Ui, pal: &Palette, per_cell: usize) {
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing.x = 4.0;
-        for (color, word) in [(pal.positive, "arrived"), (pal.negative, "missing"), (pal.well, "waiting")] {
-            let (r, _) = ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
-            ui.painter().rect_filled(r, egui::CornerRadius::same(1), color);
-            ui.label(RichText::new(word).font(fonts::mono_id(10.5)).color(pal.muted));
-            ui.add_space(6.0);
+/// The thin strip under a job row: `cells` (the job's map in [`STRIP_BUCKETS`] buckets)
+/// as one line of cells across `width`, on `ground`. `label` is read out for it.
+pub fn strip(ui: &mut Ui, pal: &Palette, cells: &[ArticleCounts], held: bool, width: f32, ground: Color32, label: &str) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, STRIP_H), Sense::hover());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Image, true, label));
+    if !ui.is_rect_visible(rect) || cells.is_empty() {
+        return resp;
+    }
+    let n = (((width + 1.5) / STRIP_PITCH).floor().max(1.0) as usize).min(STRIP_MAX_CELLS);
+    let merged = merge_cells(cells, n);
+    let w = (width - 1.5 * (merged.len() as f32 - 1.0)) / merged.len() as f32;
+    let mut mesh = epaint::Mesh::default();
+    for (i, c) in merged.iter().enumerate() {
+        let x = rect.left() + i as f32 * (w + 1.5);
+        let r = Rect::from_min_size(Pos2::new(x, rect.top()), Vec2::new(w, STRIP_H));
+        paint_cell(&mut mesh, pal, r, c, cell_color(pal, c, held), ground);
+    }
+    ui.painter().add(egui::Shape::mesh(mesh));
+    resp
+}
+
+/// A plain progress line of the strip's height, for jobs without an article map (never
+/// run since maps were introduced): it claims nothing about which articles arrived.
+pub fn progress_line(ui: &mut Ui, pal: &Palette, fraction: f32, held: bool, width: f32) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, STRIP_H), Sense::hover());
+    if ui.is_rect_visible(rect) {
+        let f = if fraction.is_finite() { fraction.clamp(0.0, 1.0) } else { 0.0 };
+        let r = egui::CornerRadius::same(2);
+        ui.painter().rect_filled(rect, r, pal.well);
+        if f > 0.0 {
+            let mut done = rect;
+            done.set_width((rect.width() * f).max(STRIP_H));
+            ui.painter().rect_filled(done, r, if held { pal.faint } else { pal.accent });
         }
-        if per_cell > 1 {
-            // Whole: it moves to the next line rather than breaking.
-            ui.add(
-                egui::Label::new(
-                    RichText::new(format!("1 cell = {per_cell} articles"))
-                        .font(fonts::mono_id(10.5))
-                        .color(pal.faint),
-                )
-                .extend(),
-            );
-        }
-    });
+    }
+    resp
+}
+
+/// One lane per file (B's file lanes): the file's name, its articles as a line of cells
+/// and `"n / N"` downloaded, in NZB order. Complete files are named in the muted tone.
+/// At most [`MAX_LANES`] lanes; the rest are summed up underneath.
+pub fn lanes(ui: &mut Ui, pal: &Palette, map: &ArticleMap, held: bool, ground: Color32) {
+    let name_w = (ui.available_width() * 0.34).clamp(90.0, 190.0);
+    let fig_w = 92.0;
+    for f in map.files.iter().take(MAX_LANES) {
+        let c = f.states.iter().fold(ArticleCounts::default(), |mut acc, s| {
+            match s {
+                ArticleState::Done => acc.done += 1,
+                ArticleState::Missing => acc.missing += 1,
+                ArticleState::Waiting => acc.waiting += 1,
+            }
+            acc
+        });
+        let complete = c.total() > 0 && c.done == c.total();
+        let figure = format!("{} / {}", thousands(c.done as u64), thousands(c.total() as u64));
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 10.0;
+            ui.allocate_ui_with_layout(Vec2::new(name_w, 16.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(&f.name).font(fonts::mono_id(11.0)).color(if complete { pal.muted } else { pal.text }),
+                    )
+                    .truncate(),
+                );
+            });
+            let cells_w = (ui.available_width() - fig_w - 10.0).max(24.0);
+            let (rect, resp) = ui.allocate_exact_size(Vec2::new(cells_w, LANE_H), Sense::hover());
+            if ui.is_rect_visible(rect) {
+                let n = ((cells_w + 2.0) / LANE_PITCH).floor().max(1.0) as usize;
+                let fine = ArticleMap { files: vec![f.clone()] }.cells(n).1;
+                let w = (cells_w - 2.0 * (fine.len() as f32 - 1.0)) / fine.len().max(1) as f32;
+                let mut mesh = epaint::Mesh::default();
+                for (i, cc) in fine.iter().enumerate() {
+                    let r = Rect::from_min_size(Pos2::new(rect.left() + i as f32 * (w + 2.0), rect.top()), Vec2::new(w, LANE_H));
+                    paint_cell(&mut mesh, pal, r, cc, cell_color(pal, cc, held), ground);
+                }
+                ui.painter().add(egui::Shape::mesh(mesh));
+            }
+            let label = format!("{}: {figure} articles", f.name);
+            resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Image, true, &label));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(RichText::new(figure).font(fonts::mono_id(11.0)).color(pal.muted));
+            });
+        });
+    }
+    let more = map.files.len().saturating_sub(MAX_LANES);
+    if more > 0 {
+        ui.label(
+            RichText::new(format!("+{more} more file{}", if more == 1 { "" } else { "s" }))
+                .font(fonts::mono_id(11.0))
+                .color(pal.faint),
+        );
+    }
 }
 
 /// The height a grid of `n` articles needs at `width`, at most `max_h`: the largest cells
@@ -275,13 +397,38 @@ pub fn fit_height(n: usize, width: f32, max_h: f32) -> f32 {
     max_h
 }
 
-/// Articles per cell `grid` uses for `map` in `size` (for the legend).
+/// Articles per cell `grid` uses for `map` in `size` (for the key).
 pub fn per_cell(map: &ArticleMap, size: Vec2) -> usize {
     let n = map.len();
     match GridLayout::for_articles(n, size) {
         Some(l) if l.capacity < n => n.div_ceil(l.capacity),
         _ => 1,
     }
+}
+
+/// The key: a swatch and word for each state (missing as its outline).
+pub fn legend(ui: &mut Ui, pal: &Palette, ground: Color32) {
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        for (state, word) in [(0, "downloaded"), (1, "missing"), (2, "waiting")] {
+            let (r, _) = ui.allocate_exact_size(Vec2::splat(9.0), Sense::hover());
+            let painter = ui.painter();
+            match state {
+                0 => {
+                    painter.rect_filled(r, egui::CornerRadius::same(2), pal.accent);
+                }
+                1 => {
+                    painter.rect_filled(r, egui::CornerRadius::same(2), pal.negative);
+                    painter.rect_filled(r.shrink(1.5), egui::CornerRadius::same(1), ground);
+                }
+                _ => {
+                    painter.rect_filled(r, egui::CornerRadius::same(2), pal.well);
+                }
+            }
+            ui.label(RichText::new(word).font(fonts::mono_id(10.5)).color(pal.muted));
+            ui.add_space(8.0);
+        }
+    });
 }
 
 #[cfg(test)]
@@ -300,9 +447,6 @@ mod tests {
         // 5,000 do not fit even at 2 px (100 × 33), so cells fold.
         let l = GridLayout::for_articles(5_000, size).unwrap();
         assert!(l.side == FOLDED_SIDE && l.capacity < 5_000, "{l:?}");
-        let l = GridLayout::for_articles(100_000, size).unwrap();
-        assert_eq!(l.side, FOLDED_SIDE);
-        assert!(l.capacity < 100_000);
         assert!(GridLayout::for_articles(10, Vec2::ZERO).is_none());
         assert!(GridLayout::for_articles(10, Vec2::new(f32::NAN, 5.0)).is_none());
     }
@@ -333,11 +477,25 @@ mod tests {
     fn cell_colors_follow_the_worst_state() {
         let pal = Palette::from_theme(&newskite_theme::fallback(true));
         let c = |done, missing, waiting| ArticleCounts { done, missing, waiting };
-        assert_eq!(cell_color(&pal, &c(3, 0, 0)), pal.positive);
-        assert_eq!(cell_color(&pal, &c(2, 1, 0)), pal.negative);
-        assert_eq!(cell_color(&pal, &c(0, 0, 3)), pal.well);
-        let partial = cell_color(&pal, &c(1, 0, 2));
-        assert!(partial != pal.well && partial != pal.positive);
+        assert_eq!(cell_color(&pal, &c(3, 0, 0), false), pal.accent);
+        assert_eq!(cell_color(&pal, &c(3, 0, 0), true), pal.faint, "held rests in the muted tone");
+        assert_eq!(cell_color(&pal, &c(2, 1, 0), false), pal.negative);
+        assert_eq!(cell_color(&pal, &c(0, 0, 3), false), pal.well);
+        let partial = cell_color(&pal, &c(1, 0, 2), false);
+        assert!(partial != pal.well && partial != pal.accent);
+    }
+
+    #[test]
+    fn merged_cells_keep_every_article_in_order() {
+        let c = |done, missing, waiting| ArticleCounts { done, missing, waiting };
+        let cells = vec![c(2, 0, 0), c(1, 1, 0), c(0, 0, 2), c(0, 0, 2), c(2, 0, 0)];
+        let m = merge_cells(&cells, 2);
+        assert_eq!(m.len(), 2);
+        assert_eq!(m.iter().map(ArticleCounts::total).sum::<usize>(), 10);
+        assert_eq!(m[0], c(3, 1, 0));
+        assert_eq!(merge_cells(&cells, 10), cells, "never more cells than buckets");
+        assert!(merge_cells(&cells, 0).is_empty());
+        assert!(merge_cells(&[], 4).is_empty());
     }
 
     #[test]

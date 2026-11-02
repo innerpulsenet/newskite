@@ -7,9 +7,8 @@ use newskite_types::format;
 use super::app::{Action, Data};
 use super::brand;
 use super::motion::Beat;
-use super::queue::eta_secs;
 use super::theme::Palette;
-use super::widgets::{credit, status_chip_live, Status, CREDIT_URL};
+use super::widgets::{credit, Status, CREDIT_URL};
 
 /// Free space below which the reading turns to the warning color.
 pub const LOW_DISK: u64 = 2 * 1024 * 1024 * 1024;
@@ -129,28 +128,24 @@ impl Pill {
     }
 }
 
-/// The servers half of the left reading, e.g. `"2 servers · 20 conn · TLS"`: the usable
-/// servers, the connections a run opens and how they connect. `None` without a usable
-/// server (the chip says so).
+/// The left reading, e.g. `"2 servers · 20 TLS"`: the usable servers and the connections
+/// a run opens, and how they connect. `None` without a usable server.
 pub fn servers_reading(data: &Data) -> Option<String> {
     let usable = data.settings.usable_servers();
     if usable.is_empty() {
         return None;
     }
     let tls = usable.iter().filter(|s| s.tls).count();
-    let security = if tls == usable.len() {
-        "TLS"
+    let conn = data.settings.effective_connections();
+    let connections = if tls == usable.len() {
+        format!("{conn} TLS")
     } else if tls == 0 {
-        "plain"
+        format!("{conn} plain")
     } else {
-        "TLS + plain"
+        format!("{conn} conn, TLS + plain")
     };
     let n = usable.len();
-    Some(format!(
-        "{n} server{}  ·  {} conn  ·  {security}",
-        if n == 1 { "" } else { "s" },
-        data.settings.effective_connections()
-    ))
+    Some(format!("{n} server{}  ·  {connections}", if n == 1 { "" } else { "s" }))
 }
 
 /// The fastest second on record: the live window and the stored history (both one sample
@@ -161,21 +156,68 @@ pub fn peak_speed(data: &Data) -> u64 {
     live.max(stored)
 }
 
-/// The center reading: while a run is active the speed, what is left and (from the
-/// measured speed only) the time left; otherwise `Idle`, with the peak once there is one.
+/// The center reading: what the queue is doing (`Downloading` and the speed, `Pausing`,
+/// `Paused` or `Idle`) and the fastest second on record, once there is one. How much is
+/// left and the time left are the queue header's.
 pub fn activity_reading(data: &Data) -> String {
-    let left = data.bytes_left();
-    if data.status.running {
-        let speed = data.speed();
-        let mut s = format!("{}  ·  {} left", format::speed(speed), format::bytes(left));
-        if let Some(eta) = eta_secs(left, speed) {
-            s.push_str(&format!("  ·  {}", format::duration_secs(eta)));
-        }
-        return s;
-    }
+    let st = &data.status;
+    let head = if st.running {
+        let word = if st.paused { "Pausing" } else { "Downloading" };
+        format!("{word}  ·  {}", format::speed(data.speed()))
+    } else if st.paused {
+        "Paused".to_owned()
+    } else {
+        "Idle".to_owned()
+    };
     match peak_speed(data) {
-        0 => "Idle".into(),
-        peak => format!("Idle  ·  peak {}", format::speed(peak)),
+        0 => head,
+        peak => format!("{head}  ·  peak {}", format::speed(peak)),
+    }
+}
+
+/// The servers' health this session, for the left reading's hover: one block per usable
+/// server with its role, what it delivered and its last error.
+fn server_health_tip(ui: &mut Ui, pal: &Palette, data: &Data) {
+    let now = super::docks::now_secs();
+    let servers = data.settings.usable_servers();
+    if servers.is_empty() {
+        ui.label("No server is set up. Add one in Settings.");
+        return;
+    }
+    for (i, cfg) in servers.iter().enumerate() {
+        if i > 0 {
+            ui.add_space(6.0);
+        }
+        let h = data.servers.iter().find(|h| h.address == cfg.address());
+        let (glyph, color) = match super::serverstrip::health_of(h, now) {
+            super::serverstrip::Health::Ok => ("✔", pal.positive),
+            super::serverstrip::Health::Errors => ("!", pal.warning),
+            super::serverstrip::Health::Refused => ("✖", pal.negative),
+        };
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(glyph).color(color));
+            ui.label(RichText::new(cfg.address()).font(super::fonts::mono_id(12.0)).color(pal.text));
+            ui.label(
+                RichText::new(format!("{}  ·  {}", if i == 0 { "primary" } else { "backup" }, if cfg.tls { "TLS" } else { "plain" }))
+                    .small()
+                    .color(pal.muted),
+            );
+        });
+        let line = match h {
+            Some(h) => format!(
+                "{} articles  ·  {} not on server  ·  {} errors",
+                super::serverstrip::thousands(h.articles),
+                super::serverstrip::thousands(h.missing),
+                super::serverstrip::thousands(h.errors)
+            ),
+            None => "not used yet this session".to_owned(),
+        };
+        ui.label(RichText::new(line).small().color(pal.muted));
+        if let Some(why) = h.and_then(|h| h.unusable.as_ref()) {
+            ui.label(RichText::new(format!("refused: {why}")).small().color(pal.negative));
+        } else if let Some((_, e)) = h.and_then(|h| h.last_error.as_ref()) {
+            ui.label(RichText::new(format!("last error: {e}")).small().color(pal.warning));
+        }
     }
 }
 
@@ -275,9 +317,31 @@ pub fn show(
     let center_w = 14.0 + 6.0 + reading_w + 12.0 + SPARK_W;
     ui.horizontal_centered(|ui| {
         let state = pill_state(data);
-        let breath = beat.moving.then(|| beat.breath());
-        let r = status_chip_live(ui, pal, state.status(), &state.text(), breath);
-        if let Pill::Error(e) = &state {
+        let color = state.status().color(pal);
+        let (dot, dresp) = ui.allocate_exact_size(Vec2::new(14.0, 14.0), Sense::hover());
+        match beat.moving.then(|| beat.breath()) {
+            Some(b) => {
+                ui.painter().circle_stroke(dot.center(), 4.0 + 3.0 * (1.0 - b), Stroke::new(1.0, Palette::fade(color, 0.45 * b)));
+                ui.painter().circle_filled(dot.center(), 4.0, Palette::fade(color, 0.6 + 0.4 * b));
+            }
+            None => {
+                ui.painter().circle_filled(dot.center(), 4.0, color);
+            }
+        }
+        let state_text = state.text();
+        dresp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, &state_text));
+        ui.add_space(4.0);
+        let left_text = match &state {
+            Pill::Error(e) => RichText::new(short_cause(e)).font(mono.clone()).color(pal.negative),
+            Pill::NoServer => RichText::new("Add a server in Settings").font(mono.clone()).color(pal.warning),
+            _ => RichText::new(servers_reading(data).unwrap_or_default()).font(mono.clone()).color(pal.muted),
+        };
+        let r = ui.add(egui::Label::new(left_text).sense(Sense::click()).selectable(false));
+        if state == Pill::NoServer {
+            if r.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Open Settings").clicked() {
+                actions.push(Action::OpenSettings);
+            }
+        } else if let Pill::Error(e) = &state {
             // The chip opens the job that failed most recently.
             let failed = data
                 .jobs
@@ -298,10 +362,8 @@ pub fn show(
                     r.on_hover_text(e);
                 }
             }
-        }
-        if let Some(servers) = servers_reading(data) {
-            ui.add_space(4.0);
-            ui.label(RichText::new(servers).font(mono.clone()).color(pal.muted));
+        } else {
+            r.on_hover_ui(|ui| server_health_tip(ui, pal, data));
         }
 
         // Center the activity group in the bar when there is room, else follow on.
@@ -373,7 +435,8 @@ fn sparkline(ui: &mut Ui, pal: &Palette, data: &Data, reduced_motion: bool) {
             painter.hline(rect.x_range(), rect.bottom() - 1.0, Stroke::new(1.0, pal.border));
         }
     }
-    let summary = if data.history.is_empty() && data.live.is_empty() {
+    // Idle seconds (0 B/s samples) are not throughput history.
+    let summary = if data.history.is_empty() && data.live.iter().all(|&(_, v)| v == 0) {
         "No throughput history yet".to_owned()
     } else {
         format!(
@@ -409,7 +472,7 @@ mod tests {
         d.status.speed_bps = 2048;
         // The chip names the state; the speed is the center reading's.
         assert_eq!(pill_state(&d).text(), "Downloading");
-        assert!(activity_reading(&d).starts_with("2.0 KB/s"));
+        assert_eq!(activity_reading(&d), "Downloading  ·  2.0 KB/s");
         // Pause requested while a job still downloads: still live.
         d.status.paused = true;
         assert_eq!(pill_state(&d), Pill::Pausing("2.0 KB/s".into()));
@@ -468,21 +531,26 @@ mod tests {
         d.live.push_back((2, 1_000));
         assert_eq!(activity_reading(&d), format!("Idle  ·  peak {}", format::speed(6_400_000)));
         d.status.running = true;
-        // Without a measured speed there is no time left, only what is left.
+        // Running: the speed now, and still the peak on record.
         d.live.push_back((3, 0));
-        assert_eq!(activity_reading(&d), "0 B/s  ·  0 B left");
+        assert_eq!(activity_reading(&d), format!("Downloading  ·  0 B/s  ·  peak {}", format::speed(6_400_000)));
+        d.status.paused = true;
+        assert!(activity_reading(&d).starts_with("Pausing  ·  "));
+        d.status.running = false;
+        assert!(activity_reading(&d).starts_with("Paused  ·  peak"));
 
         d.settings.servers[0].host = String::new();
         assert_eq!(servers_reading(&d), None);
         d.settings.servers[0].host = "a".into();
         d.settings.servers[0].tls = true;
-        assert!(servers_reading(&d).unwrap().ends_with("TLS"));
+        let r = servers_reading(&d).unwrap();
+        assert!(r.starts_with("1 server  ·  ") && r.ends_with(" TLS"), "{r}");
         let mut plain = d.settings.servers[0].clone();
         plain.host = "b".into();
         plain.tls = false;
         d.settings.servers.push(plain);
         let r = servers_reading(&d).unwrap();
-        assert!(r.starts_with("2 servers") && r.ends_with("TLS + plain"), "{r}");
+        assert!(r.starts_with("2 servers") && r.ends_with("conn, TLS + plain"), "{r}");
     }
 
     #[test]
