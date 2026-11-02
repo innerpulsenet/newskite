@@ -486,7 +486,7 @@ fn overview(
     if let Some(x) = job.stats.outcome.as_ref().and_then(|o| o.extracted_to.as_ref()) {
         place(ui, pal, "Extracted", x, Some(Action::OpenPath(x.clone())), actions);
     }
-    place(ui, pal, "NZB", &job.source_path, None, actions);
+    place(ui, pal, "NZB", &job.source_path, Some(Action::RevealPath(job.source_path.clone())), actions);
     if job.password.is_some() {
         ui.label(RichText::new("An archive password is set for this job.").small().color(pal.muted));
     }
@@ -497,15 +497,21 @@ fn place(ui: &mut Ui, pal: &Palette, key: &str, path: &std::path::Path, open: Op
         let (r, _) = ui.allocate_exact_size(Vec2::new(64.0, 16.0), Sense::hover());
         ui.painter().text(r.left_center(), egui::Align2::LEFT_CENTER, key, egui::FontId::proportional(11.5), pal.muted);
         let full = path.display().to_string();
-        // A source file is named, its folder is on hover; folders show in full.
-        let text = if open.is_some() {
-            full.clone()
-        } else {
+        // A source file is named and shown in its folder on click (the full path is on
+        // hover); folders show in full and open on click.
+        let reveal = matches!(open, Some(Action::RevealPath(_)));
+        let text = if reveal {
             path.file_name().map_or(full.clone(), |n| n.to_string_lossy().into_owned())
+        } else {
+            full.clone()
         };
         let color = if open.is_some() { pal.accent_fg } else { pal.text };
         let resp = ui.add(egui::Label::new(RichText::new(&text).small().color(color)).truncate().sense(Sense::click()));
-        let tip = if open.is_some() { format!("{full}\nClick to open") } else { full.clone() };
+        let tip = match &open {
+            Some(_) if reveal => format!("{full}\nClick to show it in the file manager"),
+            Some(_) => format!("{full}\nClick to open"),
+            None => full.clone(),
+        };
         let resp = resp.on_hover_text(tip);
         if let Some(a) = open {
             if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {

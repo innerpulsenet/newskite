@@ -81,6 +81,8 @@ impl LogFilter {
 pub struct DockState {
     /// The Log dock's level filter.
     pub log_filter: LogFilter,
+    /// The Log view's search text (lines containing it, any case).
+    pub log_search: String,
 }
 
 /// Mean of each of at most `max_points` equal chunks of `values` (keeps the shape of a
@@ -658,13 +660,30 @@ pub fn new_mark(age: f64, animate: bool) -> f32 {
 /// wraps under itself, never under the clock). Long message-id lists fold behind a
 /// disclosure; the newest failure of a job that can be retried on a backup carries that
 /// button. A line that arrived after the dock's first frame is marked behind its text.
-pub(crate) fn messages(ui: &mut Ui, pal: &Palette, data: &Data, filter: LogFilter, animate: bool, actions: &mut Vec<Action>) {
+/// `search` keeps the lines that contain it (any case).
+pub(crate) fn messages(
+    ui: &mut Ui,
+    pal: &Palette,
+    data: &Data,
+    filter: LogFilter,
+    search: &str,
+    animate: bool,
+    actions: &mut Vec<Action>,
+) {
     let logs = &data.logs;
     if logs.is_empty() {
         ui.label(RichText::new("No messages yet").color(pal.muted));
         return;
     }
-    let shown: Vec<&LogLine> = logs.iter().filter(|l| filter.admits(l.level)).collect();
+    let needle = search.trim().to_lowercase();
+    let shown: Vec<&LogLine> = logs
+        .iter()
+        .filter(|l| filter.admits(l.level) && (needle.is_empty() || l.text.to_lowercase().contains(&needle)))
+        .collect();
+    if shown.is_empty() && !needle.is_empty() {
+        ui.label(RichText::new(format!("No lines contain \u{201c}{}\u{201d}", search.trim())).color(pal.muted));
+        return;
+    }
     if shown.is_empty() {
         ui.label(
             RichText::new(match filter {

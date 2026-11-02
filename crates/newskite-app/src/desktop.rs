@@ -169,6 +169,18 @@ mod imp {
         let conn = Connection::session().map_err(err)?;
         open_local(&conn, path)
     }
+
+    pub fn show_item(path: &Path) -> Result<(), String> {
+        let conn = Connection::session().map_err(err)?;
+        let fm = Proxy::new(&conn, "org.freedesktop.FileManager1", "/org/freedesktop/FileManager1", "org.freedesktop.FileManager1")
+            .and_then(|p| p.call::<_, _, ()>("ShowItems", &(vec![file_uri(path)], "")));
+        match (fm, path.parent()) {
+            (Ok(()), _) => Ok(()),
+            // No file manager answers on the bus: the portal opens the folder's handler.
+            (Err(_), Some(dir)) => open_local(&conn, dir),
+            (Err(e), None) => Err(err(e)),
+        }
+    }
 }
 
 #[cfg(any(windows, target_os = "macos"))]
@@ -203,6 +215,10 @@ mod imp {
     pub fn open_file(path: &Path) -> Result<(), String> {
         open::that_detached(path).map_err(|e| e.to_string())
     }
+
+    pub fn show_item(path: &Path) -> Result<(), String> {
+        show_folder(path.parent().unwrap_or(path))
+    }
 }
 
 /// Shows a picker; `Ok(None)` when the user canceled.
@@ -223,6 +239,12 @@ pub fn show_folder(dir: &Path) -> Result<(), String> {
 /// Opens a file in its default application.
 pub fn open_file(path: &Path) -> Result<(), String> {
     imp::open_file(path)
+}
+
+/// Shows a file selected in its folder in the file manager (where the platform allows;
+/// otherwise its folder), without opening it.
+pub fn show_item(path: &Path) -> Result<(), String> {
+    imp::show_item(path)
 }
 
 #[cfg(test)]

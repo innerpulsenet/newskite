@@ -397,7 +397,9 @@ fn empty_state_renders_cleanly() {
         h.get_by_label("No server configured");
         h.get_by_label("No server");
         h.get_by_label("Idle");
-        h.get_by_label("128 GB free");
+        // Free space once: the wide sidebar's disk meter (the status bar has it on the rail).
+        h.get_by_label("Downloads disk: 128 GB free");
+        assert!(h.query_by_label("128 GB free").is_none());
         h.get_by_label("Queue (0)");
         h.get_by_label("History (0)");
         // Nothing queued: Start cannot act.
@@ -659,6 +661,24 @@ fn queue_rows_hold_resume_and_reorder() {
     h.key_press_modifiers(egui::Modifiers::ALT, egui::Key::ArrowUp);
     h.run_steps(2);
     assert_eq!(app(&h).data.queue_order, vec![movie, archive]);
+    assert_eq!(app(&h).view.queue.selected, Some(movie), "Alt+Up moves the job, not the selection");
+    // Plain arrows and Home/End walk the rows on screen.
+    h.key_press(egui::Key::ArrowDown);
+    h.run_steps(2);
+    assert_eq!(app(&h).view.queue.selected, Some(archive));
+    h.key_press(egui::Key::Home);
+    h.run_steps(2);
+    assert_eq!(app(&h).view.queue.selected, Some(movie));
+    h.key_press(egui::Key::End);
+    h.run_steps(2);
+    let last = *app(&h).view.queue.visible.last().expect("rows");
+    assert_eq!(app(&h).view.queue.selected, Some(last));
+    h.key_press(egui::Key::ArrowUp);
+    h.run_steps(2);
+    let visible = app(&h).view.queue.visible.clone();
+    assert_eq!(app(&h).view.queue.selected, Some(visible[visible.len() - 2]));
+    h.state_mut().as_mut().expect("app").push_action(Action::Select(Some(movie)));
+    h.run_steps(2);
     h.key_press(egui::Key::Delete);
     h.run_steps(2);
     assert_eq!(app(&h).view.queue.confirm_remove, Some(movie));
@@ -857,6 +877,22 @@ fn messages_dock_shows_logs_newest_first() {
     assert_eq!(app(&h).view.docks.log_filter, LogFilter::Errors);
     h.get_by_label("second line");
     assert!(h.query_by_label("first line").is_none());
+
+    // Ctrl+F reaches the log's own search, which keeps the lines containing the text.
+    h.get_by_label("All").click();
+    h.run_steps(2);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::F);
+    h.run_steps(2);
+    assert!(!app(&h).view.queue.focus_filter, "the search field took the focus request");
+    h.state_mut().as_mut().expect("app").view.docks.log_search = "PAR2 REPAIRED".into();
+    h.run_steps(2);
+    h.get_by_label("Open.Movie.Project.2160p: par2 repaired 3 blocks, extract ok");
+    assert!(h.query_by_label("second line").is_none() && h.query_by_label("first line").is_none());
+    h.state_mut().as_mut().expect("app").view.docks.log_search = "nothing like this".into();
+    h.run_steps(2);
+    h.get_by_label("No lines contain \u{201c}nothing like this\u{201d}");
+    // The queue's name filter is its own.
+    assert!(app(&h).view.filter.is_empty());
 }
 
 #[test]
@@ -1259,6 +1295,8 @@ fn minimum_window_keeps_remove_confirmation_and_docks_on_screen() {
     let size = egui::vec2(960.0, 600.0);
     let mut h = fx.harness(true, size);
     h.run_steps(4);
+    // On the rail the status bar names the free space.
+    h.get_by_label("128 GB free");
     // Every control of a queue row is inside the window.
     for label in [
         "Resume this job",
@@ -1384,6 +1422,35 @@ fn a_later_launch_queues_its_nzbs_here() {
 }
 
 #[test]
+fn server_cards_name_the_primary_and_can_promote_a_backup() {
+    let fx = Fixture::new(seed_failover);
+    let mut h = fx.harness(true, SIZE);
+    h.run_steps(2);
+    h.state_mut().as_mut().expect("app").push_action(Action::OpenSettings);
+    h.run_steps(4);
+    h.get_by_label("primary");
+    h.get_by_label("fail-over");
+    assert_eq!(h.get_all_by_label("Make primary").count(), 1, "only rows below the top");
+    assert_no_bad_numbers(&h);
+    snapshot(&mut h, "settings-servers-dark");
+    h.get_by_label("Make primary").click();
+    h.run_steps(2);
+    let hosts: Vec<String> = app(&h)
+        .view
+        .settings
+        .as_ref()
+        .expect("sheet open")
+        .settings
+        .servers
+        .iter()
+        .map(|s| s.host.clone())
+        .collect();
+    assert_eq!(hosts, ["news.backup-provider.example", "newshosting.tweaknews.example"]);
+    // Saved only with the sheet: the service still has the old order.
+    assert_eq!(fx.service.settings().servers[0].host, "newshosting.tweaknews.example");
+}
+
+#[test]
 fn toasts_and_server_health_render() {
     let fx = Fixture::new(seed_populated);
     let mut h = fx.harness(true, SIZE);
@@ -1441,6 +1508,12 @@ fn seed_failover(store: &Store, dir: &Path) {
     store.save_settings(&settings).expect("settings");
 }
 
+/// 10:34:00 local time on a fixed day: the start of the failover log.
+fn failover_t0() -> i64 {
+    use chrono::TimeZone;
+    chrono::Local.with_ymd_and_hms(2026, 11, 2, 10, 34, 0).earliest().expect("local time").timestamp()
+}
+
 /// Readings and log lines like a run that lost articles on both providers.
 fn feed_failover(h: &mut Harness<'_, Option<NewskiteApp>>) -> i64 {
     let a = h.state_mut().as_mut().expect("app");
@@ -1458,7 +1531,8 @@ fn feed_failover(h: &mut Harness<'_, Option<NewskiteApp>>) -> i64 {
         health("newshosting.tweaknews.example:563", 24_310, 179),
         health("news.backup-provider.example:563", 179, 179),
     ];
-    let t = now() - 30;
+    // A fixed local time, so the clocks in the snapshots do not follow the time of day.
+    let t = failover_t0();
     let line = |dt: i64, level: LogLevel, text: &str, job: bool| newskite_service::LogLine {
         ts: t + dt,
         level,
@@ -1550,7 +1624,7 @@ fn failover_strip_wide_log_and_backup_retry_render() {
         a.data.logs.insert(
             0,
             newskite_service::LogLine {
-                ts: now(),
+                ts: failover_t0() + 12,
                 level: LogLevel::Warn,
                 text: "Linux.Audio.Samples.Pack: backup retry failed: still 66 missing articles; no server delivered them".into(),
                 job_id: None,

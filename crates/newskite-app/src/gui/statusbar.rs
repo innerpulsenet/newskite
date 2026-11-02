@@ -264,13 +264,14 @@ fn paint_drive(painter: &egui::Painter, rect: Rect, color: Color32) {
 /// Draws the status bar. Left: the state chip (its live dot breathing with the busy beat)
 /// and the servers a run uses. Center: the activity glyph and reading and a sparkline of
 /// the throughput, whose hover shows the full graph with the 24 h strip. Right: the free
-/// space on the download folder's filesystem and the quiet innerpulse credit. While a run
-/// is active a 2 px accent hairline along the top edge shows how much of the pending
-/// bytes is down.
+/// space on the download folder's filesystem (only with the sidebar a `rail`: the wide
+/// sidebar has its own disk meter) and the quiet innerpulse credit. While a run is active
+/// a 2 px accent hairline along the top edge shows how much of the pending bytes is down.
 pub fn show(
     ui: &mut Ui,
     pal: &Palette,
     data: &Data,
+    rail: bool,
     reduced_motion: bool,
     actions: &mut Vec<Action>,
 ) {
@@ -379,6 +380,9 @@ pub fn show(
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             if credit(ui, pal).clicked() {
                 actions.push(Action::OpenUrl(CREDIT_URL.to_owned()));
+            }
+            if !rail {
+                return;
             }
             ui.add_space(14.0);
             let (text, low) = disk_reading(data);

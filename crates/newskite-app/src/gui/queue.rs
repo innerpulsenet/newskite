@@ -63,6 +63,35 @@ pub struct QueueState {
     pub last_states: HashMap<i64, JobState>,
     /// Rows that just finished: the state reached and when (egui time).
     pub flashes: HashMap<i64, (JobState, f64)>,
+    /// The rows on screen, top to bottom, as last drawn (what ↑/↓ walk through).
+    pub visible: Vec<i64>,
+    /// Scroll the selected row into view next frame (it was chosen from the keyboard).
+    pub reveal: bool,
+}
+
+/// A key that moves the selection through the rows on screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Nav {
+    Up,
+    Down,
+    Home,
+    End,
+}
+
+/// The row `nav` selects among `rows` (top to bottom): ↑/↓ step from the selection, or
+/// start at the bottom/top when nothing on screen is selected; Home/End jump to the ends.
+/// `None` when nothing changes.
+pub fn step_selection(rows: &[i64], selected: Option<i64>, nav: Nav) -> Option<i64> {
+    let at = selected.and_then(|id| rows.iter().position(|&r| r == id));
+    let next = match (nav, at) {
+        (Nav::Home, _) => rows.first(),
+        (Nav::End, _) => rows.last(),
+        (Nav::Up, Some(i)) => rows.get(i.saturating_sub(1)),
+        (Nav::Down, Some(i)) => rows.get(i + 1),
+        (Nav::Up, None) => rows.last(),
+        (Nav::Down, None) => rows.first(),
+    };
+    next.copied().filter(|&id| Some(id) != selected)
 }
 
 impl QueueState {
@@ -174,6 +203,28 @@ pub fn queue_bytes(data: &Data) -> (u64, u64) {
 }
 
 pub(crate) fn filter_box(ui: &mut Ui, pal: &Palette, view: &mut ViewState) {
+    search_field(
+        ui,
+        pal,
+        &mut view.filter,
+        &mut view.queue.focus_filter,
+        "job-filter",
+        "Filter by name",
+        "Show only jobs whose name contains this text (Ctrl+F)",
+    );
+}
+
+/// A search field with its magnifier: `focus` asks for the keyboard (Ctrl+F), Esc in it
+/// clears it.
+pub(crate) fn search_field(
+    ui: &mut Ui,
+    pal: &Palette,
+    text: &mut String,
+    focus: &mut bool,
+    salt: &str,
+    hint: &str,
+    tip: &str,
+) {
     let width = FILTER_W.min(ui.available_width() - 8.0).max(120.0);
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 28.0), Sense::hover());
     let mut child = ui.new_child(
@@ -182,9 +233,9 @@ pub(crate) fn filter_box(ui: &mut Ui, pal: &Palette, view: &mut ViewState) {
             .layout(Layout::left_to_right(Align::Center)),
     );
     let resp = child.add(
-        TextEdit::singleline(&mut view.filter)
-            .id_salt("job-filter")
-            .hint_text(RichText::new("Filter by name").color(pal.muted))
+        TextEdit::singleline(text)
+            .id_salt(salt)
+            .hint_text(RichText::new(hint).color(pal.muted))
             .desired_width(width - 30.0)
             .margin(egui::Margin {
                 left: 26,
@@ -202,14 +253,14 @@ pub(crate) fn filter_box(ui: &mut Ui, pal: &Palette, view: &mut ViewState) {
         Icon::Search,
         pal.faint,
     );
-    if view.queue.focus_filter {
+    if *focus {
         resp.request_focus();
-        view.queue.focus_filter = false;
+        *focus = false;
     }
     if resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-        view.filter.clear();
+        text.clear();
     }
-    resp.on_hover_text("Show only jobs whose name contains this text (Ctrl+F)");
+    resp.on_hover_text(tip);
 }
 
 pub(crate) fn empty_queue(
@@ -661,6 +712,22 @@ pub(crate) fn job_menu(
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn arrow_keys_walk_the_rows_on_screen() {
+        let rows = [7, 3, 9];
+        assert_eq!(step_selection(&rows, None, Nav::Down), Some(7), "from the top");
+        assert_eq!(step_selection(&rows, None, Nav::Up), Some(9), "from the bottom");
+        assert_eq!(step_selection(&rows, Some(7), Nav::Down), Some(3));
+        assert_eq!(step_selection(&rows, Some(3), Nav::Up), Some(7));
+        assert_eq!(step_selection(&rows, Some(9), Nav::Down), None, "stays at the end");
+        assert_eq!(step_selection(&rows, Some(7), Nav::Up), None, "stays at the top");
+        assert_eq!(step_selection(&rows, Some(3), Nav::End), Some(9));
+        assert_eq!(step_selection(&rows, Some(3), Nav::Home), Some(7));
+        // A selection that is not on screen (filtered out) starts over.
+        assert_eq!(step_selection(&rows, Some(42), Nav::Down), Some(7));
+        assert_eq!(step_selection(&[], Some(1), Nav::Down), None);
+    }
 
     fn job(id: i64, name: &str, size: u64, state: JobState, created: i64) -> Job {
         Job {
