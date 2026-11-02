@@ -23,7 +23,7 @@ use super::fonts;
 use super::icons::{paint_icon, Icon};
 use super::queue::eta_secs;
 use super::theme::Palette;
-use super::widgets::{icon_button, kit_button, progress_ring, section_title, segment_track, ButtonKind};
+use super::widgets::{compact_button, icon_button, kit_button, progress_ring, section_title, segment_track, ButtonKind};
 
 /// Width of the side panel when it first opens.
 pub const PANEL_DEFAULT_W: f32 = 400.0;
@@ -44,6 +44,10 @@ pub enum InspectorTab {
 #[derive(Default)]
 pub struct InspectorState {
     pub tab: InspectorTab,
+    /// The archive password typed into a failed job's problem card, with that job's id.
+    pub password: Option<(i64, String)>,
+    /// Whether that password shows in clear.
+    pub show_password: bool,
 }
 
 /// How a lifecycle step is marked.
@@ -288,7 +292,7 @@ pub fn show(ui: &mut Ui, pal: &Palette, data: &Data, job: &Job, state: &mut Insp
         .show(ui, |ui| {
             ui.set_max_width(ui.available_width());
             match state.tab {
-                InspectorTab::Overview => overview(ui, pal, data, job, reduced, actions),
+                InspectorTab::Overview => overview(ui, pal, data, job, state, reduced, actions),
                 InspectorTab::Log => log(ui, pal, data, actions),
             }
         });
@@ -392,11 +396,19 @@ fn tabs(ui: &mut Ui, pal: &Palette, data: &Data, job: &Job, state: &mut Inspecto
     ui.add_space(4.0);
 }
 
-fn overview(ui: &mut Ui, pal: &Palette, data: &Data, job: &Job, reduced: bool, actions: &mut Vec<Action>) {
+fn overview(
+    ui: &mut Ui,
+    pal: &Palette,
+    data: &Data,
+    job: &Job,
+    state: &mut InspectorState,
+    reduced: bool,
+    actions: &mut Vec<Action>,
+) {
     let now = now_secs();
     let done = data.shown_done(job);
     if job.state == JobState::Failed {
-        problem(ui, pal, data, job, actions);
+        problem(ui, pal, data, job, state, actions);
         ui.add_space(12.0);
     }
     let post = data.status.post.as_ref().filter(|p| p.job_id == job.id);
@@ -503,8 +515,9 @@ fn place(ui: &mut Ui, pal: &Palette, key: &str, path: &std::path::Path, open: Op
     });
 }
 
-/// The problem card of a failed job.
-fn problem(ui: &mut Ui, pal: &Palette, data: &Data, job: &Job, actions: &mut Vec<Action>) {
+/// The problem card of a failed job. A password or extraction failure gets a password
+/// field in the card itself; Retry (or Enter in the field) saves what was typed first.
+fn problem(ui: &mut Ui, pal: &Palette, data: &Data, job: &Job, state: &mut InspectorState, actions: &mut Vec<Action>) {
     let kind = job.stats.outcome.as_ref().and_then(|o| o.failure);
     let reason = job.error.clone().unwrap_or_else(|| "No reason was recorded.".into());
     let frame = egui::Frame::new()
@@ -525,9 +538,28 @@ fn problem(ui: &mut Ui, pal: &Palette, data: &Data, job: &Job, actions: &mut Vec
         ui.add_space(6.0);
         ui.add(egui::Label::new(RichText::new(kind.unwrap_or(FailureKind::Other).hint()).small().color(pal.text)).wrap());
         ui.add_space(8.0);
+        let asks_password = matches!(kind, Some(FailureKind::Password | FailureKind::Extract));
+        let entered = if asks_password {
+            let entered = password_field(ui, pal, job, state);
+            ui.add_space(8.0);
+            entered
+        } else {
+            false
+        };
+        let typed = state
+            .password
+            .as_ref()
+            .filter(|(id, text)| asks_password && *id == job.id && !text.is_empty())
+            .map(|(_, text)| text.clone());
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
-            if kit_button(ui, pal, ButtonKind::Outline, Some(Icon::Retry), "Retry", true).clicked() {
+            let tip = if typed.is_some() { "Save the password and download again" } else { "Download again" };
+            let retry = kit_button(ui, pal, ButtonKind::Outline, Some(Icon::Retry), "Retry", true).on_hover_text(tip);
+            if retry.clicked() || (entered && typed.is_some()) {
+                if let Some(pw) = typed.clone() {
+                    actions.push(Action::SetJobPassword(job.id, Some(pw)));
+                    state.password = None;
+                }
                 actions.push(Action::RetryJob(job.id));
             }
             // Missing articles and server trouble are what a fail-over server can fix.
@@ -539,11 +571,6 @@ fn problem(ui: &mut Ui, pal: &Palette, data: &Data, job: &Job, actions: &mut Vec
                     actions.push(Action::RetryOnBackup(job.id));
                 }
             }
-            if matches!(kind, Some(FailureKind::Password | FailureKind::Extract))
-                && kit_button(ui, pal, ButtonKind::Text, Some(Icon::Key), "Set password…", true).clicked()
-            {
-                actions.push(Action::EditPassword(job.id));
-            }
             if matches!(kind, Some(FailureKind::Auth | FailureKind::Connection))
                 && kit_button(ui, pal, ButtonKind::Text, Some(Icon::Gear), "Servers…", true).clicked()
             {
@@ -554,6 +581,36 @@ fn problem(ui: &mut Ui, pal: &Palette, data: &Data, job: &Job, actions: &mut Vec
             }
         });
     });
+}
+
+/// The archive password field of the problem card, the width of the card, with a toggle
+/// to show what was typed. Returns whether Enter was pressed in it.
+fn password_field(ui: &mut Ui, pal: &Palette, job: &Job, state: &mut InspectorState) -> bool {
+    // A draft belongs to one job: another job's card starts empty and hidden.
+    if state.password.as_ref().is_none_or(|(id, _)| *id != job.id) {
+        state.password = Some((job.id, String::new()));
+        state.show_password = false;
+    }
+    let InspectorState { password: Some((_, text)), show_password, .. } = state else {
+        return false;
+    };
+    // Right to left, so the field takes whatever the toggle leaves.
+    ui.allocate_ui_with_layout(Vec2::new(ui.available_width(), 24.0), Layout::right_to_left(Align::Center), |ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        if compact_button(ui, pal, ButtonKind::Text, if *show_password { "Hide" } else { "Show" }, true).clicked() {
+            *show_password = !*show_password;
+        }
+        let hint = if job.password.is_some() { "Another archive password" } else { "Archive password" };
+        let resp = ui.add(
+            egui::TextEdit::singleline(text)
+                .id_salt(("inspector-password", job.id))
+                .password(!*show_password)
+                .hint_text(hint)
+                .desired_width(ui.available_width()),
+        );
+        resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))
+    })
+    .inner
 }
 
 /// The vertical lifecycle: a node per step on a rail, title and time on one line, the

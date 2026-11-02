@@ -13,7 +13,7 @@ use egui_kittest::kittest::Queryable;
 use egui_kittest::{Harness, SnapshotError, SnapshotOptions};
 use newskite_app::gui::docks::LogFilter;
 use newskite_app::gui::queue::{EMPTY_HISTORY, EMPTY_QUEUE};
-use newskite_app::gui::{brand, brand_tokens, Action, Appearance, Tab};
+use newskite_app::gui::{brand, brand_tokens, Action, Appearance, Tab, UiMsg};
 use newskite_app::{AppConfig, NewskiteApp, ThemeMode};
 use newskite_service::{
     JobFile, JobMove, JobState, LogLevel, Service, ServiceOptions, Store, ThroughputSample,
@@ -391,6 +391,8 @@ fn empty_state_renders_cleanly() {
         h.run_steps(4);
         h.get_by_label(EMPTY_QUEUE);
         h.get_by_label("Add NZB…");
+        // One call to action: the header's Add NZB leaves it to the empty queue's.
+        assert!(h.query_by_label("Add NZB").is_none());
         h.get_by_label("No throughput history yet");
         h.get_by_label("No server configured");
         h.get_by_label("No server");
@@ -476,13 +478,30 @@ fn import_nzb_switches_to_queue_and_errors_inline() {
     let mut h = fx.harness(true, SIZE);
     h.run_steps(2);
 
-    // Ctrl+O reveals the field; the History tab is shown first to check the switch.
-    h.state_mut()
-        .as_mut()
-        .expect("app")
-        .push_action(Action::SetTab(Tab::History));
+    // Ctrl+O asks for the file picker, not the typed-path field. A picker counts as open
+    // here, so the test never shows a real one. The History tab is shown first to check
+    // the switch.
+    {
+        let a = h.state_mut().as_mut().expect("app");
+        a.push_action(Action::SetTab(Tab::History));
+        a.view.dialog_open = true;
+    }
     h.run_steps(2);
     h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::O);
+    h.run_steps(2);
+    assert!(!app(&h).view.open_nzb.visible, "Ctrl+O opens the picker");
+
+    // Without a picker (no portal), the typed-path field opens with the reason.
+    let tx = app(&h).sender();
+    tx.send(UiMsg::NzbPickerFailed("cannot show the file picker: no portal".into())).expect("send");
+    h.run_steps(2);
+    assert!(app(&h).view.open_nzb.visible);
+    assert!(!app(&h).view.dialog_open);
+    h.get_by_label("cannot show the file picker: no portal. Type or paste the NZB's path instead.");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(!app(&h).view.open_nzb.visible && app(&h).view.open_nzb.error.is_none());
+    h.state_mut().as_mut().expect("app").push_action(Action::ShowOpenNzb);
     h.run_steps(2);
     assert!(app(&h).view.open_nzb.visible);
 
@@ -704,6 +723,60 @@ fn history_lists_finished_jobs_and_clears_them() {
     h.run_steps(3);
     assert_eq!(fx.service.jobs().len(), 2, "pending jobs stay");
     h.get_by_label(EMPTY_HISTORY);
+}
+
+#[test]
+fn password_failure_takes_the_password_in_the_inspector() {
+    use newskite_types::{FailureKind, JobOutcome};
+    // No usable server: the retry is requeued but nothing downloads.
+    let fx = Fixture::new(|store, dir| {
+        let job = store
+            .insert_job_at(
+                &NewJob {
+                    name: "Locked.Archive".into(),
+                    bytes_total: 64 * 1024 * 1024,
+                    dest_dir: Path::new("/home/reader/Downloads/Newskite/Locked.Archive").into(),
+                    source_path: dir.join("Locked.Archive.nzb"),
+                    password: None,
+                },
+                now() - 600,
+            )
+            .expect("job");
+        store.set_job_state(job.id, JobState::Failed, Some("the archive needs a password")).expect("state");
+        store
+            .set_job_outcome(
+                job.id,
+                now() - 300,
+                0,
+                0,
+                &JobOutcome { failure: Some(FailureKind::Password), ..Default::default() },
+            )
+            .expect("outcome");
+    });
+    let mut h = fx.harness(true, SIZE);
+    h.run_steps(2);
+    let id = app(&h).data.jobs[0].id;
+    h.state_mut().as_mut().expect("app").push_action(Action::ShowJob(id));
+    h.run_steps(3);
+
+    // The card asks for the password itself, hidden until shown.
+    h.get_by_label(FailureKind::Password.hint());
+    assert!(h.query_by_label("Set password…").is_none());
+    h.get_by_label("Show").click();
+    h.run_steps(2);
+    assert!(app(&h).view.inspector.show_password);
+    h.get_by_label("Hide").click();
+    h.run_steps(2);
+    h.state_mut().as_mut().expect("app").view.inspector.password = Some((id, "hunter2".into()));
+    h.run_steps(2);
+    assert_no_bad_numbers(&h);
+    snapshot(&mut h, "inspector-password-dark");
+
+    // Retry saves it first, then requeues the job.
+    h.get_by_label("Retry").click();
+    run_until(&mut h, |_| fx.service.jobs().iter().any(|j| j.id == id && j.password.as_deref() == Some("hunter2")));
+    assert!(app(&h).view.inspector.password.is_none(), "the draft is dropped once used");
+    assert!(fx.service.job_log(id).iter().any(|l| l.text.starts_with("requeued")));
 }
 
 #[test]

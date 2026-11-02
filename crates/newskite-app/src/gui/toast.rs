@@ -52,7 +52,7 @@ pub fn prune(toasts: &mut Vec<Toast>, now: f64) {
     toasts.drain(..extra);
 }
 
-/// Draws the toasts above the status bar; `bottom` is the y they stack up from.
+/// Draws the toasts above the bottom bars; `bottom` is the y they stack up from.
 pub fn show(ctx: &egui::Context, pal: &Palette, toasts: &mut Vec<Toast>, bottom: f32, reduced: bool, actions: &mut Vec<Action>) {
     let (now, dt) = ctx.input(|i| (i.time, f64::from(i.stable_dt).min(0.1)));
     for t in toasts.iter_mut() {

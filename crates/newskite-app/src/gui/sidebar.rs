@@ -159,7 +159,8 @@ fn entry(ui: &mut Ui, pal: &Palette, e: &Entry, rail: bool) -> bool {
     if ui.is_rect_visible(rect) {
         let hover = ui.ctx().animate_bool(resp.id.with("hover"), resp.hovered() && !e.current);
         let painter = ui.painter();
-        let slot = rect.shrink2(Vec2::new(if rail { 8.0 } else { 0.0 }, 2.0));
+        // On the rail the slot is a square, with room in its corner for the count.
+        let slot = rect.shrink2(Vec2::new(if rail { 2.0 } else { 0.0 }, 2.0));
         if e.current {
             painter.rect_filled(slot, CornerRadius::same(8), pal.hover);
         } else if hover > 0.0 {
@@ -170,16 +171,22 @@ fn entry(ui: &mut Ui, pal: &Palette, e: &Entry, rail: bool) -> bool {
         }
         let fg = if e.current { pal.text } else { pal.muted.lerp_to_gamma(pal.text, hover) };
         if rail {
-            paint_icon(painter, Rect::from_center_size(slot.center(), Vec2::splat(18.0)), e.icon, fg);
+            let icon = Rect::from_center_size(slot.center(), Vec2::splat(18.0));
+            paint_icon(painter, icon, e.icon, fg);
             if let Some(n) = e.count.as_ref().filter(|n| n.as_str() != "0") {
-                let c = if e.count_warn { pal.warning } else { pal.muted };
-                painter.text(
-                    Pos2::new(slot.right() - 4.0, slot.top() + 6.0),
-                    Align2::RIGHT_TOP,
-                    n,
-                    fonts::mono_id(9.5),
-                    c,
-                );
+                // A pill over the icon's top-right corner, cut out of it by a ring in the
+                // color behind, so the numerals never sit on the icon's strokes.
+                let n = if n.parse::<u64>().is_ok_and(|v| v > 99) { "99+" } else { n.as_str() };
+                let (tint, c) = if e.count_warn { (pal.warning_soft, pal.warning) } else { (pal.sunken, fg) };
+                let galley = painter.layout_no_wrap(n.to_owned(), fonts::mono_id(9.5), c);
+                let size = Vec2::new((galley.size().x + 7.0).max(13.0), 13.0);
+                let right = (icon.right() - 4.0 + size.x).min(slot.right() - 2.0);
+                let pill = Rect::from_min_size(Pos2::new(right - size.x, slot.top() + 2.0), size);
+                let behind = if e.current { pal.hover } else { pal.raised.lerp_to_gamma(pal.hover, 0.6 * hover) };
+                let round = CornerRadius::same(7);
+                painter.rect_filled(pill.expand(1.5), round, behind);
+                painter.rect_filled(pill, round, tint);
+                painter.galley(pill.center() - galley.size() / 2.0, galley, c);
             }
         } else {
             paint_icon(painter, Rect::from_center_size(Pos2::new(slot.left() + 20.0, slot.center().y), Vec2::splat(16.0)), e.icon, fg);

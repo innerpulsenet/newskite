@@ -262,12 +262,12 @@ pub(crate) fn empty_queue(
             ButtonKind::Primary,
             Some(Icon::OpenNzb),
             "Add NZB…",
-            true,
+            !view.dialog_open,
         )
-        .on_hover_text("Import an NZB file (Ctrl+O)")
+        .on_hover_text("Choose NZB files (Ctrl+O)")
         .clicked()
         {
-            actions.push(Action::ShowOpenNzb);
+            actions.push(Action::BrowseNzb);
         }
         ui.add_space(14.0);
         // Keyboard hints, centered under the call to action.
@@ -415,18 +415,30 @@ pub(crate) fn inline_editors(
 ) -> bool {
     if let Some((id, text)) = q.password_edit.as_mut() {
         if *id == job.id {
-            let resp = ui.add(
-                TextEdit::singleline(text)
-                    .password(true)
-                    .hint_text("Archive password")
-                    .desired_width(76.0),
-            );
-            let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if compact_button(ui, pal, ButtonKind::Outline, "Save", true).clicked() || enter {
+            // Right to left, so the field takes the box's width after Save and Cancel.
+            let (save, cancel, enter) = ui
+                .allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), 24.0),
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        let cancel = icon_button(ui, pal, Icon::Close, pal.muted, "Cancel").clicked();
+                        let save = compact_button(ui, pal, ButtonKind::Outline, "Save", true).clicked();
+                        let resp = ui.add(
+                            TextEdit::singleline(text)
+                                .password(true)
+                                .hint_text("Archive password")
+                                .desired_width(ui.available_width()),
+                        );
+                        (save, cancel, resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                    },
+                )
+                .inner;
+            if save || enter {
                 let pw = (!text.is_empty()).then(|| text.clone());
                 actions.push(Action::SetJobPassword(job.id, pw));
                 q.password_edit = None;
-            } else if icon_button(ui, pal, Icon::Close, pal.muted, "Cancel").clicked() {
+            } else if cancel {
                 q.password_edit = None;
             }
             return true;
