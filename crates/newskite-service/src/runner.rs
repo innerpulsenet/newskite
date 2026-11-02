@@ -6,9 +6,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use newskite_engine::{download_with_pool, DownloadRequest, EngineError, EngineOptions, JobReport};
-use newskite_postproc::{detect_tools, PostEvent, PostOptions, PostReport};
+use newskite_postproc::{detect_tools, PostEvent, PostOptions, PostReport, PostStage, Verdict};
 use newskite_store::{Job, JobFile, JobState, StoreError};
-use newskite_types::{format, EngineEvent, ServerConfig, Settings};
+use newskite_types::{format, EngineEvent, FailureKind, JobOutcome, ServerConfig, Settings, StepRecord, StepState};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -276,30 +276,30 @@ async fn download_job(
         Err(e) => {
             let msg = format!("could not start {}: {e}", job.name);
             inner.set_last_error(msg.clone());
-            inner.log(LogLevel::Error, msg);
+            inner.log_job(job.id, LogLevel::Error, msg);
             return Some(End::Stopped);
         }
     }
     inner.emit(ServiceEvent::JobsChanged);
-    inner.log(LogLevel::Info, format!("started {}", job.name));
+    inner.log_job(job.id, LogLevel::Info, format!("started {}", job.name));
 
     // Parse the NZB again (it is the durable source of the job).
     let path = job.source_path.clone();
     let nzb = match tokio::task::spawn_blocking(move || newskite_nzb::nzb::parse_file(&path)).await {
         Ok(Ok(nzb)) => nzb,
         Ok(Err(e)) => {
-            fail_job(inner, &job, &format!("could not read NZB {}: {e}", job.source_path.display()));
+            fail_job(inner, &job, &format!("could not read NZB {}: {e}", job.source_path.display()), Finish::failed(FailureKind::Nzb));
             return None;
         }
         Err(e) => {
-            fail_job(inner, &job, &format!("could not read NZB: {e}"));
+            fail_job(inner, &job, &format!("could not read NZB: {e}"), Finish::failed(FailureKind::Nzb));
             return None;
         }
     };
 
     // Resume: files completed in an earlier run are skipped.
     let files = inner.store.job_files(job.id).unwrap_or_else(|e| {
-        inner.log(LogLevel::Warn, format!("could not read file progress of {}: {e}", job.name));
+        inner.log_job(job.id, LogLevel::Warn, format!("could not read file progress of {}: {e}", job.name));
         Vec::new()
     });
     let done_files: Vec<JobFile> = files.into_iter().filter(|f| f.state == "done").collect();
@@ -307,17 +307,17 @@ async fn download_job(
     let (done_files, notes) = match tokio::task::spawn_blocking(move || verify_done_files(&dest, done_files)).await {
         Ok(checked) => checked,
         Err(e) => {
-            inner.log(LogLevel::Warn, format!("could not check the completed files of {}: {e}", job.name));
+            inner.log_job(job.id, LogLevel::Warn, format!("could not check the completed files of {}: {e}", job.name));
             (Vec::new(), Vec::new())
         }
     };
     for note in notes {
-        inner.log(LogLevel::Warn, note);
+        inner.log_job(job.id, LogLevel::Warn, note);
     }
     let base_bytes: u64 = done_files.iter().map(|f| f.bytes_done).sum();
     let skip_files: HashSet<String> = done_files.iter().map(|f| f.name.clone()).collect();
     if !skip_files.is_empty() {
-        inner.log(
+        inner.log_job(job.id, 
             LogLevel::Info,
             format!(
                 "resuming {}: {} file{} already complete",
@@ -335,13 +335,19 @@ async fn download_job(
         connect_timeout: crate::CONNECT_TIMEOUT,
         skip_files,
     };
+    let articles_total: u64 = nzb.files.iter().map(|f| f.segments.len() as u64).sum();
+    let _ = inner.store.mark_job_started(job.id, crate::now_secs(), articles_total);
     let req = DownloadRequest { nzb, dest_dir: job.dest_dir.clone(), servers, options };
 
     let (tx, rx) = mpsc::unbounded_channel();
     let mut forwarder = inner.rt.spawn(forward_events(inner.clone(), job.id, job.bytes_total, base_bytes, rx));
+    let started = Instant::now();
     let result = download_with_pool(req, inner.pool.clone(), tx, inner.progress.clone(), token).await;
+    let _ = inner.store.add_job_download_ms(job.id, started.elapsed().as_millis() as u64);
     match tokio::time::timeout(FORWARDER_DRAIN, &mut forwarder).await {
-        Ok(Ok(())) => {}
+        Ok(Ok((fetched, missing))) => {
+            let _ = inner.store.add_article_counts(fetched, missing);
+        }
         Ok(Err(e)) => tracing::warn!(target: "newskite_service", "event forwarder failed: {e}"),
         Err(_) => {
             forwarder.abort();
@@ -363,7 +369,7 @@ async fn download_job(
         let _ = inner.store.set_job_state(job.id, state, None);
         inner.emit(ServiceEvent::JobsChanged);
         let what = if state == JobState::Paused { "paused" } else { "interrupted" };
-        inner.log(LogLevel::Info, format!("{what} {}; completed files are kept", job.name));
+        inner.log_job(job.id, LogLevel::Info, format!("{what} {}; completed files are kept", job.name));
         return None;
     }
 
@@ -376,7 +382,7 @@ async fn download_job(
             // Only shutdown (or removal, handled above) cancels a job: leave it resumable.
             let _ = inner.store.set_job_state(job.id, JobState::Queued, None);
             inner.emit(ServiceEvent::JobsChanged);
-            inner.log(LogLevel::Info, format!("interrupted {}; it will resume on the next start", job.name));
+            inner.log_job(job.id, LogLevel::Info, format!("interrupted {}; it will resume on the next start", job.name));
             Some(End::Shutdown)
         }
         Err(EngineError::MissingArticles { ids }) => {
@@ -385,15 +391,16 @@ async fn download_job(
             let par2 = p.enabled && p.repair && tokio::task::spawn_blocking(move || newskite_postproc::has_par2(&dir)).await.unwrap_or(false);
             if par2 {
                 // PAR2 can often rebuild what the servers no longer have.
-                inner.log(LogLevel::Warn, format!("{}: {}; trying a PAR2 repair", job.name, missing_message(&ids)));
+                inner.log_job(job.id, LogLevel::Warn, format!("{}: {}; trying a PAR2 repair", job.name, missing_message(&ids)));
                 finish_partial(inner, &job, settings, &ids).await;
             } else {
-                fail_job(inner, &job, &missing_message(&ids));
+                let fin = Finish::failed(FailureKind::MissingArticles).missing(ids.len());
+                fail_job(inner, &job, &missing_message(&ids), fin);
             }
             None
         }
         Err(EngineError::AuthFailed(m)) => {
-            fail_job(inner, &job, &format!("authentication failed: {m}"));
+            fail_job(inner, &job, &format!("authentication failed: {m}"), Finish::failed(FailureKind::Auth));
             Some(End::Stopped)
         }
         Err(EngineError::NoServer) => {
@@ -402,20 +409,104 @@ async fn download_job(
             Some(End::NoServer)
         }
         Err(EngineError::Connect(m)) => {
-            fail_job(inner, &job, &format!("connection failed: {m}"));
+            fail_job(inner, &job, &format!("connection failed: {m}"), Finish::failed(FailureKind::Connection));
             Some(End::Stopped)
         }
         Err(EngineError::Io(e)) => {
-            fail_job(inner, &job, &format!("I/O error: {e}"));
+            fail_job(inner, &job, &format!("I/O error: {e}"), Finish::failed(FailureKind::Disk));
             None
         }
     }
 }
 
+/// How a job ends: its outcome, post-processing time and missing-article count.
+#[derive(Default)]
+struct Finish {
+    outcome: JobOutcome,
+    post_ms: u64,
+    missing: u64,
+}
+
+impl Finish {
+    fn failed(kind: FailureKind) -> Self {
+        Self { outcome: JobOutcome { failure: Some(kind), ..Default::default() }, ..Default::default() }
+    }
+
+    fn missing(mut self, n: usize) -> Self {
+        self.missing = n as u64;
+        self
+    }
+}
+
+fn step_state(v: &Verdict) -> StepState {
+    match v {
+        Verdict::Ok => StepState::Ok,
+        Verdict::Repaired => StepState::Repaired,
+        Verdict::Skipped(_) => StepState::Skipped,
+        Verdict::Failed(_) => StepState::Failed,
+    }
+}
+
+/// The outcome of a post-processing run, from its report and the time spent per stage.
+fn outcome_of(post: &PostReport, stage_ms: &HashMap<PostStage, u64>) -> JobOutcome {
+    let ms = |s: PostStage| stage_ms.get(&s).copied().unwrap_or(0);
+    let mut o = JobOutcome::default();
+    let stats = post.par2_stats.as_ref();
+    let par2_state = step_state(&post.par2);
+    let repaired = post.par2 == Verdict::Repaired;
+    let repair_ran = stats.is_some_and(|s| s.slices_missing > 0 || s.repair_ms > 0) || repaired;
+    o.verify = Some(StepRecord {
+        state: match par2_state {
+            StepState::Repaired => StepState::Ok,
+            StepState::Failed if repair_ran => StepState::Ok,
+            s => s,
+        },
+        detail: match (&post.par2, stats) {
+            (Verdict::Skipped(r), _) => format!("skipped ({r})"),
+            (_, Some(s)) => s.summary(),
+            (v, None) => v.to_string(),
+        },
+        ms: stats.map_or(ms(PostStage::Verify), |s| s.verify_ms),
+    });
+    if repair_ran {
+        o.repair = Some(StepRecord {
+            state: if repaired { StepState::Repaired } else { par2_state },
+            detail: match (&post.par2, stats) {
+                (Verdict::Failed(r), _) => r.clone(),
+                (_, Some(s)) => format!("rebuilt {} slice{}", s.slices_rebuilt, if s.slices_rebuilt == 1 { "" } else { "s" }),
+                (v, None) => v.to_string(),
+            },
+            ms: stats.map_or(ms(PostStage::Repair), |s| s.repair_ms),
+        });
+    }
+    o.extract = Some(StepRecord { state: step_state(&post.extract), detail: post.extract.to_string(), ms: ms(PostStage::Extract) });
+    let removed = post.removed.len() + post.partials_removed.len();
+    o.cleanup = Some(StepRecord {
+        state: if removed > 0 { StepState::Ok } else { StepState::Skipped },
+        detail: if removed > 0 {
+            format!("removed {removed} file{}", if removed == 1 { "" } else { "s" })
+        } else {
+            "nothing to remove".into()
+        },
+        ms: ms(PostStage::Cleanup),
+    });
+    o.par2_summary = stats.map(|s| s.summary());
+    o.slices_rebuilt = stats.map_or(0, |s| s.slices_rebuilt as u64);
+    o.extracted_to = post.extracted_to.clone();
+    o.files_removed = removed as u64;
+    if post.par2.is_failed() {
+        o.failure = Some(FailureKind::Repair);
+    } else if let Verdict::Failed(r) = &post.extract {
+        o.failure = Some(if r.contains("password") { FailureKind::Password } else { FailureKind::Extract });
+    }
+    o
+}
+
 /// Runs post-processing for `job`, streaming its progress into [`crate::Status::post`]
-/// and [`ServiceEvent::PostProgress`]. `Err` carries the failure reason.
-async fn post_process(inner: &Arc<Inner>, job: &Job, settings: &Settings) -> Result<PostReport, String> {
-    inner.log(LogLevel::Info, format!("post-processing {}", job.name));
+/// and [`ServiceEvent::PostProgress`]. `Err` carries the failure reason; both carry what
+/// is known about the outcome.
+async fn post_process(inner: &Arc<Inner>, job: &Job, settings: &Settings) -> (Result<PostReport, String>, Finish) {
+    inner.log_job(job.id, LogLevel::Info, format!("post-processing {}", job.name));
     let opts = PostOptions::from_settings(&settings.postprocess, job.password.clone());
     let dir = job.dest_dir.clone();
     let name = job.name.clone();
@@ -425,9 +516,25 @@ async fn post_process(inner: &Arc<Inner>, job: &Job, settings: &Settings) -> Res
     let result = tokio::task::spawn_blocking(move || {
         let tools = task_inner.tools.get_or_init(detect_tools);
         let ev = task_inner.clone();
-        newskite_postproc::process_with_events(&dir, &name, &opts, tools, &mut |e| match e {
-            PostEvent::Log(line) => ev.log(LogLevel::Info, line),
+        // Time per stage, from the stage changes.
+        let mut stage_ms: HashMap<PostStage, u64> = HashMap::new();
+        let mut current: Option<(PostStage, Instant)> = None;
+        let report = newskite_postproc::process_with_events(&dir, &name, &opts, tools, &mut |e| match e {
+            PostEvent::Log(line) => {
+                let level = if line.contains("could not") || line.contains("still incomplete") {
+                    LogLevel::Warn
+                } else {
+                    LogLevel::Info
+                };
+                ev.log_job(job_id, level, line)
+            }
             PostEvent::Stage { stage, fraction, detail } => {
+                if current.map(|(s, _)| s) != Some(stage) {
+                    if let Some((s, t)) = current.take() {
+                        *stage_ms.entry(s).or_default() += t.elapsed().as_millis() as u64;
+                    }
+                    current = Some((stage, Instant::now()));
+                }
                 let p = PostProgress {
                     job_id,
                     stage,
@@ -437,14 +544,21 @@ async fn post_process(inner: &Arc<Inner>, job: &Job, settings: &Settings) -> Res
                 ev.lock_state().post = Some(p.clone());
                 ev.emit(ServiceEvent::PostProgress(p));
             }
-        })
+        });
+        if let Some((s, t)) = current {
+            *stage_ms.entry(s).or_default() += t.elapsed().as_millis() as u64;
+        }
+        (report, stage_ms)
     })
     .await;
     inner.lock_state().post = None;
-    let secs = started.elapsed().as_secs();
+    let post_ms = started.elapsed().as_millis() as u64;
+    let secs = post_ms / 1000;
     match result {
-        Ok(Ok(post)) => {
-            inner.log(
+        Ok((Ok(post), stage_ms)) => {
+            let fin = Finish { outcome: outcome_of(&post, &stage_ms), post_ms, missing: 0 };
+            inner.log_job(
+                job.id,
                 LogLevel::Info,
                 format!(
                     "post-processing {}: par2 {}, extract {} ({})",
@@ -455,22 +569,25 @@ async fn post_process(inner: &Arc<Inner>, job: &Job, settings: &Settings) -> Res
                 ),
             );
             if post.par2.is_failed() || post.extract.is_failed() {
-                return Err(format!("post-processing failed: par2 {}, extract {}", post.par2, post.extract));
+                return (Err(format!("post-processing failed: par2 {}, extract {}", post.par2, post.extract)), fin);
             }
-            Ok(post)
+            (Ok(post), fin)
         }
-        Ok(Err(e)) => Err(format!("post-processing error: {e}")),
-        Err(e) => Err(format!("post-processing stopped unexpectedly: {e}")),
+        Ok((Err(e), _)) => (Err(format!("post-processing error: {e}")), Finish { post_ms, ..Finish::failed(FailureKind::Disk) }),
+        Err(e) => (Err(format!("post-processing stopped unexpectedly: {e}")), Finish { post_ms, ..Finish::failed(FailureKind::Other) }),
     }
 }
 
 /// Post-processing (when enabled) and the final `done`/`failed` state of a downloaded job.
 async fn finish_ok(inner: &Arc<Inner>, job: &Job, settings: &Settings, report: &JobReport) {
+    let mut fin = Finish::default();
     if settings.postprocess.enabled {
-        if let Err(reason) = post_process(inner, job, settings).await {
-            fail_job(inner, job, &reason);
+        let (result, f) = post_process(inner, job, settings).await;
+        if let Err(reason) = result {
+            fail_job(inner, job, &reason, f);
             return;
         }
+        fin = f;
         if inner.lock_state().removed_active {
             return;
         }
@@ -486,6 +603,7 @@ async fn finish_ok(inner: &Arc<Inner>, job: &Job, settings: &Settings, report: &
             if report.files.len() == 1 { "" } else { "s" },
             format::bytes(written)
         ),
+        fin,
     );
 }
 
@@ -493,11 +611,14 @@ async fn finish_ok(inner: &Arc<Inner>, job: &Job, settings: &Settings, report: &
 /// rebuilt every incomplete file, else failed with both reasons.
 async fn finish_partial(inner: &Arc<Inner>, job: &Job, settings: &Settings, ids: &[String]) {
     let missing = missing_message(ids);
-    match post_process(inner, job, settings).await {
+    let (result, mut fin) = post_process(inner, job, settings).await;
+    fin.missing = ids.len() as u64;
+    match result {
         Ok(post) if post.incomplete.is_empty() => {
             if inner.lock_state().removed_active {
                 return;
             }
+            fin.outcome.articles_repaired = ids.len() as u64;
             mark_done(
                 inner,
                 job,
@@ -507,36 +628,60 @@ async fn finish_partial(inner: &Arc<Inner>, job: &Job, settings: &Settings, ids:
                     ids.len(),
                     if ids.len() == 1 { "" } else { "s" }
                 ),
+                fin,
             );
         }
-        Ok(post) => fail_job(
-            inner,
-            job,
-            &format!("{missing}; {} file(s) still incomplete after PAR2 (not covered by the recovery data)", post.incomplete.len()),
-        ),
-        Err(reason) => fail_job(inner, job, &format!("{missing}; {reason}")),
+        Ok(post) => {
+            fin.outcome.failure = Some(FailureKind::MissingArticles);
+            let reason = format!(
+                "{missing}; {} file(s) still incomplete after PAR2 (not covered by the recovery data)",
+                post.incomplete.len()
+            );
+            fail_job(inner, job, &reason, fin)
+        }
+        Err(reason) => {
+            fin.outcome.failure.get_or_insert(FailureKind::MissingArticles);
+            fail_job(inner, job, &format!("{missing}; {reason}"), fin)
+        }
     }
 }
 
-fn mark_done(inner: &Inner, job: &Job, line: String) {
+/// Records the finish in the store and tells subscribers.
+fn record_finish(inner: &Inner, job: &Job, ok: bool, detail: String, fin: Finish) {
+    if let Err(e) = inner.store.set_job_outcome(job.id, crate::now_secs(), fin.post_ms, fin.missing, &fin.outcome) {
+        if !matches!(e, StoreError::NotFound) {
+            inner.log_job(job.id, LogLevel::Warn, format!("could not record the outcome of {}: {e}", job.name));
+        }
+    }
+    inner.emit(ServiceEvent::JobFinished { job_id: job.id, name: job.name.clone(), ok, detail });
+}
+
+fn mark_done(inner: &Inner, job: &Job, line: String, fin: Finish) {
     let _ = inner.store.set_job_progress(job.id, job.bytes_total);
     match inner.store.set_job_state(job.id, JobState::Done, None) {
         Ok(()) | Err(StoreError::NotFound) => {}
-        Err(e) => inner.log(LogLevel::Error, format!("could not mark {} done: {e}", job.name)),
+        Err(e) => inner.log_job(job.id, LogLevel::Error, format!("could not mark {} done: {e}", job.name)),
     }
-    inner.log(LogLevel::Info, line);
+    inner.log_job(job.id, LogLevel::Info, line.clone());
+    let detail = match (&fin.outcome.extracted_to, fin.outcome.repaired()) {
+        (_, true) => "repaired and complete".to_string(),
+        (Some(_), false) => "extracted".to_string(),
+        _ => "complete".to_string(),
+    };
+    record_finish(inner, job, true, detail, fin);
     inner.emit(ServiceEvent::JobsChanged);
 }
 
 /// Marks a job failed with `reason`, logs it and records it as the last error.
-fn fail_job(inner: &Inner, job: &Job, reason: &str) {
+fn fail_job(inner: &Inner, job: &Job, reason: &str, fin: Finish) {
     match inner.store.set_job_state(job.id, JobState::Failed, Some(reason)) {
         Ok(()) | Err(StoreError::NotFound) => {}
-        Err(e) => inner.log(LogLevel::Error, format!("could not mark {} failed: {e}", job.name)),
+        Err(e) => inner.log_job(job.id, LogLevel::Error, format!("could not mark {} failed: {e}", job.name)),
     }
     let msg = format!("failed {}: {reason}", job.name);
     inner.set_last_error(msg.clone());
-    inner.log(LogLevel::Error, msg);
+    inner.log_job(job.id, LogLevel::Error, msg);
+    record_finish(inner, job, false, reason.to_string(), fin);
     inner.emit(ServiceEvent::JobsChanged);
 }
 
@@ -563,7 +708,8 @@ async fn forward_events(
     bytes_total: u64,
     base_bytes: u64,
     mut rx: mpsc::UnboundedReceiver<EngineEvent>,
-) {
+) -> (u64, u64) {
+    let (mut fetched, mut missing_n) = (0u64, 0u64);
     let mut run_bytes: u64 = 0;
     let mut per_file: HashMap<String, u64> = HashMap::new();
     let mut last_persist = Instant::now();
@@ -575,7 +721,7 @@ async fn forward_events(
             Ok(()) | Err(StoreError::NotFound) => {}
             Err(e) => {
                 if !std::mem::replace(logged, true) {
-                    inner.log(LogLevel::Warn, format!("could not save progress of job {job_id}: {e}"));
+                    inner.log_job(job_id, LogLevel::Warn, format!("could not save progress of job {job_id}: {e}"));
                 }
             }
         }
@@ -585,12 +731,13 @@ async fn forward_events(
         match &ev {
             EngineEvent::FileStarted { name, segments } => {
                 upsert_file(&inner, job_id, name, 0, 0, "downloading");
-                inner.log(
+                inner.log_job(job_id, 
                     LogLevel::Info,
                     format!("downloading {name} ({segments} segment{})", if *segments == 1 { "" } else { "s" }),
                 );
             }
             EngineEvent::SegmentDone { name, bytes, .. } => {
+                fetched += 1;
                 run_bytes = run_bytes.saturating_add(*bytes);
                 *per_file.entry(name.clone()).or_default() += *bytes;
                 if last_persist.elapsed() >= Duration::from_secs(1) {
@@ -602,14 +749,15 @@ async fn forward_events(
                 upsert_file(&inner, job_id, name, *bytes, *bytes, "done");
                 persist(run_bytes, &mut persist_error_logged);
                 last_persist = Instant::now();
-                inner.log(LogLevel::Info, format!("wrote {name} ({})", format::bytes(*bytes)));
+                inner.log_job(job_id, LogLevel::Info, format!("wrote {name} ({})", format::bytes(*bytes)));
             }
             EngineEvent::FileFailed { name, missing } => {
+                missing_n += missing.len() as u64;
                 let got = per_file.get(name).copied().unwrap_or(0);
                 upsert_file(&inner, job_id, name, 0, got, "failed");
                 persist(run_bytes, &mut persist_error_logged);
                 last_persist = Instant::now();
-                inner.log(
+                inner.log_job(job_id, 
                     LogLevel::Warn,
                     format!(
                         "{name}: {} missing article{}",
@@ -618,12 +766,13 @@ async fn forward_events(
                     ),
                 );
             }
-            EngineEvent::Log(line) => inner.log(LogLevel::Info, line.clone()),
-            EngineEvent::Warn(line) => inner.log(LogLevel::Warn, line.clone()),
+            EngineEvent::Log(line) => inner.log_job(job_id, LogLevel::Info, line.clone()),
+            EngineEvent::Warn(line) => inner.log_job(job_id, LogLevel::Warn, line.clone()),
         }
         inner.emit(ServiceEvent::Engine { job_id, event: ev });
     }
     persist(run_bytes, &mut persist_error_logged);
+    (fetched, missing_n)
 }
 
 /// Blocking: keeps the `done` rows whose file is still in `dest` with the recorded length;

@@ -206,7 +206,7 @@ pub struct PostReport {
 }
 
 /// Post-processing stage, for progress display.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PostStage {
     Verify,
     Repair,

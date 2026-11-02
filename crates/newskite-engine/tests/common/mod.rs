@@ -165,7 +165,7 @@ pub fn logs(events: &[EngineEvent]) -> Vec<String> {
     events
         .iter()
         .filter_map(|e| match e {
-            EngineEvent::Log(l) => Some(l.clone()),
+            EngineEvent::Log(l) | EngineEvent::Warn(l) => Some(l.clone()),
             _ => None,
         })
         .collect()

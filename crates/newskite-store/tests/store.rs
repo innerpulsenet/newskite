@@ -565,7 +565,7 @@ fn totals_counts_states_and_bytes() {
     store.add_downloaded_bytes(0).unwrap();
     assert_eq!(
         store.totals().unwrap(),
-        Totals { downloaded_bytes: 1_234, jobs_done: 2, jobs_pending: 3, jobs_failed: 1 }
+        Totals { downloaded_bytes: 1_234, jobs_done: 2, jobs_pending: 3, jobs_failed: 1, articles_fetched: 0, articles_missing: 0 }
     );
 
     store.add_downloaded_bytes(u64::MAX).unwrap();
@@ -737,4 +737,47 @@ fn seen_sources_survive_job_removal_and_track_the_file_fingerprint() {
     let j = store.insert_job(&new_job("a")).unwrap();
     store.remove_job(j.id).unwrap();
     assert!(store.source_seen(p, 101, 6).unwrap());
+}
+
+#[test]
+fn job_stats_outcome_and_log_round_trip() {
+    let s = mem();
+    let j = s.insert_job(&new_job("stats")).unwrap();
+    assert_eq!(j.stats, newskite_store::JobStats::default());
+    s.mark_job_started(j.id, 100, 40).unwrap();
+    s.mark_job_started(j.id, 200, 40).unwrap();
+    s.add_job_download_ms(j.id, 1500).unwrap();
+    s.add_job_download_ms(j.id, 500).unwrap();
+    let outcome = newskite_types::JobOutcome {
+        failure: None,
+        slices_rebuilt: 8,
+        par2_summary: Some("1 file: 1 damaged".into()),
+        extracted_to: Some(PathBuf::from("/dl/x/x")),
+        ..Default::default()
+    };
+    s.set_job_outcome(j.id, 300, 750, 3, &outcome).unwrap();
+    let got = s.get_job(j.id).unwrap().unwrap().stats;
+    assert_eq!(got.started_at, Some(100), "first start is kept");
+    assert_eq!((got.finished_at, got.download_ms, got.post_ms), (Some(300), 2000, 750));
+    assert_eq!((got.articles_total, got.articles_missing), (40, 3));
+    assert_eq!(got.outcome, Some(outcome));
+    assert_eq!(got.avg_speed(4000), Some(2000));
+    s.clear_job_outcome(j.id).unwrap();
+    let got = s.get_job(j.id).unwrap().unwrap().stats;
+    assert_eq!((got.finished_at, got.outcome, got.download_ms), (None, None, 2000));
+
+    for i in 0..(newskite_store::JOB_LOG_KEEP + 120) {
+        s.append_job_log(j.id, i, "info", &format!("line {i}")).unwrap();
+    }
+    let log = s.job_log(j.id).unwrap();
+    assert_eq!(log.len() as i64, newskite_store::JOB_LOG_KEEP);
+    assert_eq!(log.last().unwrap().text, format!("line {}", newskite_store::JOB_LOG_KEEP + 119));
+    assert!(matches!(s.append_job_log(9999, 0, "info", "x"), Err(StoreError::NotFound)));
+    s.remove_job(j.id).unwrap();
+    assert!(s.job_log(j.id).unwrap().is_empty());
+
+    s.add_article_counts(10, 2).unwrap();
+    s.add_article_counts(5, 0).unwrap();
+    let t = s.totals().unwrap();
+    assert_eq!((t.articles_fetched, t.articles_missing), (15, 2));
 }

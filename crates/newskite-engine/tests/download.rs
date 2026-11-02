@@ -43,7 +43,7 @@ async fn acceptance_two_mib_eight_parts_with_auth() {
     assert!(server.connections_accepted() <= 4, "reuses at most 4 connections");
 
     // Event order: FileStarted, 8 x SegmentDone (done reaching 8), FileDone.
-    let file_events: Vec<&EngineEvent> = out.events.iter().filter(|e| !matches!(e, EngineEvent::Log(_))).collect();
+    let file_events: Vec<&EngineEvent> = out.events.iter().filter(|e| !matches!(e, EngineEvent::Log(_) | EngineEvent::Warn(_))).collect();
     assert!(matches!(file_events[0], EngineEvent::FileStarted { name, segments: 8 } if name == "payload.bin"));
     let dones: Vec<usize> = file_events[1..9]
         .iter()

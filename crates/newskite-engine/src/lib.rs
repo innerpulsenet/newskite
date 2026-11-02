@@ -223,6 +223,8 @@ pub struct Progress {
     pub bytes_down: AtomicU64,
     /// Segments processed, including missing ones (monotonic).
     pub segments_done: AtomicU64,
+    /// Per-server health, in the order servers were first used.
+    servers: std::sync::Mutex<Vec<newskite_types::ServerHealth>>,
 }
 
 impl Progress {
@@ -239,6 +241,24 @@ impl Progress {
     /// Current [`Progress::segments_done`].
     pub fn segments_done(&self) -> u64 {
         self.segments_done.load(Ordering::Relaxed)
+    }
+
+    /// Snapshot of every server's health since this `Progress` was created.
+    pub fn server_health(&self) -> Vec<newskite_types::ServerHealth> {
+        self.servers.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Updates (creating if needed) the health record of `address`.
+    pub(crate) fn health(&self, address: &str, f: impl FnOnce(&mut newskite_types::ServerHealth)) {
+        let mut v = self.servers.lock().unwrap_or_else(|e| e.into_inner());
+        let i = match v.iter().position(|h| h.address == address) {
+            Some(i) => i,
+            None => {
+                v.push(newskite_types::ServerHealth { address: address.to_string(), ..Default::default() });
+                v.len() - 1
+            }
+        };
+        f(&mut v[i]);
     }
 }
 

@@ -115,14 +115,12 @@ pub struct ServerHealth {
     pub address: String,
     /// Articles delivered.
     pub articles: u64,
-    /// Decoded bytes delivered.
+    /// Article bytes received (yEnc-encoded, as they came over the wire).
     pub bytes: u64,
     /// "No such article" answers.
     pub missing: u64,
     /// Transient errors (each one was retried or failed over).
     pub errors: u64,
-    /// Connections open right now.
-    pub connections: u32,
     /// Refused for the current job (login failed); reason attached.
     pub unusable: Option<String>,
     /// The most recent error, with its unix time.

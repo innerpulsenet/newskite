@@ -10,7 +10,7 @@ use newskite_types::Settings;
 use rusqlite::types::Type;
 use rusqlite::{params, Connection, OptionalExtension, Row};
 
-use crate::model::{Bookmark, Job, JobFile, JobState, NewBookmark, NewJob, ThroughputSample, Totals};
+use crate::model::{Bookmark, Job, JobFile, JobLogLine, JobState, JobStats, NewBookmark, NewJob, ThroughputSample, Totals};
 use crate::schema;
 use crate::StoreError;
 
@@ -34,8 +34,15 @@ const SETTINGS_BACKUP_PREFIX: &str = "settings.unreadable-";
 /// Key of the lifetime downloaded-bytes counter in the `counters` table.
 const DOWNLOADED_BYTES_KEY: &str = "downloaded_bytes";
 
-const JOB_COLUMNS: &str =
-    "id, name, state, bytes_total, bytes_done, dest_dir, source_path, created_at, error, password";
+const JOB_COLUMNS: &str = "id, name, state, bytes_total, bytes_done, dest_dir, source_path, created_at, error, password, \
+     started_at, finished_at, download_ms, post_ms, articles_total, articles_missing, outcome";
+
+/// Lines kept per job in `job_log`.
+pub const JOB_LOG_KEEP: i64 = 500;
+
+/// Lifetime article counters in the `counters` table.
+const ARTICLES_FETCHED_KEY: &str = "articles_fetched";
+const ARTICLES_MISSING_KEY: &str = "articles_missing";
 
 /// Queue order: explicit position, then age, then id.
 const QUEUE_ORDER: &str = "position ASC, created_at ASC, id ASC";
@@ -104,6 +111,16 @@ fn job_from_row(row: &Row<'_>) -> rusqlite::Result<Job> {
         created_at: row.get(7)?,
         error: row.get(8)?,
         password: row.get(9)?,
+        stats: JobStats {
+            started_at: row.get(10)?,
+            finished_at: row.get(11)?,
+            download_ms: from_db(row.get(12)?),
+            post_ms: from_db(row.get(13)?),
+            articles_total: from_db(row.get(14)?),
+            articles_missing: from_db(row.get(15)?),
+            // An outcome written by another build that no longer parses is dropped.
+            outcome: row.get::<_, Option<String>>(16)?.and_then(|s| serde_json::from_str(&s).ok()),
+        },
     })
 }
 
@@ -373,6 +390,95 @@ impl Store {
         require_changed(n)
     }
 
+    /// Records when a job first started downloading (later calls keep the first time) and
+    /// how many articles its NZB has.
+    pub fn mark_job_started(&self, id: i64, ts: i64, articles_total: u64) -> Result<(), StoreError> {
+        let n = self.conn().execute(
+            "UPDATE jobs SET started_at = COALESCE(started_at, ?2), articles_total = ?3 WHERE id = ?1",
+            params![id, ts, to_db(articles_total)],
+        )?;
+        require_changed(n)
+    }
+
+    /// Adds download time to a job.
+    pub fn add_job_download_ms(&self, id: i64, ms: u64) -> Result<(), StoreError> {
+        let n = self
+            .conn()
+            .execute("UPDATE jobs SET download_ms = download_ms + ?2 WHERE id = ?1", params![id, to_db(ms)])?;
+        require_changed(n)
+    }
+
+    /// Records how a job finished: finish time, post-processing time, missing articles and
+    /// the outcome (stored as JSON).
+    pub fn set_job_outcome(
+        &self,
+        id: i64,
+        finished_at: i64,
+        post_ms: u64,
+        articles_missing: u64,
+        outcome: &newskite_types::JobOutcome,
+    ) -> Result<(), StoreError> {
+        let json = serde_json::to_string(outcome)?;
+        let n = self.conn().execute(
+            "UPDATE jobs SET finished_at = ?2, post_ms = ?3, articles_missing = ?4, outcome = ?5 WHERE id = ?1",
+            params![id, finished_at, to_db(post_ms), to_db(articles_missing), json],
+        )?;
+        require_changed(n)
+    }
+
+    /// Forgets the last finish (a retried job is pending again). Timings of earlier runs
+    /// and the log are kept.
+    pub fn clear_job_outcome(&self, id: i64) -> Result<(), StoreError> {
+        let n = self.conn().execute(
+            "UPDATE jobs SET finished_at = NULL, post_ms = 0, articles_missing = 0, outcome = NULL WHERE id = ?1",
+            [id],
+        )?;
+        require_changed(n)
+    }
+
+    /// Appends a line to a job's log, keeping the newest [`JOB_LOG_KEEP`] lines.
+    pub fn append_job_log(&self, job_id: i64, ts: i64, level: &str, text: &str) -> Result<(), StoreError> {
+        let conn = self.conn();
+        let n = conn.execute(
+            "INSERT INTO job_log (job_id, ts, level, text) SELECT ?1, ?2, ?3, ?4 WHERE EXISTS (SELECT 1 FROM jobs WHERE id = ?1)",
+            params![job_id, ts, level, text],
+        )?;
+        require_changed(n)?;
+        let id = conn.last_insert_rowid();
+        // Trim now and then rather than on every line.
+        if id % 50 == 0 {
+            conn.execute("DELETE FROM job_log WHERE job_id = ?1 AND id <= ?2", params![job_id, id - JOB_LOG_KEEP])?;
+        }
+        Ok(())
+    }
+
+    /// A job's log, oldest first.
+    pub fn job_log(&self, job_id: i64) -> Result<Vec<JobLogLine>, StoreError> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT ts, level, text FROM (SELECT id, ts, level, text FROM job_log WHERE job_id = ?1 ORDER BY id DESC LIMIT ?2) ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map(params![job_id, JOB_LOG_KEEP], |r| {
+            Ok(JobLogLine { ts: r.get(0)?, level: r.get(1)?, text: r.get(2)? })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Adds to the lifetime article counters.
+    pub fn add_article_counts(&self, fetched: u64, missing: u64) -> Result<(), StoreError> {
+        let conn = self.conn();
+        for (key, n) in [(ARTICLES_FETCHED_KEY, fetched), (ARTICLES_MISSING_KEY, missing)] {
+            if n > 0 {
+                conn.execute(
+                    "INSERT INTO counters (key, value) VALUES (?1, ?2)
+                     ON CONFLICT (key) DO UPDATE SET value = value + excluded.value",
+                    params![key, to_db(n)],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     /// Set or clear (`None`) the archive password of a job.
     pub fn set_job_password(&self, id: i64, pw: Option<&str>) -> Result<(), StoreError> {
         let n = self.conn().execute("UPDATE jobs SET password = ?2 WHERE id = ?1", params![id, pw])?;
@@ -384,6 +490,7 @@ impl Store {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         tx.execute("DELETE FROM job_files WHERE job_id = ?1", [id])?;
+        tx.execute("DELETE FROM job_log WHERE job_id = ?1", [id])?;
         let n = tx.execute("DELETE FROM jobs WHERE id = ?1", [id])?;
         if n == 0 {
             // Dropping the transaction rolls back (nothing was deleted anyway).
@@ -794,11 +901,17 @@ impl Store {
             [],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
-        let downloaded: Option<i64> = conn
-            .query_row("SELECT value FROM counters WHERE key = ?1", [DOWNLOADED_BYTES_KEY], |r| r.get(0))
-            .optional()?;
+        let counter = |key: &str| -> Result<u64, StoreError> {
+            Ok(conn
+                .query_row("SELECT value FROM counters WHERE key = ?1", [key], |r| r.get::<_, i64>(0))
+                .optional()?
+                .map(from_db)
+                .unwrap_or(0))
+        };
         Ok(Totals {
-            downloaded_bytes: downloaded.map(from_db).unwrap_or(0),
+            downloaded_bytes: counter(DOWNLOADED_BYTES_KEY)?,
+            articles_fetched: counter(ARTICLES_FETCHED_KEY)?,
+            articles_missing: counter(ARTICLES_MISSING_KEY)?,
             jobs_done: from_db(done),
             jobs_pending: from_db(pending),
             jobs_failed: from_db(failed),

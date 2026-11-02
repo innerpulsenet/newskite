@@ -99,6 +99,44 @@ pub struct Job {
     pub error: Option<String>,
     /// Archive password used by post-processing.
     pub password: Option<String>,
+    /// Timings, article counts and outcome.
+    pub stats: JobStats,
+}
+
+/// What is known about a job's run(s).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct JobStats {
+    /// When its first download began, unix seconds.
+    pub started_at: Option<i64>,
+    /// When it last reached `done` or `failed`, unix seconds.
+    pub finished_at: Option<i64>,
+    /// Time spent downloading, summed over runs.
+    pub download_ms: u64,
+    /// Time spent post-processing in the last run.
+    pub post_ms: u64,
+    /// Articles in the NZB.
+    pub articles_total: u64,
+    /// Articles no server had in the last run.
+    pub articles_missing: u64,
+    /// What happened when it last finished.
+    pub outcome: Option<newskite_types::JobOutcome>,
+}
+
+impl JobStats {
+    /// Average download speed in bytes/s over the time spent downloading, when known.
+    pub fn avg_speed(&self, bytes: u64) -> Option<u64> {
+        (self.download_ms >= 1000 && bytes > 0).then(|| bytes.saturating_mul(1000) / self.download_ms)
+    }
+}
+
+/// One line of a job's own log.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JobLogLine {
+    /// Unix seconds.
+    pub ts: i64,
+    /// `"info"`, `"warn"` or `"error"`.
+    pub level: String,
+    pub text: String,
 }
 
 impl fmt::Debug for Job {
@@ -114,6 +152,7 @@ impl fmt::Debug for Job {
             .field("created_at", &self.created_at)
             .field("error", &self.error)
             .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("stats", &self.stats)
             .finish()
     }
 }
@@ -218,4 +257,7 @@ pub struct Totals {
     pub jobs_pending: u64,
     /// Jobs in state `failed`.
     pub jobs_failed: u64,
+    /// Lifetime articles fetched and missing.
+    pub articles_fetched: u64,
+    pub articles_missing: u64,
 }

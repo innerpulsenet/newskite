@@ -24,10 +24,10 @@ mod schema;
 mod store;
 
 pub use model::{
-    Bookmark, Job, JobFile, JobState, NewBookmark, NewJob, ParseJobStateError, ThroughputSample, Totals,
+    Bookmark, Job, JobFile, JobLogLine, JobState, JobStats, NewBookmark, NewJob, ParseJobStateError, ThroughputSample, Totals,
 };
 pub use schema::SCHEMA_VERSION;
-pub use store::{Store, DB_FILE_NAME, LOCK_FILE_NAME};
+pub use store::{Store, DB_FILE_NAME, JOB_LOG_KEEP, LOCK_FILE_NAME};
 
 /// Errors returned by [`Store`].
 #[derive(Debug, thiserror::Error)]

@@ -207,12 +207,30 @@ impl Shared {
         self.emit(EngineEvent::Log(line));
     }
 
+    /// A problem that did not stop the download.
+    fn warn(&self, line: impl Into<String>) {
+        let line = line.into();
+        tracing::warn!(target: "newskite_engine", "{line}");
+        self.emit(EngineEvent::Warn(line));
+    }
+
+    /// Records a transient error against `server`'s health.
+    fn note_error(&self, server: usize, err: &str) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
+        self.progress.health(&self.servers[server].address, |h| {
+            h.errors += 1;
+            h.last_error = Some((now, err.to_string()));
+        });
+    }
+
     /// Logs a per-article problem, but only the first [`BAD_ARTICLE_LOG_LIMIT`] of a run;
     /// the rest go to tracing only and are summarized by [`finish`].
     fn log_bad_article(&self, line: &str) {
         let n = self.bad_articles.fetch_add(1, Ordering::Relaxed);
         if n < BAD_ARTICLE_LOG_LIMIT {
-            self.log(line);
+            self.warn(line);
         } else {
             tracing::debug!(target: "newskite_engine", "{line}");
         }
@@ -262,8 +280,9 @@ impl Shared {
 
     fn mark_unusable(&self, server: usize, msg: &str) {
         let slot = &self.servers[server];
+        self.progress.health(&slot.address, |h| h.unusable = Some(msg.to_string()));
         if !slot.unusable.swap(true, Ordering::SeqCst) {
-            self.log(format!(
+            self.warn(format!(
                 "{}: authentication failed ({msg}); not using this server for the rest of the job",
                 slot.address
             ));
@@ -442,6 +461,10 @@ pub(crate) async fn run(
         bad_articles: AtomicUsize::new(0),
     });
 
+    // A new job tries every server again; earlier login failures stay in last_error.
+    for slot in &shared.servers {
+        shared.progress.health(&slot.address, |h| h.unusable = None);
+    }
     let fallback = match shared.servers.len() {
         1 => String::new(),
         n => format!(" (+{} fallback)", n - 1),
@@ -497,7 +520,7 @@ fn finish(shared: &Shared, cancel: &CancellationToken) -> Result<JobReport, Engi
     }
     log_bad_article_summary(shared);
     if !missing.is_empty() {
-        shared.log(format!("Download incomplete: {} missing article(s)", missing.len()));
+        shared.warn(format!("Download incomplete: {} missing article(s)", missing.len()));
         return Err(EngineError::MissingArticles { ids: missing });
     }
     let bytes_written = shared.bytes_written.load(Ordering::SeqCst);
@@ -509,7 +532,7 @@ fn finish(shared: &Shared, cancel: &CancellationToken) -> Result<JobReport, Engi
 fn log_bad_article_summary(shared: &Shared) {
     let bad = shared.bad_articles.load(Ordering::Relaxed);
     if bad > BAD_ARTICLE_LOG_LIMIT {
-        shared.log(format!(
+        shared.warn(format!(
             "{bad} article fetch(es) were rejected as damaged, foreign or invalid (first {BAD_ARTICLE_LOG_LIMIT} listed above)"
         ));
     }
@@ -728,6 +751,7 @@ async fn process_segment(shared: &Arc<Shared>, held: &mut Option<Held>, st: &mut
         };
         match res {
             Ok(raw) => {
+                let received = raw.len() as u64;
                 if let Some(limiter) = &shared.limiter {
                     tokio::select! {
                         _ = shared.abort.cancelled() => return Flow::Stop,
@@ -749,8 +773,15 @@ async fn process_segment(shared: &Arc<Shared>, held: &mut Option<Held>, st: &mut
                     .await
                 };
                 match checked {
-                    Ok(Ok(part)) => return store_part(shared, fi, part).await,
+                    Ok(Ok(part)) => {
+                        shared.progress.health(&shared.servers[server].address, |h| {
+                            h.articles += 1;
+                            h.bytes += received;
+                        });
+                        return store_part(shared, fi, part).await;
+                    }
                     Ok(Err(why)) => {
+                        shared.note_error(server, &why);
                         let msg = format!(
                             "{}: article <{}> from {} {why}",
                             file.label, seg.message_id, shared.servers[server].address
@@ -767,6 +798,7 @@ async fn process_segment(shared: &Arc<Shared>, held: &mut Option<Held>, st: &mut
                 }
             }
             Err(NntpError::ArticleMissing(_)) => {
+                shared.progress.health(&shared.servers[server].address, |h| h.missing += 1);
                 st.tried[server] = true;
                 st.failover = true;
                 if let Some(&next) = shared.order(&st.tried, server).first() {
@@ -900,8 +932,9 @@ async fn retry_wait(
         shared.fail(EngineError::Connect(format!("{address}: {err}")));
         return Retry::Stop;
     }
+    shared.note_error(server, &err.to_string());
     let delay = backoff_delay(*failures);
-    shared.log(format!(
+    shared.warn(format!(
         "{address}: {err}; retrying in {} ms (retry {} of {})",
         delay.as_millis(),
         failures,
@@ -922,7 +955,7 @@ fn skip_server(shared: &Shared, tried: &mut [bool], server: usize, message_id: &
         "Article <{message_id}> could not be fetched from {} ({err}); treating it as not available there",
         shared.servers[server].address
     );
-    shared.log(msg.clone());
+    shared.warn(msg.clone());
     msg
 }
 
@@ -1149,7 +1182,7 @@ async fn finalize(shared: &Arc<Shared>, fi: usize) -> io::Result<()> {
             let hint = file.size_hint.load(Ordering::SeqCst);
             let target = hint.max(max_end);
             if bytes < target {
-                shared.log(format!(
+                shared.warn(format!(
                     "{}: decoded {} of {}; the gaps are zero-filled (the NZB may be incomplete)",
                     out.name,
                     format::bytes(bytes),
@@ -1157,7 +1190,7 @@ async fn finalize(shared: &Arc<Shared>, fi: usize) -> io::Result<()> {
                 ));
             }
             if crc_errors > 0 {
-                shared.log(format!("{}: {crc_errors} segment(s) failed the CRC check; PAR2 may repair them", out.name));
+                shared.warn(format!("{}: {crc_errors} segment(s) failed the CRC check; PAR2 may repair them", out.name));
             }
             let s = shared.clone();
             let o = out.clone();
@@ -1176,7 +1209,7 @@ async fn finalize(shared: &Arc<Shared>, fi: usize) -> io::Result<()> {
 fn fail_file(shared: &Shared, name: &str, missing: &[String]) {
     let preview: Vec<String> = missing.iter().take(MISSING_PREVIEW).map(|id| format!("<{id}>")).collect();
     let more = if missing.len() > MISSING_PREVIEW { ", ..." } else { "" };
-    shared.log(format!("{name}: {} missing article(s): {}{more}", missing.len(), preview.join(", ")));
+    shared.warn(format!("{name}: {} missing article(s): {}{more}", missing.len(), preview.join(", ")));
     shared.emit(EngineEvent::FileFailed { name: name.to_string(), missing: missing.to_vec() });
 }
 
@@ -1251,7 +1284,7 @@ mod tests {
         let ids: Vec<String> = (1..=5).map(|i| format!("id{i}@x")).collect();
         fail_file(&shared, "f.bin", &ids);
         match rx.try_recv().unwrap() {
-            EngineEvent::Log(l) => assert_eq!(l, "f.bin: 5 missing article(s): <id1@x>, <id2@x>, <id3@x>, ..."),
+            EngineEvent::Warn(l) => assert_eq!(l, "f.bin: 5 missing article(s): <id1@x>, <id2@x>, <id3@x>, ..."),
             other => panic!("unexpected {other:?}"),
         }
         assert_eq!(rx.try_recv().unwrap(), EngineEvent::FileFailed { name: "f.bin".into(), missing: ids });
@@ -1286,7 +1319,7 @@ mod tests {
         log_bad_article_summary(&shared);
         let mut lines = Vec::new();
         while let Ok(ev) = rx.try_recv() {
-            if let EngineEvent::Log(l) = ev {
+            if let EngineEvent::Warn(l) = ev {
                 lines.push(l);
             }
         }

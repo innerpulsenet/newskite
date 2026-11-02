@@ -244,6 +244,7 @@ mod tests {
             created_at: 0,
             error: None,
             password: None,
+            stats: Default::default(),
         };
         let mut d = Data::default();
         assert_eq!(pending_fraction(&d), 0.0);
