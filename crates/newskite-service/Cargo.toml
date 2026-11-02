@@ -24,4 +24,5 @@ newskite-nntp = { workspace = true, features = ["testkit"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 sha2 = "0.10"
 tempfile = "3.27"
+newskite-par2.workspace = true
 rusqlite = { version = "0.41.1", features = ["bundled"] }

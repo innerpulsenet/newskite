@@ -110,7 +110,7 @@ mod tests {
         let base = tmp.path().join("downloads");
         std::fs::create_dir_all(base.join("a")).unwrap();
         let a = job(1, &base.join("a"));
-        assert_eq!(refuse_reason(&a, &base, &[a.clone()]), None);
+        assert_eq!(refuse_reason(&a, &base, std::slice::from_ref(&a)), None);
         assert!(refuse_reason(&job(2, &base), &base, &[]).is_some());
         assert!(refuse_reason(&job(2, tmp.path()), &base, &[]).is_some());
         assert!(refuse_reason(&job(2, Path::new("rel/dir")), &base, &[]).is_some());

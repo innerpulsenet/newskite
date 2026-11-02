@@ -73,7 +73,7 @@ pub(crate) fn input_constants(count: usize) -> Vec<u16> {
     let mut n: u32 = 0;
     while out.len() < count {
         n += 1;
-        if n % 3 != 0 && n % 5 != 0 && n % 17 != 0 && n % 257 != 0 {
+        if !n.is_multiple_of(3) && !n.is_multiple_of(5) && !n.is_multiple_of(17) && !n.is_multiple_of(257) {
             out.push(exp2(n));
         }
     }

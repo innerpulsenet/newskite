@@ -24,7 +24,7 @@ fn packet(out: &mut Vec<u8>, set_id: &Id, ptype: &[u8; 16], body: &[u8]) {
 }
 
 fn pad4(v: &mut Vec<u8>) {
-    while v.len() % 4 != 0 {
+    while !v.len().is_multiple_of(4) {
         v.push(0);
     }
 }
@@ -33,7 +33,7 @@ fn pad4(v: &mut Vec<u8>) {
 /// and `recovery` recovery slices) protecting `names` (relative to `dir`). `slice_size`
 /// must be a positive multiple of 4. Returns the files written.
 pub fn create(dir: &Path, names: &[&str], slice_size: u64, recovery: u32, base: &Path) -> io::Result<Vec<PathBuf>> {
-    assert!(slice_size > 0 && slice_size % 4 == 0, "slice size must be a positive multiple of 4");
+    assert!(slice_size > 0 && slice_size.is_multiple_of(4), "slice size must be a positive multiple of 4");
     struct F {
         id: Id,
         name: String,

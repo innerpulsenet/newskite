@@ -700,3 +700,53 @@ async fn settings_bookmarks_passwords_and_server_test() {
     assert!(matches!(svc.set_job_password(424242, None), Err(ServiceError::NotFound(424242))));
     assert!(!svc.logs().iter().any(|l| l.text.contains("archive-secret")));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn missing_article_is_repaired_by_par2_and_files_can_be_deleted() {
+    let tmp = TempDir::new().unwrap();
+    let data = common::random_bytes(40 * 1024, 77);
+    // PAR2 data for the payload, posted alongside it.
+    let src = tmp.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("m.bin"), &data).unwrap();
+    let written = newskite_par2::create(&src, &["m.bin"], 2048, 8, &src.join("m")).unwrap();
+    let file = TestFile::new("r", "m.bin", data.clone(), 4);
+    let par2: Vec<TestFile> = written
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let name = p.file_name().unwrap().to_string_lossy().into_owned();
+            TestFile::new(&format!("p{i}"), &name, std::fs::read(p).unwrap(), 1)
+        })
+        .collect();
+    let gone = file.articles[2].0.clone();
+    let mut all: Vec<&TestFile> = vec![&file];
+    all.extend(par2.iter());
+    let mock = mock_for(&all, &[gone.as_str()], 0).await;
+    let mut settings = test_settings(tmp.path(), vec![server_for(&mock, 2)]);
+    settings.postprocess = newskite_types::PostProcessSettings::default();
+    let svc = open_service(tmp.path(), settings);
+    let job = svc.add_nzb(&write_nzb(&tmp.path().join("n"), "m.nzb", None, &all)).unwrap();
+    let mut rx = svc.subscribe();
+
+    assert!(svc.start());
+    wait_idle(&svc, 30).await;
+    let done = svc.jobs().remove(0);
+    let logs: Vec<String> = svc.logs().into_iter().map(|l| l.text).collect();
+    assert_eq!(done.state, JobState::Done, "{:?}\n{logs:#?}", done.error);
+    assert_eq!(std::fs::read(job.dest_dir.join("m.bin")).unwrap(), data);
+    assert!(!job.dest_dir.join("m.bin.nkpart").exists());
+    // Leftovers are gone once verified.
+    assert!(!job.dest_dir.join("m.par2").exists());
+    assert!(logs.iter().any(|l| l.contains("PAR2 repaired 1 missing article")), "{logs:#?}");
+    let events = drain(&mut rx);
+    assert!(events.iter().any(|e| matches!(e, ServiceEvent::PostProgress(p) if p.stage == newskite_service::PostStage::Repair)));
+    assert_eq!(svc.status().post, None);
+
+    // Delete files: the folder goes, the job leaves the list.
+    let deleted = svc.delete_job_files(job.id).unwrap();
+    assert_eq!(deleted.files, 1);
+    assert!(!job.dest_dir.exists());
+    assert!(svc.jobs().is_empty());
+    assert!(tmp.path().join("downloads").exists(), "the download folder itself stays");
+}
