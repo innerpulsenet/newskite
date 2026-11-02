@@ -1,4 +1,5 @@
-//! PAR2 verify/repair through `par2` (par2cmdline).
+//! PAR2 verify/repair: native ([`newskite_par2`]) by default, `par2` (par2cmdline) only
+//! when no usable recovery set can be parsed natively.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -7,6 +8,8 @@ use std::time::Duration;
 use crate::detect::{find_par2_sets, is_par2, par2_key, par2_set_id, Par2Set};
 use crate::tools::{ToolCommand, ToolRun};
 use crate::Verdict;
+use newskite_types::format;
+use std::time::Instant;
 
 /// Verify/repair can read the whole download several times; be generous.
 const PAR2_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
@@ -247,9 +250,281 @@ fn rename_no_clobber(src: &Path, dst: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Verify (and if allowed, repair) every PAR2 set in `dir`.
-/// Returns the verdict and the backup files par2 left behind (cleanup candidates).
+/// Counts from a native PAR2 run, summed over its recovery sets.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Par2Stats {
+    /// Recovery sets checked.
+    pub sets: usize,
+    /// Files protected.
+    pub files: usize,
+    /// Files present and correct before any repair.
+    pub intact: usize,
+    /// Files present but damaged or truncated.
+    pub damaged: usize,
+    /// Files absent (including those found under another name).
+    pub missing: usize,
+    /// Files whose complete content was found under another name.
+    pub misnamed: usize,
+    /// Input slices that were missing.
+    pub slices_missing: usize,
+    /// Input slices in total.
+    pub slices_total: usize,
+    /// Recovery slices available.
+    pub recovery_available: usize,
+    /// Slices rebuilt by the repair.
+    pub slices_rebuilt: usize,
+    /// Bytes protected.
+    pub data_bytes: u64,
+    /// Wall-clock time spent verifying and repairing, in milliseconds.
+    pub verify_ms: u64,
+    pub repair_ms: u64,
+}
+
+impl Par2Stats {
+    /// One line for logs and the UI, e.g. `"12 files: 1 damaged, 1 missing; rebuilt 8 of
+    /// 8 missing slices from 12 recovery slices (0.4 s)"`.
+    pub fn summary(&self) -> String {
+        let mut problems = Vec::new();
+        if self.damaged > 0 {
+            problems.push(format!("{} damaged", self.damaged));
+        }
+        if self.missing > self.misnamed {
+            problems.push(format!("{} missing", self.missing - self.misnamed));
+        }
+        if self.misnamed > 0 {
+            problems.push(format!("{} misnamed", self.misnamed));
+        }
+        let files = format!("{} file{}", self.files, if self.files == 1 { "" } else { "s" });
+        let head = if problems.is_empty() { format!("{files}: all correct") } else { format!("{files}: {}", problems.join(", ")) };
+        let mut out = head;
+        if self.slices_missing > 0 {
+            out.push_str(&format!(
+                "; {} of {} slices missing, {} recovery slices available",
+                self.slices_missing, self.slices_total, self.recovery_available
+            ));
+        }
+        if self.slices_rebuilt > 0 {
+            out.push_str(&format!("; rebuilt {} slices", self.slices_rebuilt));
+        }
+        out.push_str(&format!(" (verify {:.1} s", self.verify_ms as f64 / 1000.0));
+        if self.repair_ms > 0 {
+            out.push_str(&format!(", repair {:.1} s", self.repair_ms as f64 / 1000.0));
+        }
+        out.push(')');
+        out
+    }
+}
+
+/// What [`run`] found and did.
+#[derive(Default)]
+pub(crate) struct Par2Outcome {
+    pub verdict: Option<Verdict>,
+    /// Damaged originals par2 kept as `name.1` (cleanup candidates).
+    pub backups: Vec<PathBuf>,
+    pub stats: Option<Par2Stats>,
+    /// Partial (`.nkpart`) files that supplied slices.
+    pub partials_used: Vec<PathBuf>,
+    /// Protected files that are correct now.
+    pub good_targets: Vec<PathBuf>,
+}
+
+/// Progress callback: stage, fraction done (when known), detail line.
+pub(crate) type Progress<'a> = &'a mut dyn FnMut(crate::PostStage, Option<f32>, String);
+
+/// Verify (and if allowed, repair) every PAR2 set in `dir`, natively. `files` are the
+/// regular files of the folder; `partials` the engine's incomplete `.nkpart` files, used
+/// as extra slice sources. Falls back to the `par2` tool when no set parses.
 pub(crate) fn run(
+    dir: &Path,
+    files: &[PathBuf],
+    partials: &[PathBuf],
+    tool: Option<&Path>,
+    repair: bool,
+    log: &mut dyn FnMut(String),
+    progress: Progress,
+) -> Par2Outcome {
+    use newskite_par2::{Event, FileStatus, Stage};
+    let par2_paths: Vec<PathBuf> = files.iter().filter(|f| newskite_par2::has_magic(f)).cloned().collect();
+    if par2_paths.is_empty() {
+        return Par2Outcome { verdict: Some(Verdict::Skipped(crate::NO_PAR2.into())), ..Default::default() };
+    }
+    progress(crate::PostStage::Verify, None, "Reading PAR2 files".into());
+    let (sets, bad) = newskite_par2::load(&par2_paths);
+    if bad > 0 {
+        log(format!("par2: skipped {bad} corrupt or unreadable PAR2 packet(s)/file(s)"));
+    }
+    if sets.is_empty() {
+        if tool.is_some() {
+            log("par2: no recovery set could be read natively; trying the par2 tool".into());
+            let (verdict, backups) = run_external(dir, files, tool, repair, log);
+            return Par2Outcome { verdict: Some(verdict), backups, ..Default::default() };
+        }
+        // Unverifiable is not damaged: extraction still runs (and checks its own CRCs).
+        log("par2: no usable recovery set (main packet missing or corrupt); skipping verification".into());
+        return Par2Outcome { verdict: Some(Verdict::Skipped("PAR2 files unreadable".into())), ..Default::default() };
+    }
+    let mut others: Vec<PathBuf> = files.iter().filter(|f| !newskite_par2::has_magic(f)).cloned().collect();
+    others.extend(partials.iter().cloned());
+
+    let mut out = Par2Outcome::default();
+    let mut stats = Par2Stats { sets: sets.len(), ..Default::default() };
+    let mut failures = Vec::new();
+    let mut repaired_any = false;
+    for set in &sets {
+        let label = set
+            .files
+            .first()
+            .map(|f| if set.files.len() > 1 { format!("{} (+{} more)", f.name, set.files.len() - 1) } else { f.name.clone() })
+            .unwrap_or_else(|| "empty set".into());
+        if !set.incomplete.is_empty() {
+            log(format!(
+                "par2: {label}: {} file(s) listed without a description; they cannot be checked",
+                set.incomplete.len()
+            ));
+        }
+        log(format!(
+            "par2: {label}: {} file(s), {} slices of {}, {} recovery slice(s){}",
+            set.files.len(),
+            set.slice_count(),
+            format::bytes(set.slice_size),
+            set.recovery.len(),
+            set.creator.as_deref().map(|c| format!(", made by {c}")).unwrap_or_default()
+        ));
+        let started = Instant::now();
+        let mut last = -1.0f32;
+        let mut current = String::new();
+        let ver = newskite_par2::verify(set, dir, &others, &mut |e| match e {
+            Event::File { index, count, name, .. } => {
+                current = format!("Verifying {name} ({}/{count})", index + 1);
+                progress(crate::PostStage::Verify, (last >= 0.0).then_some(last), current.clone());
+            }
+            Event::Bytes { done, total, .. } => {
+                let f = if total == 0 { 1.0 } else { done as f32 / total as f32 };
+                if f - last >= 0.005 || f >= 1.0 {
+                    last = f;
+                    progress(crate::PostStage::Verify, Some(f), current.clone());
+                }
+            }
+            Event::FileResult { name, status } => match status {
+                FileStatus::Intact => {}
+                FileStatus::Misnamed(p) => log(format!(
+                    "par2: {name}: found complete as {}",
+                    p.file_name().unwrap_or_default().to_string_lossy()
+                )),
+                FileStatus::Damaged { found, total } => log(format!("par2: {name}: damaged ({found} of {total} slices good)")),
+                FileStatus::Missing { found, total } if found > 0 => {
+                    log(format!("par2: {name}: missing ({found} of {total} slices found in other files)"))
+                }
+                FileStatus::Missing { .. } => log(format!("par2: {name}: missing")),
+                FileStatus::UnsafeName => log(format!("par2: {name}: unsafe file name; refusing to write it")),
+            },
+            Event::Note(n) => log(format!("par2: {n}")),
+        });
+        stats.verify_ms += started.elapsed().as_millis() as u64;
+        stats.files += ver.files.len();
+        stats.slices_total += ver.sources.len();
+        stats.slices_missing += ver.missing_slices();
+        stats.recovery_available += ver.recovery_available;
+        stats.data_bytes += set.data_bytes();
+        for f in &ver.files {
+            match f.status {
+                FileStatus::Intact => stats.intact += 1,
+                FileStatus::Damaged { .. } => stats.damaged += 1,
+                FileStatus::Missing { .. } | FileStatus::UnsafeName => stats.missing += 1,
+                FileStatus::Misnamed(_) => {
+                    stats.missing += 1;
+                    stats.misnamed += 1;
+                }
+            }
+        }
+        for s in ver.sources.iter().flatten() {
+            if partials.contains(&s.path) && !out.partials_used.contains(&s.path) {
+                out.partials_used.push(s.path.clone());
+            }
+        }
+        let multi = sets.len() > 1;
+        let fail = |log: &mut dyn FnMut(String), failures: &mut Vec<String>, reason: String| {
+            log(format!("par2: {label}: {reason}"));
+            failures.push(if multi { format!("{label}: {reason}") } else { reason });
+        };
+        if ver.is_intact() {
+            log(format!("par2: {label}: all files are correct"));
+            out.good_targets.extend(ver.files.iter().filter_map(|f| f.target.clone()));
+            continue;
+        }
+        let bad_files = ver.files.iter().filter(|f| f.status != FileStatus::Intact).count();
+        if !repair {
+            fail(log, &mut failures, format!("{bad_files} file(s) damaged or missing; repair is disabled"));
+            continue;
+        }
+        if !ver.repairable() {
+            let reason = if ver.files.iter().any(|f| f.status == FileStatus::UnsafeName) {
+                "repair not possible (a file has an unsafe name)".to_string()
+            } else {
+                format!(
+                    "repair not possible (need {} more recovery slice(s): {} missing, {} available)",
+                    ver.blocks_short(),
+                    ver.missing_slices(),
+                    ver.recovery_available
+                )
+            };
+            fail(log, &mut failures, reason);
+            continue;
+        }
+        log(format!(
+            "par2: {label}: repairing {} slice(s) with {} recovery slice(s) available",
+            ver.missing_slices(),
+            ver.recovery_available
+        ));
+        let started = Instant::now();
+        let mut last = -1.0f32;
+        let result = newskite_par2::repair(set, &ver, &newskite_par2::RepairOptions::default(), &mut |e| match e {
+            Event::File { stage: Stage::Prepare, index, count, .. } => progress(
+                crate::PostStage::Repair,
+                Some(0.0),
+                format!("Checking recovery data ({}/{count})", index + 1),
+            ),
+            Event::Bytes { done, total, .. } => {
+                let f = if total == 0 { 1.0 } else { done as f32 / total as f32 };
+                if f - last >= 0.005 || f >= 1.0 {
+                    last = f;
+                    progress(crate::PostStage::Repair, Some(f), format!("Rebuilding {} slice(s)", ver.missing_slices()));
+                }
+            }
+            Event::Note(n) => log(format!("par2: {n}")),
+            _ => {}
+        });
+        stats.repair_ms += started.elapsed().as_millis() as u64;
+        match result {
+            Ok(r) => {
+                repaired_any = true;
+                stats.slices_rebuilt += r.slices_rebuilt;
+                out.backups.extend(r.backups);
+                out.good_targets.extend(ver.files.iter().filter_map(|f| f.target.clone()));
+                log(format!(
+                    "par2: {label}: repair complete ({} rebuilt, {} renamed)",
+                    r.rebuilt.len(),
+                    r.renamed.len()
+                ));
+            }
+            Err(e) => fail(log, &mut failures, e.to_string()),
+        }
+    }
+    log(format!("par2: {}", stats.summary()));
+    out.verdict = Some(if !failures.is_empty() {
+        Verdict::Failed(failures.join("; "))
+    } else if repaired_any {
+        Verdict::Repaired
+    } else {
+        Verdict::Ok
+    });
+    out.stats = Some(stats);
+    out
+}
+
+/// Verify (and if allowed, repair) every PAR2 set in `dir` with the `par2` tool.
+/// Returns the verdict and the backup files par2 left behind (cleanup candidates).
+pub(crate) fn run_external(
     dir: &Path,
     files: &[PathBuf],
     par2: Option<&Path>,

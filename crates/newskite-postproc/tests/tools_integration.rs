@@ -256,7 +256,8 @@ fn no_tools_skips_gracefully() {
     fs::write(f.dl.join("x.par2"), b"PAR2\0PKT").unwrap();
     fs::write(f.dl.join("x.rar"), b"Rar!\x1a\x07\x01\x00junk").unwrap();
     let (r, _) = run(&f.dl, "job", &PostOptions { cleanup: true, ..Default::default() }, &Tools::none());
-    assert_eq!(r.par2, Verdict::Skipped("par2 tool not found".into()));
+    // PAR2 is native now; a file with only the magic holds no usable recovery set.
+    assert_eq!(r.par2, Verdict::Skipped("PAR2 files unreadable".into()));
     match &r.extract {
         Verdict::Skipped(reason) => assert!(reason.contains("unrar"), "{reason}"),
         other => panic!("expected skip, got {other:?}"),

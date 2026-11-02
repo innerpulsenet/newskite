@@ -86,6 +86,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use newskite_engine::{ConnectionPool, Progress};
 use newskite_nzb::NzbError;
+pub use newskite_postproc::PostStage;
 use newskite_postproc::Tools;
 use newskite_types::{format, EngineEvent, ServerConfig, Settings};
 use tokio::runtime::Handle;
@@ -153,6 +154,21 @@ pub enum ServiceEvent {
     ShutdownCanceled,
     /// An error line (also delivered as `JobLog`); drives the status-bar error state.
     Error(String),
+    /// Post-processing progress of the active job (also in [`Status::post`]).
+    PostProgress(PostProgress),
+}
+
+/// Where post-processing of a job is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PostProgress {
+    /// The job being post-processed.
+    pub job_id: i64,
+    /// Verify, repair, extract or cleanup.
+    pub stage: PostStage,
+    /// Thousandths done, when the stage can tell.
+    pub permille: Option<u16>,
+    /// Short detail ("Verifying movie.mkv (2/5)").
+    pub detail: String,
 }
 
 /// Severity of a [`LogLine`].
@@ -210,6 +226,8 @@ pub struct Status {
     /// The jobs the active run is limited to ([`Service::start_job`]); `None` while the
     /// whole queue runs or no run is active.
     pub run_scope: Option<Vec<i64>>,
+    /// Post-processing progress of the active job, while it runs.
+    pub post: Option<PostProgress>,
 }
 
 /// Where [`Service::move_job`] moves a job within the queue.
@@ -294,6 +312,8 @@ pub(crate) struct RunState {
     /// The jobs the active run is limited to (`None`: the whole queue).
     pub(crate) only: Option<Vec<i64>>,
     pub(crate) last_error: Option<String>,
+    /// Post-processing progress of the active job.
+    pub(crate) post: Option<PostProgress>,
     /// Token of the running auto-shutdown countdown.
     pub(crate) countdown: Option<CancellationToken>,
 }
@@ -920,6 +940,7 @@ impl Service {
             speed_bps: self.inner.speed_bps.load(Ordering::Relaxed),
             last_error: st.last_error.clone(),
             run_scope: if st.running { st.only.clone() } else { None },
+            post: st.post.clone(),
         }
     }
 

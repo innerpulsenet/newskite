@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 newskite-types.workspace = true
+newskite-par2.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

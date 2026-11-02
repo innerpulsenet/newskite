@@ -1093,7 +1093,7 @@ fn minimum_window_keeps_remove_confirmation_and_docks_on_screen() {
         .push_action(Action::SetTab(Tab::History));
     h.run_steps(2);
     // Every action icon of the failed row is inside the window.
-    for label in ["Retry (completed files are kept)", "Remove from the list"] {
+    for label in ["Retry (completed files are kept)", "Remove from the list (files stay on disk)"] {
         for node in h.get_all_by_label(label) {
             assert!(
                 node.rect().right() <= size.x - 4.0,
