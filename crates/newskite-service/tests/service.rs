@@ -9,6 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use common::*;
+use newskite_nntp::testkit::MockServer;
 use newskite_service::{
     JobFile, JobMove, JobState, LogLevel, NewBookmark, ServiceError, ServiceEvent, Store, NO_SERVER_MESSAGE,
 };
@@ -396,6 +397,44 @@ async fn missing_article_fails_the_job_with_the_id_and_retry_requeues() {
     assert_eq!(requeued.error, None);
     assert!(matches!(svc.retry_job(job.id), Err(ServiceError::Other(_))));
     assert!(matches!(svc.retry_job(9999), Err(ServiceError::NotFound(9999))));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retry_on_backup_asks_the_fail_over_server_first_and_logs_the_result() {
+    let tmp = TempDir::new().unwrap();
+    let file = TestFile::random("b", "b.bin", 30 * 1024, 3, 37);
+    let gone = file.articles[1].0.clone();
+    let primary = mock_for(&[&file], &[gone.as_str()], 0).await;
+    let backup = mock_for(&[&file], &[], 0).await;
+    let mut settings = test_settings(tmp.path(), vec![server_for(&primary, 2)]);
+    let svc = open_service(tmp.path(), settings.clone());
+    let job = svc.add_nzb(&write_nzb(&tmp.path().join("n"), "b.nzb", None, &[&file])).unwrap();
+    assert!(svc.start());
+    wait_idle(&svc, 20).await;
+    assert_eq!(svc.jobs().remove(0).state, JobState::Failed);
+
+    // With one server there is no backup to ask: refused, the job stays failed.
+    assert!(matches!(svc.retry_job_on_backup(job.id), Err(ServiceError::Other(_))));
+    assert_eq!(svc.jobs().remove(0).state, JobState::Failed);
+
+    settings.servers.push(server_for(&backup, 2));
+    svc.save_settings(settings).unwrap();
+    svc.retry_job_on_backup(job.id).unwrap();
+    assert_eq!(svc.jobs().remove(0).state, JobState::Queued);
+    svc.start_job(job.id).unwrap();
+    wait_idle(&svc, 20).await;
+
+    let done = svc.jobs().remove(0);
+    assert_eq!(done.state, JobState::Done, "{:?}", done.error);
+    assert_eq!(read(&job.dest_dir.join("b.bin")), file.data);
+    // Every article of the incomplete file came from the backup; the primary was not asked again.
+    let health = svc.server_health();
+    let of = |m: &MockServer| health.iter().find(|h| h.address == format!("{}:{}", m.addr.ip(), m.addr.port())).cloned().unwrap();
+    assert_eq!(of(&backup).articles, 3);
+    assert_eq!((of(&primary).articles, of(&primary).missing), (2, 1));
+    let logs: Vec<String> = svc.logs().into_iter().map(|l| l.text).collect();
+    assert!(logs.iter().any(|l| l.contains("backup retry queued")), "{logs:?}");
+    assert!(logs.iter().any(|l| l.contains("backup retry succeeded")), "{logs:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

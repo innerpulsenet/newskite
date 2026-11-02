@@ -1,17 +1,21 @@
 //! Bottom docks: Throughput, Details and Log.
 //!
-//! Each dock is a card under a mono eyebrow. **Throughput** keeps the live trace and the
-//! 24 h history on separate bands so two time axes never share one plot, under the speed
-//! and what is left to download. **Details** follows the selection: the selected job's
-//! facts and per-file progress, or, with nothing selected, the server (connection slots,
-//! articles this session) and lifetime totals as stat tiles. **Log** keeps fixed level and
-//! time columns so long lines wrap under their own text, with a level filter. Motion (the
-//! live marker's pulse, the slot shimmer, a new message's fade) runs only while bytes move
-//! and stops under reduced motion.
+//! Each dock is a card under a mono eyebrow. **Throughput** is a narrow card that keeps the
+//! live trace and the 24 h history on separate bands so two time axes never share one plot,
+//! under the speed and what is left to download. **Details** shows only while a job is
+//! selected and the inspector column has no room: the job's facts and per-file progress.
+//! **Log** takes the rest of the width: fixed level and time columns so long lines wrap
+//! under their own text, a level filter, and long message-id lists folded into a summary
+//! that opens in place. The server readings live in the server strip above the status bar.
+//!
+//! A new log line is marked by a tint and an accent bar painted *behind* its text, so the
+//! text keeps full contrast from the first frame; the tint eases out over a few seconds, or
+//! under reduced motion stays still and then goes. The live marker's pulse runs only while
+//! bytes move and stops under reduced motion.
 
 use eframe::egui::{
     self, epaint, Color32, CornerRadius, FontId, Id, Pos2, Rect, RichText, Sense, Shape, Stroke,
-    StrokeKind, Ui, Vec2,
+    Ui, Vec2,
 };
 use newskite_service::{Job, JobState, LogLevel, LogLine};
 use newskite_types::format;
@@ -21,8 +25,7 @@ use super::fonts;
 use super::queue::eta_secs;
 use super::theme::Palette;
 use super::widgets::{
-    card, icon_button, kit_button, paint_icon, section_title, segment_track, spaced, state_badge,
-    status_chip, ButtonKind, Icon, Status,
+    card, icon_button, paint_icon, section_title, segment_track, spaced, state_badge, Icon,
 };
 
 /// Width at which the three docks sit side by side (below: one scrolling column).
@@ -39,19 +42,25 @@ const MOTION_FRAME: std::time::Duration = std::time::Duration::from_millis(40);
 /// Height of the 24 h history strip under the live graph, and the shortest live plot.
 const HISTORY_STRIP_H: f32 = 10.0;
 const MIN_PLOT_H: f32 = 24.0;
-/// Height of a stat tile (figure over label) and of its one-line inline form.
-const TILE_H: f32 = 38.0;
-const INLINE_TILE_H: f32 = 18.0;
-/// Height of a connection slot cell and the gap between cells.
-const SLOT_H: f32 = 9.0;
+/// Gap between connection slot cells.
 const SLOT_GAP: f32 = 2.0;
 /// Narrowest slot cell; more connections than fit become proportional cells.
 const SLOT_MIN_W: f32 = 4.0;
 /// Widths of the level and time columns of the message log.
 const LEVEL_COL_W: f32 = 14.0;
 const TIME_COL_W: f32 = 58.0;
-/// Seconds a new message's highlight takes to fade.
-const MESSAGE_FADE_SECS: f32 = 1.6;
+/// Seconds a new message stays marked.
+const MESSAGE_NEW_SECS: f64 = 6.0;
+/// Width of the Throughput card in the row, as a share of the window and its bounds.
+const THROUGHPUT_SHARE: f32 = 0.24;
+const THROUGHPUT_MIN_W: f32 = 250.0;
+const THROUGHPUT_MAX_W: f32 = 340.0;
+/// Width of the Details card in the row (only while a job is selected), share and bounds.
+const DETAILS_SHARE: f32 = 0.3;
+const DETAILS_MIN_W: f32 = 300.0;
+const DETAILS_MAX_W: f32 = 440.0;
+/// Gap between dock cards.
+const DOCK_GAP: f32 = 8.0;
 
 /// Dock arrangement for a given window width.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -228,7 +237,26 @@ enum Dock {
 }
 
 impl Dock {
-    const ALL: [Dock; 3] = [Dock::Throughput, Dock::Details, Dock::Log];
+    /// The docks to show, left to right (top to bottom in the stack, where the log leads).
+    fn shown(details: bool, stack: bool) -> Vec<Dock> {
+        match (details, stack) {
+            (true, false) => vec![Dock::Throughput, Dock::Details, Dock::Log],
+            (false, false) => vec![Dock::Throughput, Dock::Log],
+            (true, true) => vec![Dock::Log, Dock::Details, Dock::Throughput],
+            (false, true) => vec![Dock::Log, Dock::Throughput],
+        }
+    }
+}
+
+/// Widths of the row's cards for a row `width` px wide: Throughput, Details (0 when not
+/// shown) and Log, which takes what is left. Gaps between cards are subtracted first.
+pub fn row_widths(width: f32, details: bool) -> (f32, f32, f32) {
+    let width = if width.is_finite() { width.max(0.0) } else { 0.0 };
+    let gaps = DOCK_GAP * if details { 2.0 } else { 1.0 };
+    let t = (width * THROUGHPUT_SHARE).clamp(THROUGHPUT_MIN_W, THROUGHPUT_MAX_W);
+    let d = if details { (width * DETAILS_SHARE).clamp(DETAILS_MIN_W, DETAILS_MAX_W) } else { 0.0 };
+    let log = (width - gaps - t - d).max(0.0);
+    (t, d, log)
 }
 
 /// What moves this frame: the clock phase of the busy beat (0…1) and whether anything
@@ -329,8 +357,7 @@ fn dock(
             ui.set_min_height(18.0);
             let title = match which {
                 Dock::Throughput => "Throughput",
-                Dock::Details if c.selected.is_some() => "Details",
-                Dock::Details => "Server",
+                Dock::Details => "Details",
                 Dock::Log => "Log",
             };
             section_title(ui, pal, title);
@@ -354,20 +381,19 @@ fn dock(
             Dock::Throughput => graph(ui, pal, c.data, c.motion),
             Dock::Log => messages(ui, pal, c.data, state.log_filter, c.motion.animate, actions),
             Dock::Details => {
-                egui::ScrollArea::vertical()
-                    .id_salt("dock-details")
-                    .auto_shrink([false, false])
-                    .max_height(ui.available_height().max(20.0))
-                    .show(ui, |ui| match c.selected {
-                        Some(job) => details(ui, pal, c.data, job, actions),
-                        None => activity(ui, pal, c.data, c.motion, actions),
-                    });
+                if let Some(job) = c.selected {
+                    egui::ScrollArea::vertical()
+                        .id_salt("dock-details")
+                        .auto_shrink([false, false])
+                        .max_height(ui.available_height().max(20.0))
+                        .show(ui, |ui| details(ui, pal, c.data, job, actions));
+                }
             }
         }
     });
 }
 
-/// Draws the three docks in the arrangement that fits the available width.
+/// Draws the docks in the arrangement that fits the available width.
 pub fn show(
     ui: &mut Ui,
     pal: &Palette,
@@ -388,12 +414,26 @@ pub fn show(
         motion,
     };
     let width = ui.ctx().content_rect().width();
+    let with_details = c.selected.is_some();
     match layout_for(width) {
         DockLayout::Row => {
             let h = (ui.available_height() - CARD_CHROME).max(80.0);
-            ui.columns(3, |cols| {
-                for (col, which) in cols.iter_mut().zip(Dock::ALL) {
-                    dock(col, &c, which, h, state, actions);
+            let (tw, dw, lw) = row_widths(ui.available_width(), with_details);
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = DOCK_GAP;
+                for which in Dock::shown(with_details, false) {
+                    let w = match which {
+                        Dock::Throughput => tw,
+                        Dock::Details => dw,
+                        Dock::Log => lw,
+                    };
+                    // Top-down inside each card (the row itself is horizontal); the card's
+                    // frame adds its margins and hairline outside the content.
+                    let layout = egui::Layout::top_down(egui::Align::Min);
+                    ui.allocate_ui_with_layout(Vec2::new(w, h + CARD_CHROME), layout, |ui| {
+                        ui.set_width(w);
+                        dock(ui, &c, which, h, state, actions);
+                    });
                 }
             });
         }
@@ -401,8 +441,9 @@ pub fn show(
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    for which in Dock::ALL {
-                        dock(ui, &c, which, 150.0, state, actions);
+                    for which in Dock::shown(with_details, true) {
+                        let h = if matches!(which, Dock::Log) { 220.0 } else { 150.0 };
+                        dock(ui, &c, which, h, state, actions);
                     }
                 });
         }
@@ -424,110 +465,6 @@ fn log_filter_chips(ui: &mut Ui, pal: &Palette, filter: &mut LogFilter) {
     }
 }
 
-/// A reading for a stat tile.
-struct Stat {
-    value: String,
-    label: &'static str,
-    color: Color32,
-}
-
-impl Stat {
-    fn new(value: impl Into<String>, label: &'static str, color: Color32) -> Self {
-        Self {
-            value: value.into(),
-            label,
-            color,
-        }
-    }
-}
-
-/// One stat tile: the figure in the 17 px mono semibold over its label as a small mono
-/// eyebrow; `inline` lays the two side by side on one 18 px line for the short cards of
-/// the 2×2 grid. Two accessible nodes: `"<label>: <value>"` on the figure and the label
-/// itself.
-fn tile(ui: &mut Ui, pal: &Palette, stat: &Stat, width: f32, inline: bool) {
-    let height = if inline { INLINE_TILE_H } else { TILE_H };
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
-    let value_font = FontId::new(if inline { 13.5 } else { 17.0 }, fonts::mono_semibold());
-    let label_job = spaced(
-        &stat.label.to_uppercase(),
-        fonts::mono_id(9.5),
-        pal.faint,
-        1.0,
-    );
-    let painter = ui.painter_at(rect);
-    let value_galley = painter.layout_no_wrap(stat.value.clone(), value_font, stat.color);
-    let label_galley = painter.layout_job(label_job);
-    let (value_rect, label_rect) = if inline {
-        let v = Rect::from_min_size(rect.min, Vec2::new(value_galley.size().x, height));
-        let l = Rect::from_min_max(Pos2::new(v.right() + 6.0, rect.top()), rect.right_bottom());
-        (v, l)
-    } else {
-        (
-            Rect::from_min_size(rect.min, Vec2::new(width, 22.0)),
-            Rect::from_min_size(
-                Pos2::new(rect.left(), rect.bottom() - 14.0),
-                Vec2::new(width, 14.0),
-            ),
-        )
-    };
-    if ui.is_rect_visible(rect) {
-        painter.galley(
-            Pos2::new(
-                value_rect.left(),
-                value_rect.center().y - value_galley.size().y / 2.0,
-            ),
-            value_galley,
-            stat.color,
-        );
-        let label_pos = if inline {
-            // Baselines align: the eyebrow sits a hair above the figure's baseline.
-            Pos2::new(
-                label_rect.left(),
-                value_rect.center().y - label_galley.size().y / 2.0 + 1.0,
-            )
-        } else {
-            label_rect.left_top()
-        };
-        painter.galley(label_pos, label_galley, pal.faint);
-    }
-    let value_resp = ui.interact(
-        value_rect,
-        ui.id().with(("tile-value", stat.label)),
-        Sense::hover(),
-    );
-    value_resp.widget_info(|| {
-        egui::WidgetInfo::labeled(
-            egui::WidgetType::Label,
-            true,
-            format!("{}: {}", stat.label, stat.value),
-        )
-    });
-    let label_resp = ui.interact(
-        label_rect,
-        ui.id().with(("tile-label", stat.label)),
-        Sense::hover(),
-    );
-    label_resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, stat.label));
-}
-
-/// Stat tiles in rows of `per_row`, sharing the width evenly; inline tiles when
-/// `compact` (the 2×2 grid, where height is scarce).
-fn tiles(ui: &mut Ui, pal: &Palette, stats: &[Stat], per_row: usize, compact: bool) {
-    let per_row = per_row.max(1);
-    let gap = 10.0;
-    let width = ((ui.available_width() - gap * (per_row as f32 - 1.0)) / per_row as f32).max(40.0);
-    for row in stats.chunks(per_row) {
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = gap;
-            for stat in row {
-                tile(ui, pal, stat, width, compact);
-            }
-        });
-        ui.add_space(if compact { 2.0 } else { 4.0 });
-    }
-}
-
 /// A small mono eyebrow with a figure at the right end of the same line.
 fn eyebrow_row(ui: &mut Ui, pal: &Palette, label: &str, right: &str, right_color: Color32) {
     ui.horizontal(|ui| {
@@ -546,7 +483,7 @@ fn eyebrow_row(ui: &mut Ui, pal: &Palette, label: &str, right: &str, right_color
     });
 }
 
-fn now_secs() -> i64 {
+pub fn now_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -787,181 +724,6 @@ fn graph(ui: &mut Ui, pal: &Palette, data: &Data, motion: Motion) {
     }
 }
 
-/// The connection slot row: one cell per configured connection (or a proportional row
-/// when they do not fit), the effective ones lit. While bytes move the lit cells shimmer
-/// in the live series color; idle, they rest in the muted tone.
-fn slots(ui: &mut Ui, pal: &Palette, max: usize, effective: usize, active: bool, motion: Motion) {
-    let width = ui.available_width();
-    let (cells, lit) = slot_cells(max, effective, width);
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, SLOT_H), Sense::hover());
-    if ui.is_rect_visible(rect) {
-        let cell_w = (rect.width() - SLOT_GAP * (cells as f32 - 1.0)) / cells as f32;
-        let painter = ui.painter();
-        let r = CornerRadius::same(1);
-        for i in 0..cells {
-            let x = rect.left() + i as f32 * (cell_w + SLOT_GAP);
-            let cell = Rect::from_min_size(Pos2::new(x, rect.top()), Vec2::new(cell_w, SLOT_H));
-            let color = if i >= lit {
-                pal.well
-            } else if motion.moving {
-                Palette::fade(pal.series, slot_shimmer(i, lit, motion.phase))
-            } else if active {
-                pal.series
-            } else {
-                pal.muted
-            };
-            painter.rect_filled(cell, r, color);
-        }
-    }
-    resp.on_hover_text(format!(
-        "{effective} of {max} connections per run{}",
-        if cells < max {
-            " (proportional row)"
-        } else {
-            ""
-        }
-    ));
-}
-
-fn activity(ui: &mut Ui, pal: &Palette, data: &Data, motion: Motion, actions: &mut Vec<Action>) {
-    let s = &data.settings;
-    match s.first_usable_server() {
-        None => {
-            ui.label(RichText::new("No server configured.").color(pal.warning));
-            ui.label(
-                RichText::new("Add an NNTP server to start downloading.")
-                    .small()
-                    .color(pal.muted),
-            );
-            ui.add_space(4.0);
-            if kit_button(
-                ui,
-                pal,
-                ButtonKind::Outline,
-                Some(Icon::Gear),
-                "Open settings…",
-                true,
-            )
-            .clicked()
-            {
-                actions.push(Action::OpenSettings);
-            }
-            ui.add_space(10.0);
-            account(ui, pal, data);
-        }
-        Some(server) => {
-            let others = s.usable_servers().len().saturating_sub(1);
-            let max = s.max_connections.max(1) as usize;
-            let effective = s.effective_connections();
-            let active = data.status.running && !data.status.paused;
-            let identity = |ui: &mut Ui| {
-                ui.spacing_mut().item_spacing.x = 8.0;
-                if server.tls {
-                    status_chip(ui, pal, Status::Ok, "TLS");
-                } else {
-                    status_chip(ui, pal, Status::Warn, "Plain");
-                }
-                ui.label(
-                    RichText::new(if server.username.is_empty() {
-                        "(none)".to_owned()
-                    } else {
-                        server.username.clone()
-                    })
-                    .font(fonts::mono_id(11.5))
-                    .color(pal.muted),
-                );
-                if others > 0 {
-                    ui.label(
-                        RichText::new(format!(
-                            "+{others} fail-over server{}",
-                            if others == 1 { "" } else { "s" }
-                        ))
-                        .font(fonts::mono_id(11.0))
-                        .color(pal.faint),
-                    );
-                }
-            };
-            let address = RichText::new(server.address())
-                .font(fonts::mono_id(12.5))
-                .color(pal.text);
-            {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(address);
-                    ui.add_space(4.0);
-                    identity(ui);
-                });
-                if !data.servers.is_empty() {
-                    ui.add_space(4.0);
-                    server_health(ui, pal, data);
-                }
-                ui.add_space(6.0);
-                eyebrow_row(
-                    ui,
-                    pal,
-                    "Connections",
-                    &format!("{effective} / {max}"),
-                    pal.text,
-                );
-                ui.add_space(3.0);
-                slots(ui, pal, max, effective, active, motion);
-                ui.add_space(10.0);
-                account(ui, pal, data);
-            }
-        }
-    }
-}
-
-/// One line per server used this session: a status glyph, the address and what it
-/// delivered; the last error on hover. Counts come from the engine, never estimates.
-fn server_health(ui: &mut Ui, pal: &Palette, data: &Data) {
-    let now = now_secs();
-    for h in &data.servers {
-        // Errors in the last five minutes make a server "struggling".
-        let recent = h.last_error.as_ref().is_some_and(|(t, _)| now - t < 300);
-        let (icon, color, state) = match (&h.unusable, recent) {
-            (Some(_), _) => (Icon::StatusErr, pal.negative, "login refused".to_string()),
-            (None, true) => (Icon::StatusWarn, pal.warning, "errors".to_string()),
-            (None, false) => (Icon::StatusOk, pal.positive, "ok".to_string()),
-        };
-        let resp = ui
-            .horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
-                let (r, _) = ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
-                paint_icon(ui.painter(), r, icon, color);
-                // With one server its address is right above; name it only among several.
-                let label = if data.servers.len() > 1 { h.address.clone() } else { format!("Health: {state}") };
-                ui.label(RichText::new(label).font(fonts::mono_id(11.5)).color(pal.text));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let mut parts = vec![format!("{} art", h.articles)];
-                    if h.missing > 0 {
-                        parts.push(format!("{} missing", h.missing));
-                    }
-                    if h.errors > 0 {
-                        parts.push(format!("{} err", h.errors));
-                    }
-                    let c = if h.errors > 0 || h.missing > 0 { pal.warning } else { pal.muted };
-                    ui.label(RichText::new(parts.join(" · ")).font(fonts::mono_id(10.5)).color(c));
-                });
-            })
-            .response;
-        let mut tip = format!(
-            "{}: {state}\n{} articles, {} received\n{} not on this server, {} errors",
-            h.address,
-            h.articles,
-            format::bytes(h.bytes),
-            h.missing,
-            h.errors
-        );
-        if let Some(why) = &h.unusable {
-            tip.push_str(&format!("\nRefused: {why}"));
-        }
-        if let Some((t, e)) = &h.last_error {
-            tip.push_str(&format!("\nLast error at {}: {e}", clock(*t)));
-        }
-        resp.on_hover_text(tip);
-    }
-}
-
 pub fn clock(ts: i64) -> String {
     use chrono::TimeZone;
     match chrono::Local.timestamp_opt(ts, 0) {
@@ -980,9 +742,82 @@ fn level_color(pal: &Palette, level: LogLevel) -> Color32 {
     }
 }
 
+/// A log line whose message-id list is folded: `lead` + "N missing articles" + `tail`
+/// on the summary line, the listed `ids` (without `<>`) behind a disclosure.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IdList {
+    /// Text before the count ("regret-gf.r01: ").
+    pub lead: String,
+    /// How many articles the line says are missing.
+    pub count: u64,
+    /// The ids the line lists (often a preview of the first few).
+    pub ids: Vec<String>,
+    /// Text after the list ("; trying a PAR2 repair").
+    pub tail: String,
+}
+
+impl IdList {
+    /// The folded line: `"regret-gf.r01: 66 missing articles; trying a PAR2 repair"`.
+    pub fn summary(&self) -> String {
+        format!(
+            "{}{} missing article{}{}",
+            self.lead,
+            self.count,
+            if self.count == 1 { "" } else { "s" },
+            self.tail
+        )
+    }
+}
+
+/// Splits a "N missing article(s): <id>, <id>, ..." line (the engine's and the queue's
+/// wording) into a summary and its ids. `None` when the line lists fewer than two ids
+/// (nothing worth folding) or is not such a line.
+pub fn split_id_list(text: &str) -> Option<IdList> {
+    let at = text.find(" missing article")?;
+    let digits_start = text[..at].rfind(|c: char| !c.is_ascii_digit()).map_or(0, |i| i + 1);
+    let count: u64 = text[digits_start..at].parse().ok()?;
+    let rest = &text[at + " missing article".len()..];
+    let rest = rest.strip_prefix("(s)").or_else(|| rest.strip_prefix('s')).unwrap_or(rest);
+    let list = rest.strip_prefix(": ")?;
+    let (list, tail) = match list.find("; ") {
+        Some(i) => (&list[..i], &list[i..]),
+        None => (list, ""),
+    };
+    let ids: Vec<String> = list
+        .split(", ")
+        .map(|t| t.trim().trim_start_matches('<').trim_end_matches('>').trim_end_matches(','))
+        .filter(|t| t.contains('@') && !t.starts_with("..."))
+        .map(str::to_owned)
+        .collect();
+    if ids.len() < 2 {
+        return None;
+    }
+    Some(IdList { lead: text[..digits_start].to_owned(), count, ids, tail: tail.to_owned() })
+}
+
+/// Strength (0…1) of a line's "new" mark `age` seconds after it first showed: eases out
+/// over [`MESSAGE_NEW_SECS`] when animating; held at full, then gone, under reduced motion.
+pub fn new_mark(age: f64, animate: bool) -> f32 {
+    if !age.is_finite() || !(0.0..MESSAGE_NEW_SECS).contains(&age) {
+        return 0.0;
+    }
+    if !animate {
+        return 1.0;
+    }
+    let t = (age / MESSAGE_NEW_SECS) as f32;
+    // Hold for the first third, then ease out.
+    if t < 1.0 / 3.0 {
+        1.0
+    } else {
+        let u = (t - 1.0 / 3.0) * 1.5;
+        (1.0 - u).powi(2)
+    }
+}
+
 /// Messages, newest first, in three columns: a level mark, the clock, the text (which
-/// wraps under itself, never under the clock). A line seen for the first time after the
-/// dock's first frame carries an accent band that fades out.
+/// wraps under itself, never under the clock). Long message-id lists fold behind a
+/// disclosure; the newest failure of a job that can be retried on a backup carries that
+/// button. A line that arrived after the dock's first frame is marked behind its text.
 fn messages(ui: &mut Ui, pal: &Palette, data: &Data, filter: LogFilter, animate: bool, actions: &mut Vec<Action>) {
     let logs = &data.logs;
     if logs.is_empty() {
@@ -1001,95 +836,96 @@ fn messages(ui: &mut Ui, pal: &Palette, data: &Data, filter: LogFilter, animate:
         return;
     }
     let ctx = ui.ctx().clone();
+    let now = ui.input(|i| i.time);
     let seen_key = Id::new("messages-seen-once");
     let first_frame = !ctx.data(|d| d.get_temp::<bool>(seen_key)).unwrap_or(false);
+    let backup_servers = data.settings.usable_servers();
+    let has_backup = backup_servers.len() >= 2;
+    let mut offered: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    let mut marked = false;
     egui::ScrollArea::vertical()
         .id_salt("messages")
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            ui.spacing_mut().item_spacing.y = 3.0;
-            let text_w = (ui.available_width() - LEVEL_COL_W - TIME_COL_W - 10.0).max(40.0);
+            ui.spacing_mut().item_spacing.y = 4.0;
+            let text_w = (ui.available_width() - LEVEL_COL_W - TIME_COL_W - 12.0).max(40.0);
+            // The gutter columns are one text row tall, so glyph, clock and text share a center.
+            let row_h = ui.fonts_mut(|f| f.row_height(&fonts::mono_id(12.0))).max(14.0);
             for line in shown {
                 let id = Id::new(("logline", line.ts, &line.text));
-                let seen = ctx.data(|d| d.get_temp::<bool>(id)).unwrap_or(false);
-                if !seen {
-                    ctx.data_mut(|d| d.insert_temp(id, true));
+                // When this line first showed; lines present on the first frame count as old.
+                let first_seen = ctx.data_mut(|d| {
+                    *d.get_temp_mut_or_insert_with(id, || if first_frame { f64::NEG_INFINITY } else { now })
+                });
+                let mark = new_mark(now - first_seen, animate);
+                marked |= mark > 0.0;
+                let job = line.job_id.and_then(|jid| data.jobs.iter().find(|j| j.id == jid));
+                let folded = split_id_list(&line.text);
+                let retry = has_backup
+                    && line.level != LogLevel::Info
+                    && job.is_some_and(|j| j.state == JobState::Failed && !offered.contains(&j.id));
+                if retry {
+                    offered.extend(job.map(|j| j.id));
                 }
-                // Lines present on the first frame were not "new"; later ones fade in.
-                let fade = if animate && !first_frame {
-                    1.0 - ctx.animate_bool_with_time(id.with("fade"), seen, MESSAGE_FADE_SECS)
-                } else {
-                    0.0
-                };
+                // Reserve the backdrop's slot first so it paints under the row.
+                let backdrop = ui.painter().add(Shape::Noop);
                 let row = ui
                     .horizontal_top(|ui| {
                         ui.spacing_mut().item_spacing.x = 4.0;
-                        let (lr, _) =
-                            ui.allocate_exact_size(Vec2::new(LEVEL_COL_W, 16.0), Sense::hover());
-                        let mark = Rect::from_center_size(lr.center(), Vec2::splat(11.0));
+                        let (lr, _) = ui.allocate_exact_size(Vec2::new(LEVEL_COL_W, row_h), Sense::hover());
+                        let glyph = Rect::from_center_size(lr.center(), Vec2::splat(11.0));
                         match line.level {
                             LogLevel::Info => {
-                                ui.painter().circle_filled(mark.center(), 2.0, pal.faint);
+                                ui.painter().circle_filled(glyph.center(), 2.0, pal.faint);
                             }
-                            LogLevel::Warn => {
-                                paint_icon(ui.painter(), mark, Icon::StatusWarn, pal.warning)
-                            }
-                            LogLevel::Error => {
-                                paint_icon(ui.painter(), mark, Icon::StatusErr, pal.negative)
-                            }
+                            LogLevel::Warn => paint_icon(ui.painter(), glyph, Icon::StatusWarn, pal.warning),
+                            LogLevel::Error => paint_icon(ui.painter(), glyph, Icon::StatusErr, pal.negative),
                         }
-                        let (tr, _) =
-                            ui.allocate_exact_size(Vec2::new(TIME_COL_W, 16.0), Sense::hover());
+                        let (tr, _) = ui.allocate_exact_size(Vec2::new(TIME_COL_W, row_h), Sense::hover());
                         ui.painter().text(
                             tr.left_center(),
                             egui::Align2::LEFT_CENTER,
                             clock(line.ts),
                             fonts::mono_id(11.0),
-                            pal.faint,
+                            if mark > 0.0 { pal.text } else { pal.faint },
                         );
-                        ui.scope(|ui| {
+                        ui.vertical(|ui| {
                             ui.set_max_width(text_w);
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(&line.text)
-                                        .font(fonts::mono_id(11.5))
-                                        .color(level_color(pal, line.level)),
-                                )
-                                .wrap(),
-                            );
+                            ui.spacing_mut().item_spacing.y = 3.0;
+                            message_text(ui, pal, line, job, folded.as_ref(), id, actions);
+                            if retry {
+                                if let Some(job) = job {
+                                    let r = super::serverstrip::strip_button(
+                                        ui,
+                                        pal,
+                                        Some(Icon::RetryBackup),
+                                        "Retry on backup",
+                                        false,
+                                        true,
+                                    )
+                                    .on_hover_text(super::serverstrip::backup_retry_explainer(&backup_servers));
+                                    if r.clicked() {
+                                        actions.push(Action::RetryOnBackup(job.id));
+                                    }
+                                }
+                            }
                         });
                     })
-                    .response;
-                // A line about a job opens that job.
-                if let Some(job) = line.job_id.and_then(|id| data.jobs.iter().find(|j| j.id == id)) {
-                    let click = ui
-                        .interact(row.rect, row.id.with("open"), Sense::click())
-                        .on_hover_cursor(egui::CursorIcon::PointingHand)
-                        .on_hover_text(format!("Show {}", job.name));
-                    if click.hovered() {
-                        ui.painter().rect_stroke(
-                            row.rect.expand(1.0),
-                            CornerRadius::same(3),
-                            Stroke::new(1.0, pal.border_strong),
-                            StrokeKind::Outside,
-                        );
-                    }
-                    if click.clicked() {
-                        actions.push(Action::ShowJob(job.id));
-                    }
-                }
-                let row = row.rect;
-                if fade > 0.0 {
-                    ui.painter().rect_filled(
-                        row.expand2(Vec2::new(2.0, 1.0)),
-                        CornerRadius::same(3),
-                        Palette::fade(pal.accent_soft, fade),
+                    .response
+                    .rect;
+                if mark > 0.0 {
+                    // Across the whole log width, so a short line reads as marked too.
+                    let band = Rect::from_min_max(
+                        Pos2::new(row.left() - 3.0, row.top() - 1.5),
+                        Pos2::new(ui.max_rect().right(), row.bottom() + 1.5),
                     );
-                    ui.painter().rect_stroke(
-                        row.expand2(Vec2::new(2.0, 1.0)),
-                        CornerRadius::same(3),
-                        Stroke::new(1.0, Palette::fade(pal.accent_fg, fade * 0.6)),
-                        StrokeKind::Outside,
+                    let bar = Rect::from_min_size(band.min, Vec2::new(2.0, band.height()));
+                    ui.painter().set(
+                        backdrop,
+                        Shape::Vec(vec![
+                            Shape::rect_filled(band, CornerRadius::same(3), Palette::fade(pal.accent_soft, 0.85 * mark)),
+                            Shape::rect_filled(bar, CornerRadius::same(1), Palette::fade(pal.accent, mark)),
+                        ]),
                     );
                 }
             }
@@ -1097,29 +933,93 @@ fn messages(ui: &mut Ui, pal: &Palette, data: &Data, filter: LogFilter, animate:
     if first_frame {
         ctx.data_mut(|d| d.insert_temp(seen_key, true));
     }
+    if marked {
+        ctx.request_repaint_after(if animate { MOTION_FRAME } else { std::time::Duration::from_millis(500) });
+    }
 }
 
-/// One row of stat tiles: this session's articles (real counts from engine events,
-/// never estimates) and the lifetime download total. Job counts live on the History tab.
-fn account(ui: &mut Ui, pal: &Palette, data: &Data) {
-    let stats = [
-        Stat::new(data.articles_fetched.to_string(), "Articles", pal.text),
-        Stat::new(
-            data.articles_missing.to_string(),
-            "Missing",
-            if data.articles_missing > 0 {
-                pal.warning
-            } else {
-                pal.text
-            },
-        ),
-        Stat::new(
-            format::bytes(data.totals.downloaded_bytes),
-            "Downloaded",
-            pal.text,
-        ),
-    ];
-    tiles(ui, pal, &stats, 3, false);
+/// The text column of one log line: the line (or its folded summary with a disclosure
+/// and, when open, the ids with a copy button). A line about a job opens that job.
+fn message_text(
+    ui: &mut Ui,
+    pal: &Palette,
+    line: &LogLine,
+    job: Option<&Job>,
+    folded: Option<&IdList>,
+    id: Id,
+    actions: &mut Vec<Action>,
+) {
+    let color = level_color(pal, line.level);
+    let font = fonts::mono_id(12.0);
+    let open_key = id.with("open");
+    let open = ui.ctx().data(|d| d.get_temp::<bool>(open_key)).unwrap_or(false);
+    let text = folded.map_or_else(|| line.text.clone(), IdList::summary);
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        let label = egui::Label::new(RichText::new(&text).font(font.clone()).color(color)).wrap();
+        let resp = match job {
+            Some(_) => ui.add(label.sense(Sense::click()).selectable(false)),
+            None => ui.add(label),
+        };
+        if let Some(job) = job {
+            let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(format!("Show {}", job.name));
+            if resp.hovered() {
+                ui.painter().line_segment(
+                    [resp.rect.left_bottom(), resp.rect.right_bottom()],
+                    Stroke::new(1.0, Palette::fade(color, 0.5)),
+                );
+            }
+            if resp.clicked() {
+                actions.push(Action::ShowJob(job.id));
+            }
+        }
+        if let Some(f) = folded {
+            let what = format!("{} {}", if open { "Hide" } else { "Show" }, if f.ids.len() as u64 == f.count { "ids" } else { "first ids" });
+            let r = ui.add(
+                egui::Button::new(
+                    RichText::new(format!("{} {what}", if open { "▾" } else { "▸" }))
+                        .font(fonts::mono_id(11.0))
+                        .color(pal.accent_fg),
+                )
+                .frame(false),
+            );
+            if r.clicked() {
+                ui.ctx().data_mut(|d| d.insert_temp(open_key, !open));
+            }
+        }
+    });
+    if let (Some(f), true) = (folded, open) {
+        egui::Frame::new()
+            .fill(pal.sunken)
+            .corner_radius(CornerRadius::same(4))
+            .inner_margin(egui::Margin::symmetric(8, 6))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = Vec2::new(14.0, 3.0);
+                    for mid in &f.ids {
+                        ui.add(egui::Label::new(RichText::new(format!("<{mid}>")).font(fonts::mono_id(11.0)).color(pal.muted)));
+                    }
+                });
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 10.0;
+                    let note = if (f.ids.len() as u64) < f.count {
+                        format!("{} of {} ids are listed in this message", f.ids.len(), f.count)
+                    } else {
+                        format!("all {} listed", f.count)
+                    };
+                    ui.label(RichText::new(note).font(fonts::mono_id(10.5)).color(pal.faint));
+                    if ui
+                        .add(egui::Button::new(RichText::new("Copy ids").font(fonts::mono_id(10.5)).color(pal.accent_fg)).frame(false))
+                        .clicked()
+                    {
+                        let ids: Vec<String> = f.ids.iter().map(|m| format!("<{m}>")).collect();
+                        ui.ctx().copy_text(ids.join("\n"));
+                    }
+                });
+            });
+    }
 }
 
 /// The selected job: its facts and per-file progress.
@@ -1427,6 +1327,48 @@ mod tests {
         assert_eq!(heat_alpha(10.0, 10.0), Some(1.0));
         let low = heat_alpha(1.0, 10.0).unwrap();
         assert!((0.3..0.4).contains(&low), "{low}");
+    }
+
+    #[test]
+    fn id_lists_fold_into_a_summary() {
+        let f = split_id_list("regret-gf.r01: 66 missing article(s): <a@x>, <b@x>, <c@x>, ...").unwrap();
+        assert_eq!(f.summary(), "regret-gf.r01: 66 missing articles");
+        assert_eq!(f.ids, ["a@x", "b@x", "c@x"]);
+        let f = split_id_list("m: 7 missing articles: id1@x, id2@x, ... (+5 more); trying a PAR2 repair").unwrap();
+        assert_eq!(f.summary(), "m: 7 missing articles; trying a PAR2 repair");
+        assert_eq!(f.ids, ["id1@x", "id2@x"]);
+        let f = split_id_list("failed m: 2 missing articles: id1@x, id2@x").unwrap();
+        assert_eq!((f.count, f.lead.as_str()), (2, "failed m: "));
+        // One id, or no list at all: nothing to fold.
+        assert_eq!(split_id_list("1 missing article: gone@x"), None);
+        assert_eq!(split_id_list("regret-gf.r01: 66 missing articles"), None);
+        assert_eq!(split_id_list("started job"), None);
+    }
+
+    #[test]
+    fn new_mark_holds_then_eases_and_respects_reduced_motion() {
+        assert_eq!(new_mark(f64::NEG_INFINITY, true), 0.0);
+        assert_eq!(new_mark(-1.0, true), 0.0);
+        assert_eq!(new_mark(0.0, true), 1.0);
+        assert_eq!(new_mark(1.0, true), 1.0);
+        let mid = new_mark(4.0, true);
+        assert!(mid > 0.0 && mid < 1.0, "{mid}");
+        assert_eq!(new_mark(MESSAGE_NEW_SECS, true), 0.0);
+        // Reduced motion: still at full strength until it goes.
+        assert_eq!(new_mark(5.9, false), 1.0);
+        assert_eq!(new_mark(6.1, false), 0.0);
+    }
+
+    #[test]
+    fn the_log_takes_the_rest_of_the_row() {
+        let (t, d, l) = row_widths(1600.0, false);
+        assert_eq!(d, 0.0);
+        assert!(l > 3.0 * t, "{t} {l}");
+        assert_eq!(t + l + DOCK_GAP, 1600.0);
+        let (t, d, l) = row_widths(944.0, true);
+        assert!(t >= THROUGHPUT_MIN_W && d >= DETAILS_MIN_W && l > 0.0);
+        assert_eq!(t + d + l + 2.0 * DOCK_GAP, 944.0);
+        assert_eq!(row_widths(f32::NAN, true).2, 0.0);
     }
 
     #[test]

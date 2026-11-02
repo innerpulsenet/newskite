@@ -29,8 +29,6 @@ thiserror.workspace = true
 eframe = { version = "0.33.3", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland", "x11"] }
 egui_extras = { version = "0.33.3", default-features = false, features = ["svg"] }
 clap = { version = "4.6", features = ["derive"] }
-rfd = "0.17"
-open = "5.3"
 serde_json.workspace = true
 chrono = { version = "0.4.41", default-features = false, features = ["clock", "std"] }
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
@@ -43,6 +41,14 @@ rustix = { version = "1.1.2", default-features = false, features = ["fs", "std"]
 # Same winit as eframe; used only to pick its X11 backend (file drag and drop).
 winit = { version = "0.30.13", default-features = false, features = ["x11"] }
 notify-rust = { version = "4.11", default-features = false, features = ["z"] }
+# File pickers, opening folders/files/pages: the XDG portal and FileManager1 over D-Bus
+# (pure Rust, the same client the theme watcher uses); no helper programs.
+zbus = { version = "5.19", default-features = false, features = ["async-io", "blocking-api"] }
+
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+# The platform dialogs and launchers where there is no D-Bus.
+rfd = "0.17"
+open = "5.3"
 
 [dev-dependencies]
 egui_kittest = { version = "0.33.3", features = ["wgpu", "snapshot"] }
@@ -66,8 +72,8 @@ priority = "optional"
 # $auto finds the libraries linked at build time (libc, libgcc). winit/glutin load the
 # windowing libraries with dlopen, so those are listed explicitly.
 depends = "$auto, libgl1, libegl1, libxkbcommon0, libwayland-client0, libwayland-cursor0, libwayland-egl1, libx11-6, libxcursor1, libxrandr2, libxi6, libxkbcommon-x11-0"
-# zenity or kdialog shows a start-up error when not even a window of our own can open.
-recommends = "par2, 7zip | p7zip-full, unzip, zenity | kdialog"
+# Fallbacks only, for sets the native post-processing cannot read (see newskite-postproc).
+recommends = "par2, 7zip | p7zip-full, unzip"
 suggests = "unrar"
 extended-description = """\
 Newskite is a desktop Usenet (NZB) download client. It downloads the binary articles \

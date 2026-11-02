@@ -1,7 +1,8 @@
 //! The egui/eframe desktop window (outline §5–§7), branded with the innerpulse kit.
 //!
 //! Layout: toolbar with the masthead (top), the Queue/History tables in the center,
-//! three bottom docks (throughput, details, log) and a status bar. All colors come from theme tokens via
+//! the bottom docks (throughput, details while a job is selected, a wide log), the server
+//! strip and a status bar. All colors come from theme tokens via
 //! [`theme::Palette`]; only [`theme`] converts colors and only it and [`brand_tokens`]
 //! hold literal color values.
 
@@ -18,6 +19,7 @@ pub mod icons;
 pub mod inspector;
 pub mod motion;
 pub mod queue;
+pub mod serverstrip;
 pub mod settings;
 pub mod statusbar;
 pub mod theme;

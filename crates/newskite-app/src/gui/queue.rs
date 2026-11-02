@@ -53,7 +53,7 @@ const NAME_MIN: f32 = 150.0;
 const PROGRESS_MIN: f32 = 110.0;
 const PROGRESS_MAX: f32 = 240.0;
 /// History table: actions column.
-const HISTORY_ACTIONS_W: f32 = 140.0;
+const HISTORY_ACTIONS_W: f32 = 166.0;
 /// History table: result chip plus its qualifier.
 const RESULT_W: f32 = 120.0;
 /// History table: finish time.
@@ -805,7 +805,7 @@ fn history_tab(
                                 .on_hover_text("Finished before finish times were recorded");
                         }
                     });
-                    row.col(|ui| history_actions(ui, pal, job, &mut view.queue, actions));
+                    row.col(|ui| history_actions(ui, pal, data, job, &mut view.queue, actions));
                     let resp = row.response();
                     if resp.double_clicked() {
                         actions.push(Action::OpenJobFolder(job.id));
@@ -1092,6 +1092,7 @@ fn controls_cell(
 fn history_actions(
     ui: &mut Ui,
     pal: &Palette,
+    data: &Data,
     job: &Job,
     q: &mut QueueState,
     actions: &mut Vec<Action>,
@@ -1114,6 +1115,13 @@ fn history_actions(
         .clicked()
         {
             actions.push(Action::RetryJob(job.id));
+        }
+        let servers = data.settings.usable_servers();
+        let tip = format!("Retry on the backup server: {}", super::serverstrip::backup_retry_explainer(&servers));
+        let color = if servers.len() >= 2 { pal.accent_fg } else { pal.faint };
+        let r = icon_button(ui, pal, Icon::RetryBackup, color, &tip);
+        if r.clicked() && servers.len() >= 2 {
+            actions.push(Action::RetryOnBackup(job.id));
         }
         let (color, tip) = if job.password.is_some() {
             (pal.text, "Change archive password (one is set)")

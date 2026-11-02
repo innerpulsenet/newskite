@@ -44,6 +44,8 @@ pub enum Icon {
     Close,
     /// Circular arrow (kit `refresh`), for Retry.
     Retry,
+    /// Return arrow over a server box (drawn here): retry on the backup server.
+    RetryBackup,
     /// Key (drawn here).
     Key,
     /// Bin with a lid (drawn here): delete files.
@@ -72,7 +74,7 @@ pub enum Icon {
 
 impl Icon {
     /// Every icon (for registration and tests).
-    pub const ALL: [Icon; 26] = [
+    pub const ALL: [Icon; 27] = [
         Icon::Search,
         Icon::Scan,
         Icon::More,
@@ -87,6 +89,7 @@ impl Icon {
         Icon::Plus,
         Icon::Close,
         Icon::Retry,
+        Icon::RetryBackup,
         Icon::Key,
         Icon::Trash,
         Icon::ChevronDown,
@@ -110,6 +113,7 @@ impl Icon {
             Icon::ToTop => "bytes://newskite/icon/to-top.svg",
             Icon::ToBottom => "bytes://newskite/icon/to-bottom.svg",
             Icon::Retry => "bytes://newskite/icon/refresh.svg",
+            Icon::RetryBackup => "bytes://newskite/icon/retry-backup.svg",
             Icon::OpenNzb => "bytes://newskite/icon/open-nzb.svg",
             Icon::Folder => "bytes://newskite/icon/folder.svg",
             Icon::Transfers => "bytes://newskite/icon/download.svg",
@@ -152,6 +156,7 @@ impl Icon {
             Icon::ToBottom => drawn("M5.5 19.5h13M6.5 9l5.5 5.5 5.5-5.5M12 14.5v-10"),
             Icon::OpenNzb => drawn("M13.5 3.5H6v17h12V8zM13.5 3.5V8H18M12 11.5v6M9 14.5h6"),
             Icon::Folder => drawn("M3.5 5.5h6l2 2.5h9v11.5h-17z"),
+            Icon::RetryBackup => drawn("M4.5 14.5h15v5h-15zM7.5 17h.1M10.5 17h6M5.5 10a6.5 6.5 0 0 1 12.2-3M18.5 3.5v4h-4"),
             Icon::Key => drawn(
                 "M10.5 12a3.5 3.5 0 1 1-7 0a3.5 3.5 0 1 1 7 0M10.5 12h10M17.5 12v3M20.5 12v2.5",
             ),

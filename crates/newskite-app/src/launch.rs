@@ -151,7 +151,7 @@ fn strip_query_and_fragment(s: &str) -> &str {
 }
 
 /// Turns the part of a `file:` URI after the scheme into a local path.
-fn file_uri_path(rest: &str) -> Result<PathBuf, &'static str> {
+pub(crate) fn file_uri_path(rest: &str) -> Result<PathBuf, &'static str> {
     // file:///abs, file://localhost/abs (any case), file:/abs
     let rest = strip_query_and_fragment(rest);
     let path = match rest.strip_prefix("//") {
