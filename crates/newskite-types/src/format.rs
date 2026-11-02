@@ -48,9 +48,49 @@ pub fn duration_secs(secs: u64) -> String {
     if h > 0 { format!("{h}:{m:02}:{s:02}") } else { format!("{m}:{s:02}") }
 }
 
+/// Compact human duration: `45s`, `8m 12s`, `2h 05m`, `3d 4h`.
+pub fn duration_short(secs: u64) -> String {
+    let (d, h, m, s) = (secs / 86400, (secs % 86400) / 3600, (secs % 3600) / 60, secs % 60);
+    if d > 0 {
+        format!("{d}d {h}h")
+    } else if h > 0 {
+        format!("{h}h {m:02}m")
+    } else if m > 0 {
+        format!("{m}m {s:02}s")
+    } else {
+        format!("{s}s")
+    }
+}
+
+/// How long ago `then` was, relative to `now` (unix seconds): `just now`, `5 min ago`,
+/// `3 h ago`, `yesterday`, `4 days ago`.
+pub fn ago(then: i64, now: i64) -> String {
+    let d = (now - then).max(0);
+    match d {
+        0..=44 => "just now".into(),
+        45..=3599 => format!("{} min ago", (d + 30) / 60),
+        3600..=86_399 => format!("{} h ago", d / 3600),
+        86_400..=172_799 => "yesterday".into(),
+        _ => format!("{} days ago", d / 86_400),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn short_durations_and_ago() {
+        assert_eq!(duration_short(45), "45s");
+        assert_eq!(duration_short(492), "8m 12s");
+        assert_eq!(duration_short(7500), "2h 05m");
+        assert_eq!(duration_short(3 * 86400 + 4 * 3600), "3d 4h");
+        assert_eq!(ago(100, 110), "just now");
+        assert_eq!(ago(0, 300), "5 min ago");
+        assert_eq!(ago(0, 3 * 3600 + 5), "3 h ago");
+        assert_eq!(ago(0, 90_000), "yesterday");
+        assert_eq!(ago(0, 5 * 86_400), "5 days ago");
+    }
 
     #[test]
     fn formats() {

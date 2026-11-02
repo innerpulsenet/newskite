@@ -5,9 +5,11 @@
 pub mod config;
 pub mod events;
 pub mod format;
+pub mod outcome;
 
 pub use config::{PostProcessSettings, ServerConfig, Settings};
 pub use events::EngineEvent;
+pub use outcome::{FailureKind, JobOutcome, ServerHealth, StepRecord, StepState};
 
 /// Application name used for data/config directories and window titles.
 pub const APP_NAME: &str = "Newskite";

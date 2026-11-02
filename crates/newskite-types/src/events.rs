@@ -14,4 +14,6 @@ pub enum EngineEvent {
     FileFailed { name: String, missing: Vec<String> },
     /// Human-readable engine line (job started, server fail-over, ...).
     Log(String),
+    /// A problem that did not stop the download (retries, missing articles, CRC errors).
+    Warn(String),
 }
