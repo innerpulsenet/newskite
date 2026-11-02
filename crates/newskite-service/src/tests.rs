@@ -182,6 +182,38 @@ async fn runtime_settings_override_is_used_but_never_persisted() {
     assert!(!svc.has_runtime_settings_override());
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_speed_limit_is_live_and_saved() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut settings = test_settings(tmp.path(), vec![]);
+    settings.speed_limit_kbps = 100;
+    let svc = open_service(tmp.path(), settings);
+    // The stored limit is in force from the start.
+    assert_eq!(svc.speed_limit_bps(), 100 * 1024);
+    // Engines hold the same value, so a change reaches a running download.
+    let engine_side = svc.inner.speed_limit.clone();
+
+    svc.set_speed_limit_kbps(25 * 1024).unwrap();
+    assert_eq!(svc.speed_limit_bps(), 25 * 1024 * 1024);
+    assert_eq!(engine_side.get(), 25 * 1024 * 1024);
+    assert_eq!(svc.settings().speed_limit_kbps, 25 * 1024, "saved");
+    assert!(svc.logs().iter().any(|l| l.text == "speed limit 25.0 MB/s"), "{:?}", svc.logs());
+
+    // A save from the Settings sheet applies at once too.
+    let mut s = svc.settings();
+    s.speed_limit_kbps = 0;
+    svc.save_settings(s).unwrap();
+    assert_eq!(engine_side.get(), 0, "unlimited");
+
+    // The headless override wins while set, and the stored value comes back after.
+    let mut over = svc.settings();
+    over.speed_limit_kbps = 7;
+    svc.set_runtime_settings_override(Some(over));
+    assert_eq!(engine_side.get(), 7 * 1024);
+    svc.set_runtime_settings_override(None);
+    assert_eq!(engine_side.get(), 0);
+}
+
 /// An older job that was retried must still block a re-import of the same NZB, even when a
 /// newer job for that NZB is already done.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -84,7 +84,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use newskite_engine::{ConnectionPool, Progress};
+use newskite_engine::{ConnectionPool, Progress, SpeedLimit};
 use newskite_nzb::NzbError;
 pub use newskite_postproc::PostStage;
 use newskite_types::{format, EngineEvent, ServerConfig, Settings};
@@ -369,6 +369,9 @@ pub(crate) struct Inner {
     /// In-memory settings used instead of the stored document (never persisted); set by
     /// [`Service::set_runtime_settings_override`] (the headless CLI).
     settings_override: Mutex<Option<Settings>>,
+    /// The speed limit every job's engine reads as it runs; kept equal to the effective
+    /// settings' limit (set on save, on override and at each job's start).
+    pub(crate) speed_limit: SpeedLimit,
     /// Jobs requeued by [`Service::retry_job_on_backup`], with the articles they were
     /// missing before: their next download asks the fail-over servers first. Cleared when that download ends (not when it is merely
     /// interrupted, so a paused backup retry resumes as one).
@@ -640,9 +643,11 @@ impl Service {
             settings_error_logged: AtomicBool::new(false),
             sampler_error_logged: AtomicBool::new(false),
             settings_override: Mutex::new(None),
+            speed_limit: SpeedLimit::default(),
             backup_first: Mutex::new(HashMap::new()),
             articles: Mutex::new(HashMap::new()),
         });
+        inner.speed_limit.set(inner.settings().speed_limit_bps());
         match inner.store.reset_interrupted() {
             Ok(0) => {}
             Ok(n) => inner.log(
@@ -1184,9 +1189,43 @@ impl Service {
     /// override instead of the stored document. The override is normalized, is never
     /// written to the database and is never logged (it may carry server passwords). Used
     /// by the headless CLI for `--server`/`--dest`. Like saved settings, it applies from
-    /// the next job.
+    /// the next job, except the speed limit, which applies at once.
     pub fn set_runtime_settings_override(&self, s: Option<Settings>) {
         *lock(&self.inner.settings_override) = s.map(Settings::normalized);
+        self.inner.speed_limit.set(self.inner.settings().speed_limit_bps());
+    }
+
+    /// The speed limit in force now, in bytes per second (0 = unlimited).
+    pub fn speed_limit_bps(&self) -> u64 {
+        self.inner.speed_limit.get()
+    }
+
+    /// Sets the speed limit (KiB/s, 0 = unlimited) for downloads running now and later,
+    /// and saves it in the settings. When the stored settings cannot be read the limit
+    /// still applies, for this session only (saving would replace them with defaults).
+    pub fn set_speed_limit_kbps(&self, kbps: u64) -> Result<(), ServiceError> {
+        let mut s = match self.inner.store.load_settings() {
+            Ok(s) => s,
+            Err(e) => {
+                self.inner.speed_limit.set(kbps.saturating_mul(1024));
+                self.inner.log(
+                    LogLevel::Warn,
+                    format!("speed limit applied for this session only: the settings cannot be read ({e})"),
+                );
+                return Err(e.into());
+            }
+        };
+        s.speed_limit_kbps = kbps;
+        self.save_settings(s)?;
+        self.inner.log(
+            LogLevel::Info,
+            if kbps == 0 {
+                "speed limit off".to_owned()
+            } else {
+                format!("speed limit {}/s", format::bytes(kbps.saturating_mul(1024)))
+            },
+        );
+        Ok(())
     }
 
     /// `true` while a runtime settings override is set.
@@ -1195,13 +1234,16 @@ impl Service {
     }
 
     /// Normalizes and persists the settings. They apply to the next job (a running job
-    /// keeps its servers, connections and speed limit).
+    /// keeps its servers and connections), except the speed limit, which running
+    /// downloads follow at once.
     /// When the stored document cannot be loaded, it is kept as a backup row first (see
     /// [`Store::save_settings`]) and a warning names the backup key.
     pub fn save_settings(&self, s: Settings) -> Result<(), ServiceError> {
         let was_unreadable = self.inner.store.load_settings().is_err();
         match self.inner.store.save_settings(&s.normalized()) {
             Ok(()) => {
+                // Running downloads follow a new limit at once (the rest from the next job).
+                self.inner.speed_limit.set(self.inner.settings().speed_limit_bps());
                 self.inner.settings_error_logged.store(false, Ordering::Relaxed);
                 self.inner.log(LogLevel::Info, "settings saved");
                 if was_unreadable {

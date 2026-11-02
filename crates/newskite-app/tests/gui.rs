@@ -1427,7 +1427,14 @@ fn server_cards_name_the_primary_and_can_promote_a_backup() {
     let mut h = fx.harness(true, SIZE);
     h.run_steps(2);
     h.state_mut().as_mut().expect("app").push_action(Action::OpenSettings);
-    h.run_steps(4);
+    h.run_steps(2);
+    {
+        // Fixed display paths: the fixture's temporary folder has a random name.
+        let d = h.state_mut().as_mut().expect("app").view.settings.as_mut().expect("sheet open");
+        d.download_dir = "/home/reader/Downloads/Newskite".into();
+        d.watch_folder = "/home/reader/Downloads/NZB".into();
+    }
+    h.run_steps(2);
     h.get_by_label("primary");
     h.get_by_label("fail-over");
     assert_eq!(h.get_all_by_label("Make primary").count(), 1, "only rows below the top");
@@ -1448,6 +1455,30 @@ fn server_cards_name_the_primary_and_can_promote_a_backup() {
     assert_eq!(hosts, ["news.backup-provider.example", "newshosting.tweaknews.example"]);
     // Saved only with the sheet: the service still has the old order.
     assert_eq!(fx.service.settings().servers[0].host, "newshosting.tweaknews.example");
+}
+
+#[test]
+fn the_status_bar_sets_a_speed_limit_at_once() {
+    let fx = Fixture::new(seed_populated);
+    let mut h = fx.harness(true, SIZE);
+    h.run_steps(3);
+    let reading = app(&h).data.status.running;
+    assert!(!reading);
+    h.get_by_label_contains("peak").click();
+    h.run_steps(2);
+    h.get_by_label("Unlimited");
+    assert_no_bad_numbers(&h);
+    snapshot(&mut h, "speed-menu-dark");
+    h.get_by_label("25.0 MB/s").click();
+    h.run_steps(2);
+    assert_eq!(fx.service.speed_limit_bps(), 25 * 1024 * 1024, "in force");
+    assert_eq!(fx.service.settings().speed_limit_kbps, 25 * 1024, "saved");
+    h.get_by_label("Idle  ·  limit 25.0 MB/s").click();
+    h.run_steps(2);
+    h.get_by_label("Unlimited").click();
+    h.run_steps(2);
+    assert_eq!(fx.service.speed_limit_bps(), 0);
+    h.get_by_label_contains("peak");
 }
 
 #[test]

@@ -748,7 +748,7 @@ fn performance_section(ui: &mut Ui, pal: &Palette, s: &mut Settings) {
                 ui.end_row();
             });
         ui.label(
-            RichText::new("Changes apply from the next job.")
+            RichText::new("A new speed limit applies to running downloads at once (also from the status bar); the rest from the next job.")
                 .small()
                 .color(pal.muted),
         );
