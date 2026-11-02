@@ -24,8 +24,10 @@ use super::app::{Action, Data, HISTORY_SECS, LIVE_WINDOW_SECS};
 use super::fonts;
 use super::queue::eta_secs;
 use super::theme::Palette;
+use super::motion;
 use super::widgets::{
-    card, icon_button, paint_icon, section_title, segment_track, spaced, state_badge, Icon,
+    card, icon_button, paint_icon, section_title, segment_track, segmented, spaced, state_badge,
+    Icon,
 };
 
 /// Width at which the three docks sit side by side (below: one scrolling column).
@@ -451,17 +453,18 @@ pub fn show(
 }
 
 fn log_filter_chips(ui: &mut Ui, pal: &Palette, filter: &mut LogFilter) {
-    ui.spacing_mut().item_spacing.x = 2.0;
-    // Right to left: the last chip is drawn first.
-    for f in LogFilter::ALL.iter().rev() {
-        let on = *filter == *f;
-        let text = RichText::new(f.label())
-            .font(fonts::mono_id(10.5))
-            .color(if on { pal.text } else { pal.faint });
-        let resp = ui.add(egui::Button::selectable(on, text).corner_radius(CornerRadius::same(4)));
-        if resp.clicked() {
-            *filter = *f;
-        }
+    let options: Vec<(LogFilter, &str)> = LogFilter::ALL.iter().map(|f| (*f, f.label())).collect();
+    if let Some(f) = segmented(ui, pal, Id::new("log-filter"), &options, *filter) {
+        *filter = f;
+    }
+}
+
+/// `"now"`, `"12 s ago"` or `"3 min 5 s ago"` for a sample `secs` old.
+fn sample_age(secs: i64) -> String {
+    match secs.max(0) {
+        0 => "now".to_owned(),
+        s if s < 60 => format!("{s} s ago"),
+        s => format!("{} min {} s ago", s / 60, s % 60),
     }
 }
 
@@ -513,10 +516,12 @@ fn graph(ui: &mut Ui, pal: &Palette, data: &Data, motion: Motion) {
     ui.spacing_mut().item_spacing.y = 0.0;
     let speed = data.speed();
     let left = data.bytes_left();
+    // The figure counts to each new reading instead of jumping.
+    let shown = motion::ease_to(ui.ctx(), Id::new("graph-speed"), speed as f32, 0.5, !motion.animate);
     ui.horizontal(|ui| {
         ui.label(
-            RichText::new(format::speed(speed))
-                .font(FontId::new(17.0, fonts::mono_semibold()))
+            RichText::new(format::speed(shown.round().max(0.0) as u64))
+                .font(FontId::new(19.0, fonts::mono_semibold()))
                 .color(pal.text),
         );
         if speed > 0 {
@@ -581,11 +586,14 @@ fn graph(ui: &mut Ui, pal: &Palette, data: &Data, motion: Motion) {
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, CornerRadius::same(4), pal.sunken);
     let inner = rect.shrink2(Vec2::new(4.0, 0.0));
-    let y_max = if live_peak > 0.0 {
+    // The scale eases to a new peak, so the trace rescales smoothly.
+    let y_target = if live_peak > 0.0 {
         live_peak * 1.12
     } else {
         1.0
     };
+    let y_max = motion::ease_to(ui.ctx(), Id::new("graph-scale"), y_target, 0.6, !motion.animate).max(1.0);
+    let mut crosshair = false;
 
     if nothing {
         painter.text(
@@ -611,7 +619,7 @@ fn graph(ui: &mut Ui, pal: &Palette, data: &Data, motion: Motion) {
                 Palette::fade(pal.series, 0.38),
                 pal.transparent,
             ));
-            painter.add(Shape::line(lp.clone(), Stroke::new(1.8, pal.series)));
+            painter.add(Shape::line(lp.clone(), Stroke::new(2.0, pal.series)));
             let end = lp[lp.len() - 1];
             if motion.moving {
                 let ring = 3.0 + 7.0 * motion.phase;
@@ -621,8 +629,37 @@ fn graph(ui: &mut Ui, pal: &Palette, data: &Data, motion: Motion) {
                     Stroke::new(1.5, Palette::fade(pal.series, pulse_alpha(motion.phase))),
                 );
             }
+            // A soft glow under the head of the trace.
+            painter.circle_filled(end, 8.0, Palette::fade(pal.series, 0.12));
+            painter.circle_filled(end, 5.0, Palette::fade(pal.series, 0.22));
             painter.circle_filled(end, 3.0, pal.series);
             painter.circle_filled(end, 1.4, pal.sunken);
+            // Hover: a crosshair on the nearest sample with its reading.
+            let start = now - LIVE_WINDOW_SECS as i64;
+            let shown: Vec<(i64, u64)> = live.iter().copied().filter(|(ts, _)| *ts >= start).collect();
+            if let (Some(p), true) = (resp.hover_pos(), shown.len() == lp.len()) {
+                let nearest = lp
+                    .iter()
+                    .enumerate()
+                    .min_by(|a, b| (a.1.x - p.x).abs().total_cmp(&(b.1.x - p.x).abs()));
+                if let Some((i, pt)) = nearest {
+                    crosshair = true;
+                    painter.vline(pt.x, rect.y_range(), Stroke::new(1.0, pal.border_strong));
+                    painter.circle_filled(*pt, 4.5, pal.series);
+                    painter.circle_stroke(*pt, 4.5, Stroke::new(1.5, pal.sunken));
+                    let (ts, v) = shown[i];
+                    let galley = painter.layout_no_wrap(
+                        format!("{}  ·  {}", format::speed(v), sample_age(now - ts)),
+                        fonts::mono_id(10.5),
+                        pal.text,
+                    );
+                    let size = galley.size() + Vec2::new(14.0, 8.0);
+                    let x = if pt.x + 10.0 + size.x <= rect.right() - 2.0 { pt.x + 10.0 } else { pt.x - 10.0 - size.x };
+                    let tag = Rect::from_min_size(Pos2::new(x.max(rect.left() + 2.0), rect.top() + 18.0), size);
+                    painter.rect(tag, CornerRadius::same(6), pal.raised, Stroke::new(1.0, pal.border_strong), egui::StrokeKind::Inside);
+                    painter.galley(tag.min + Vec2::new(7.0, 4.0), galley, pal.text);
+                }
+            }
             // Axis corner labels: the scale top-left, the time span along the bottom.
             let corner = fonts::mono_id(9.5);
             painter.text(
@@ -669,13 +706,16 @@ fn graph(ui: &mut Ui, pal: &Palette, data: &Data, motion: Motion) {
         )
     };
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, &summary));
-    resp.on_hover_text(format!(
-        "Live: last {} min, one point per second\nStrip: last 24 h in {}-minute cells, brighter = faster, idle cells empty ({} samples)\nPeak: {}",
-        LIVE_WINDOW_SECS / 60,
-        HISTORY_SECS / 60 / HISTORY_POINTS as u64,
-        data.history.len(),
-        format::speed(peak as u64)
-    ));
+    // The crosshair answers the hover itself; otherwise explain the graph.
+    if !crosshair {
+        resp.on_hover_text(format!(
+            "Live: last {} min, one point per second\nStrip: last 24 h in {}-minute cells, brighter = faster, idle cells empty ({} samples)\nPeak: {}",
+            LIVE_WINDOW_SECS / 60,
+            HISTORY_SECS / 60 / HISTORY_POINTS as u64,
+            data.history.len(),
+            format::speed(peak as u64)
+        ));
+    }
 
     if !history.is_empty() {
         ui.add_space(4.0);

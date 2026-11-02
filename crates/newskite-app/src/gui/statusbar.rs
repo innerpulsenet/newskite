@@ -148,7 +148,13 @@ pub fn show(
     );
     if st.running {
         let bar = ui.max_rect();
-        let f = pending_fraction(data);
+        let f = super::motion::ease_to(
+            ui.ctx(),
+            eframe::egui::Id::new("statusbar-pending"),
+            pending_fraction(data),
+            0.6,
+            reduced_motion,
+        );
         let y = bar.top() - 2.0;
         ui.painter().line_segment(
             [

@@ -15,11 +15,11 @@ use newskite_types::format;
 use super::app::{Action, Data, Tab, ViewState};
 use super::brand;
 use super::fonts;
-use super::motion::Beat;
+use super::motion::{self, Beat};
 use super::theme::Palette;
 use super::widgets::{
-    article_grid, icon_button, kit_button, paint_icon, segment_track_live, spaced, state_badge,
-    ButtonKind, Icon, EYEBROW_TRACKING,
+    article_grid, icon_button, keycap, kit_button, paint_icon, segment_track_live, spaced,
+    state_badge, ButtonKind, Icon, EYEBROW_TRACKING,
 };
 
 /// Seconds the just-imported job's name stays in the accent before settling.
@@ -68,6 +68,66 @@ pub fn table_widths(available: f32, gap: f32) -> (f32, f32) {
     let fixed = POS_W + STATE_W + SIZE_W + CONTROLS_W + 5.0 * gap;
     let progress = (available - fixed - NAME_MIN).clamp(PROGRESS_MIN, PROGRESS_MAX);
     (progress, fixed + NAME_MIN + progress)
+}
+
+/// Height of a job row.
+const ROW_H: f32 = 48.0;
+/// Space at the start of a row's first cell, beside the selection rail.
+const RAIL_ROOM: f32 = 10.0;
+/// Seconds a job's progress takes to glide to a new figure.
+const PROGRESS_GLIDE_SECS: f32 = 0.6;
+
+/// A job row's background, painted under its cells once they are laid out: a rounded
+/// wash that fades in on hover, the selection tint with an accent rail at the left edge,
+/// and the brief finish wash (done or failed) across the whole row.
+struct RowBg {
+    painter: egui::Painter,
+    slot: egui::layers::ShapeIdx,
+}
+
+impl RowBg {
+    /// Reserves the slot from inside the row's first cell, so the background lands under
+    /// every cell; `clip` is the table's clip rect (a cell's own clip is too narrow).
+    fn reserve(ui: &Ui, clip: egui::Rect) -> Self {
+        let mut painter = ui.painter().clone();
+        painter.set_clip_rect(clip);
+        let slot = painter.add(egui::Shape::Noop);
+        Self { painter, slot }
+    }
+
+    fn paint(&self, pal: &Palette, resp: &egui::Response, selected: bool, flash: Option<(JobState, f32)>) {
+        let ctx = &resp.ctx;
+        let hover = ctx.animate_bool(resp.id.with("row-hover"), resp.contains_pointer());
+        let sel = ctx.animate_bool(resp.id.with("row-selected"), selected);
+        let rect = resp.rect.shrink2(egui::vec2(0.0, 2.0));
+        let radius = egui::CornerRadius::same(8);
+        // A faint hairline between rows; the washes below cover it.
+        let mut shapes = vec![egui::Shape::hline(
+            (rect.left() + 10.0)..=(rect.right() - 10.0),
+            resp.rect.bottom() - 0.5,
+            egui::Stroke::new(1.0, Palette::fade(pal.border, 0.6)),
+        )];
+        if sel > 0.0 {
+            shapes.push(egui::Shape::rect_filled(rect, radius, Palette::fade(pal.accent_soft, sel)));
+        }
+        if hover > 0.0 {
+            let wash = if selected { 0.5 } else { 1.0 };
+            shapes.push(egui::Shape::rect_filled(rect, radius, Palette::fade(pal.hover, hover * wash)));
+        }
+        if let Some((state, strength)) = flash {
+            let tint = match state {
+                JobState::Failed => pal.negative_soft,
+                _ => pal.positive_soft,
+            };
+            shapes.push(egui::Shape::rect_filled(rect, radius, Palette::fade(tint, strength)));
+        }
+        if sel > 0.0 {
+            let h = (rect.height() - 16.0) * (0.4 + 0.6 * sel);
+            let rail = egui::Rect::from_center_size(egui::pos2(rect.left() + 3.5, rect.center().y), egui::vec2(3.0, h));
+            shapes.push(egui::Shape::rect_filled(rail, egui::CornerRadius::same(2), Palette::fade(pal.accent, sel)));
+        }
+        self.painter.set(self.slot, egui::Shape::Vec(shapes));
+    }
 }
 
 /// Center-area UI state.
@@ -251,11 +311,8 @@ pub fn show_center(
                 ),
             )
         };
-        let y = rect.bottom() - 1.5;
-        ui.painter().line_segment(
-            [egui::pos2(left, y), egui::pos2(right, y)],
-            egui::Stroke::new(3.0, pal.accent),
-        );
+        let rule = egui::Rect::from_x_y_ranges(left..=right, (rect.bottom() - 3.0)..=rect.bottom());
+        ui.painter().rect_filled(rule, egui::CornerRadius::same(2), pal.accent);
     }
     let r = ui.available_rect_before_wrap();
     ui.painter().line_segment(
@@ -290,9 +347,13 @@ fn tab_button(
     let pill_w = count_galley.size().x + 12.0;
     let size = egui::vec2(galley.size().x + 6.0 + pill_w + 24.0, 30.0);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
-    if resp.hovered() && !selected {
-        ui.painter()
-            .rect_filled(rect.shrink(2.0), egui::CornerRadius::same(5), pal.hover);
+    let hover = ui.ctx().animate_bool(resp.id.with("tab-hover"), resp.hovered() && !selected);
+    if hover > 0.0 {
+        ui.painter().rect_filled(
+            rect.shrink2(egui::vec2(2.0, 3.0)),
+            egui::CornerRadius::same(6),
+            Palette::fade(pal.hover, hover),
+        );
     }
     if resp.has_focus() {
         super::widgets::focus_ring(ui, pal, rect.shrink(2.0), 5);
@@ -307,12 +368,17 @@ fn tab_button(
         egui::pos2(x + galley.size().x + 6.0, rect.center().y - 9.0),
         egui::vec2(pill_w, 18.0),
     );
-    ui.painter()
-        .rect_filled(pill, egui::CornerRadius::same(9), pal.sunken);
+    let on = ui.ctx().animate_bool(resp.id.with("tab-on"), selected);
+    ui.painter().rect_filled(
+        pill,
+        egui::CornerRadius::same(9),
+        pal.sunken.lerp_to_gamma(pal.accent_soft, on),
+    );
+    let count_color = pal.muted.lerp_to_gamma(pal.accent_fg, on);
     ui.painter().galley(
         pill.center() - count_galley.size() / 2.0,
         count_galley,
-        pal.muted,
+        count_color,
     );
     let name = format!("{label} ({count})");
     resp.widget_info(|| {
@@ -468,24 +534,43 @@ fn empty_queue(
     view: &ViewState,
     actions: &mut Vec<Action>,
 ) {
-    let ambient = Beat::new(
-        ui.ctx(),
-        true,
-        view.reduced_motion,
-        brand::PERIOD_AMBIENT * 2.0,
+    let ambient = Beat::ambient(ui.ctx(), view.reduced_motion, brand::PERIOD_AMBIENT * 2.0);
+    ui.add_space(24.0);
+    // A drop zone: a dashed, rounded frame whose dashes drift slowly around it.
+    let finished = data.history().len();
+    let zone_w = (ui.available_width() - 48.0).clamp(280.0, 580.0);
+    let zone_h = if finished > 0 { 286.0 } else { 256.0 };
+    let zone = egui::Rect::from_center_size(
+        egui::pos2(ui.max_rect().center().x, ui.cursor().top() + zone_h / 2.0),
+        egui::vec2(zone_w, zone_h),
     );
-    ui.add_space(36.0);
-    ui.vertical_centered(|ui| {
+    ui.allocate_rect(zone, Sense::hover());
+    ui.painter().rect_filled(zone, egui::CornerRadius::same(16), Palette::fade(pal.raised, 0.55));
+    let drift = if ambient.moving { ambient.phase * 22.0 } else { 0.0 };
+    ui.painter().extend(egui::Shape::dashed_line_with_offset(
+        &rounded_outline(zone, 16.0),
+        egui::Stroke::new(1.5, pal.border_strong),
+        &[8.0],
+        &[6.0],
+        drift,
+    ));
+    let mut inner = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(zone.shrink2(egui::vec2(24.0, 28.0)))
+            .layout(Layout::top_down(Align::Center)),
+    );
+    let ui = &mut inner;
+    {
         article_grid(ui, pal, ambient.moving.then_some(ambient.phase));
-        ui.add_space(18.0);
-        ui.label(RichText::new(EMPTY_QUEUE).size(14.0).color(pal.muted));
-        ui.add_space(4.0);
+        ui.add_space(20.0);
+        ui.label(RichText::new(EMPTY_QUEUE).font(fonts::semibold_id(15.5)).color(pal.text));
+        ui.add_space(5.0);
         ui.label(
             RichText::new("Drop .nzb files onto the window, or set a watch folder in Settings.")
                 .small()
-                .color(pal.faint),
+                .color(pal.muted),
         );
-        ui.add_space(12.0);
+        ui.add_space(16.0);
         if kit_button(
             ui,
             pal,
@@ -499,7 +584,32 @@ fn empty_queue(
         {
             actions.push(Action::ShowOpenNzb);
         }
-        let finished = data.history().len();
+        ui.add_space(14.0);
+        // Keyboard hints, centered under the call to action.
+        let hints: [(&[&str], &str); 2] = [(&["Ctrl", "O"], "browse"), (&["Ctrl", "V"], "paste copied files")];
+        let font = egui::TextStyle::Small.resolve(ui.style());
+        let row_w: f32 = hints
+            .iter()
+            .map(|(keys, word)| {
+                keys.iter().map(|k| (k.len() as f32 * 6.5 + 10.0).max(20.0) + 3.0).sum::<f32>()
+                    + 4.0
+                    + ui.painter().layout_no_wrap((*word).to_owned(), font.clone(), pal.faint).size().x
+            })
+            .sum::<f32>()
+            + 22.0;
+        ui.allocate_ui_with_layout(egui::vec2(row_w, 22.0), Layout::left_to_right(Align::Center), |ui| {
+            ui.spacing_mut().item_spacing.x = 3.0;
+            for (i, (keys, word)) in hints.iter().enumerate() {
+                if i > 0 {
+                    ui.add_space(16.0);
+                }
+                for k in *keys {
+                    keycap(ui, pal, k);
+                }
+                ui.add_space(2.0);
+                ui.label(RichText::new(*word).small().color(pal.faint));
+            }
+        });
         if finished > 0 {
             ui.add_space(8.0);
             if kit_button(
@@ -515,7 +625,28 @@ fn empty_queue(
                 actions.push(Action::SetTab(Tab::History));
             }
         }
-    });
+    }
+}
+
+/// Points around `rect` with corners of `radius`, closed (for dashed outlines).
+pub(crate) fn rounded_outline(rect: egui::Rect, radius: f32) -> Vec<egui::Pos2> {
+    const STEPS: usize = 6;
+    let r = radius.min(rect.width() / 2.0).min(rect.height() / 2.0);
+    let corners = [
+        (egui::pos2(rect.right() - r, rect.top() + r), -90.0f32),
+        (egui::pos2(rect.right() - r, rect.bottom() - r), 0.0),
+        (egui::pos2(rect.left() + r, rect.bottom() - r), 90.0),
+        (egui::pos2(rect.left() + r, rect.top() + r), 180.0),
+    ];
+    let mut pts = vec![egui::pos2(rect.left() + r, rect.top())];
+    for (c, start) in corners {
+        for s in 0..=STEPS {
+            let a = (start + 90.0 * s as f32 / STEPS as f32).to_radians();
+            pts.push(c + egui::vec2(a.cos(), a.sin()) * r);
+        }
+    }
+    pts.push(pts[0]);
+    pts
 }
 
 fn no_match(ui: &mut Ui, pal: &Palette, filter: &str) {
@@ -531,8 +662,12 @@ fn no_match(ui: &mut Ui, pal: &Palette, filter: &str) {
 
 /// The eyebrow header row of a job table.
 fn header_labels(h: &mut egui_extras::TableRow<'_, '_>, pal: &Palette, labels: &[&str]) {
-    for t in labels {
+    for (i, t) in labels.iter().enumerate() {
         h.col(|ui| {
+            if i == 0 {
+                // Lines up with the rows' first cell (see RAIL_ROOM).
+                ui.add_space(RAIL_ROOM);
+            }
             let job = spaced(
                 &t.to_uppercase(),
                 fonts::mono_id(11.0),
@@ -579,11 +714,9 @@ fn queue_table(
     // inspector opened beside the table.
     let gap = ui.spacing().item_spacing.x;
     let name_w = (ui.available_width() - (POS_W + STATE_W + SIZE_W + progress_w + CONTROLS_W + 5.0 * gap)).max(NAME_MIN);
-    // A tinted selection keeps the row's colored sublines (errors, live speed) readable.
-    ui.visuals_mut().selection.bg_fill = pal.accent_soft;
     TableBuilder::new(ui)
         .id_salt("queue-table")
-        .striped(true)
+        .striped(false)
         .resizable(false)
         .sense(Sense::click())
         .cell_layout(Layout::left_to_right(Align::Center))
@@ -597,11 +730,17 @@ fn queue_table(
             header_labels(&mut h, pal, &["#", "Name", "State", "Size", "Progress", ""])
         })
         .body(|mut body| {
+            let clip = body.ui_mut().clip_rect();
             for &job in jobs {
                 let pos = order.iter().position(|&id| id == job.id);
-                body.row(42.0, |mut row| {
-                    row.set_selected(view.queue.selected == Some(job.id));
+                body.row(ROW_H, |mut row| {
+                    // The row paints its own hover and selection (see RowBg).
+                    row.set_hovered(false);
+                    let mut bg = None;
                     row.col(|ui| {
+                        bg = Some(RowBg::reserve(ui, clip));
+                        // Room for the selection rail before the position.
+                        ui.add_space(RAIL_ROOM);
                         ui.label(
                             RichText::new(pos.map_or("–".to_owned(), |p| (p + 1).to_string()))
                                 .font(fonts::mono_id(12.0))
@@ -618,7 +757,7 @@ fn queue_table(
                             None
                         };
                         let live = live_subline(job, data.shown_done(job), data.speed());
-                        name_cell(ui, pal, job, highlight, None, live);
+                        name_cell(ui, pal, job, highlight, live);
                     });
                     row.col(|ui| {
                         let r = state_badge(ui, pal, job.state);
@@ -638,6 +777,9 @@ fn queue_table(
                     row.col(|ui| progress_cell(ui, pal, data, job, progress_w - 8.0, busy));
                     row.col(|ui| controls_cell(ui, pal, data, job, &mut view.queue, actions));
                     let resp = row.response();
+                    if let Some(bg) = &bg {
+                        bg.paint(pal, &resp, view.queue.selected == Some(job.id), None);
+                    }
                     if resp.clicked() {
                         actions.push(Action::Select(Some(job.id)));
                     }
@@ -748,11 +890,9 @@ fn history_tab(
     let gap = ui.spacing().item_spacing.x;
     let name_w = (ui.available_width() - (RESULT_W + SIZE_W + FINISHED_W + HISTORY_ACTIONS_W + 4.0 * gap)).max(NAME_MIN);
     let now_unix = now_unix();
-    // A tinted selection keeps the row's colored sublines (errors, live speed) readable.
-    ui.visuals_mut().selection.bg_fill = pal.accent_soft;
     TableBuilder::new(ui)
         .id_salt("history-table")
-        .striped(true)
+        .striped(false)
         .resizable(false)
         .sense(Sense::click())
         .cell_layout(Layout::left_to_right(Align::Center))
@@ -765,16 +905,15 @@ fn history_tab(
             header_labels(&mut h, pal, &["Name", "Result", "Size", "Finished", ""])
         })
         .body(|mut body| {
+            let clip = body.ui_mut().clip_rect();
             for job in jobs {
-                body.row(42.0, |mut row| {
-                    row.set_selected(view.queue.selected == Some(job.id));
+                body.row(ROW_H, |mut row| {
+                    row.set_hovered(false);
+                    let mut bg = None;
                     row.col(|ui| {
-                        let flash = if reduced {
-                            None
-                        } else {
-                            view.queue.flash(job.id, now)
-                        };
-                        name_cell(ui, pal, job, None, flash, None);
+                        bg = Some(RowBg::reserve(ui, clip));
+                        ui.add_space(RAIL_ROOM);
+                        name_cell(ui, pal, job, None, None);
                     });
                     row.col(|ui| {
                         ui.vertical(|ui| {
@@ -807,6 +946,10 @@ fn history_tab(
                     });
                     row.col(|ui| history_actions(ui, pal, data, job, &mut view.queue, actions));
                     let resp = row.response();
+                    if let Some(bg) = &bg {
+                        let flash = if reduced { None } else { view.queue.flash(job.id, now) };
+                        bg.paint(pal, &resp, view.queue.selected == Some(job.id), flash);
+                    }
                     if resp.double_clicked() {
                         actions.push(Action::OpenJobFolder(job.id));
                     } else if resp.clicked() {
@@ -819,27 +962,8 @@ fn history_tab(
 }
 
 /// The name and its subline. `highlight` is the just-imported fade (0 = full accent, 1 =
-/// settled); `flash` a finish wash (state, 1 → 0) painted under the cell.
-fn name_cell(
-    ui: &mut Ui,
-    pal: &Palette,
-    job: &Job,
-    highlight: Option<f32>,
-    flash: Option<(JobState, f32)>,
-    live: Option<String>,
-) {
-    if let Some((state, strength)) = flash {
-        let tint = match state {
-            JobState::Failed => pal.negative_soft,
-            _ => pal.positive_soft,
-        };
-        let r = ui.available_rect_before_wrap();
-        ui.painter().rect_filled(
-            r.expand2(egui::vec2(6.0, 2.0)),
-            egui::CornerRadius::same(4),
-            Palette::fade(tint, strength),
-        );
-    }
+/// settled). A finish wash is painted by the row (see [`RowBg`]).
+fn name_cell(ui: &mut Ui, pal: &Palette, job: &Job, highlight: Option<f32>, live: Option<String>) {
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing.y = 1.0;
         let color = match highlight {
@@ -847,7 +971,7 @@ fn name_cell(
             None => pal.text,
         };
         ui.add(
-            egui::Label::new(RichText::new(&job.name).color(color))
+            egui::Label::new(RichText::new(&job.name).font(fonts::semibold_id(13.5)).color(color))
                 .truncate()
                 .selectable(false),
         )
@@ -934,6 +1058,14 @@ fn progress_cell(ui: &mut Ui, pal: &Palette, data: &Data, job: &Job, width: f32,
         return;
     }
     let done = data.shown_done(job);
+    // The track glides to each new figure instead of jumping between updates.
+    let shown = motion::ease_to(
+        ui.ctx(),
+        Id::new(("job-progress", job.id)),
+        format::fraction(done, job.bytes_total),
+        PROGRESS_GLIDE_SECS,
+        !busy.animate,
+    );
     // Segment cells fill in the accent; a held job's cells rest in the muted tone.
     let color = match job.state {
         JobState::Failed => pal.negative,
@@ -944,14 +1076,7 @@ fn progress_cell(ui: &mut Ui, pal: &Palette, data: &Data, job: &Job, width: f32,
     let sweep = (downloading && busy.moving).then_some(busy.phase);
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing.y = 4.0;
-        segment_track_live(
-            ui,
-            pal,
-            format::fraction(done, job.bytes_total),
-            color,
-            width,
-            sweep,
-        );
+        segment_track_live(ui, pal, shown, color, width, sweep);
         ui.label(
             RichText::new(format!(
                 "{}%  ·  {} / {}",

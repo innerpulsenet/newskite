@@ -22,7 +22,7 @@ use super::fonts;
 use super::icons::{paint_icon, Icon};
 use super::queue::eta_secs;
 use super::theme::Palette;
-use super::widgets::{icon_button, kit_button, section_title, segment_track, state_badge, ButtonKind};
+use super::widgets::{icon_button, kit_button, progress_ring, section_title, segment_track, state_badge, ButtonKind};
 
 /// Width of the side panel when it first opens.
 pub const PANEL_DEFAULT_W: f32 = 400.0;
@@ -278,7 +278,7 @@ pub fn facts(job: &Job, done: u64) -> Vec<(&'static str, String)> {
 /// The inspector body for `job`. `compact` drops the header (the dock has its own).
 pub fn show(ui: &mut Ui, pal: &Palette, data: &Data, job: &Job, state: &mut InspectorState, reduced: bool, actions: &mut Vec<Action>) {
     ui.set_max_width(ui.available_width());
-    header(ui, pal, job, actions);
+    header(ui, pal, data, job, reduced, actions);
     ui.add_space(10.0);
     tabs(ui, pal, data, job, state);
     ui.add_space(8.0);
@@ -295,7 +295,7 @@ pub fn show(ui: &mut Ui, pal: &Palette, data: &Data, job: &Job, state: &mut Insp
         });
 }
 
-fn header(ui: &mut Ui, pal: &Palette, job: &Job, actions: &mut Vec<Action>) {
+fn header(ui: &mut Ui, pal: &Palette, data: &Data, job: &Job, reduced: bool, actions: &mut Vec<Action>) {
     ui.horizontal(|ui| {
         state_badge(ui, pal, job.state);
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -307,14 +307,47 @@ fn header(ui: &mut Ui, pal: &Palette, job: &Job, actions: &mut Vec<Action>) {
             }
         });
     });
-    ui.add_space(6.0);
-    ui.add(egui::Label::new(RichText::new(&job.name).font(fonts::semibold_id(15.0)).color(pal.text)).wrap());
-    let nzb = job.source_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    ui.add(egui::Label::new(RichText::new(nzb).small().color(pal.muted)).truncate())
-        .on_hover_text(job.source_path.display().to_string());
+    ui.add_space(10.0);
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = 12.0;
+        // How far the job got, as a ring that glides to each new figure.
+        let done = data.shown_done(job);
+        let target = if job.state == JobState::Done { 1.0 } else { format::fraction(done, job.bytes_total) };
+        let f = super::motion::ease_to(ui.ctx(), egui::Id::new(("inspector-ring", job.id)), target, 0.6, reduced);
+        let color = match job.state {
+            JobState::Done => pal.positive,
+            JobState::Failed => pal.negative,
+            JobState::Paused => pal.muted,
+            _ => pal.accent,
+        };
+        let (r, _) = ui.allocate_exact_size(Vec2::splat(50.0), Sense::hover());
+        progress_ring(ui.painter(), pal, r.center(), 21.0, 4.5, f, color);
+        match job.state {
+            JobState::Done => paint_icon(ui.painter(), Rect::from_center_size(r.center(), Vec2::splat(18.0)), Icon::StatusOk, color),
+            JobState::Failed => paint_icon(ui.painter(), Rect::from_center_size(r.center(), Vec2::splat(18.0)), Icon::StatusErr, color),
+            _ => {
+                ui.painter().text(
+                    r.center(),
+                    egui::Align2::CENTER_CENTER,
+                    format!("{:.0}%", (f * 100.0).floor()),
+                    fonts::mono_id(11.0),
+                    pal.text,
+                );
+            }
+        }
+        ui.vertical(|ui| {
+            ui.set_max_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 3.0;
+            ui.add(egui::Label::new(RichText::new(&job.name).font(fonts::semibold_id(15.0)).color(pal.text)).wrap());
+            let nzb = job.source_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            ui.add(egui::Label::new(RichText::new(nzb).small().color(pal.muted)).truncate())
+                .on_hover_text(job.source_path.display().to_string());
+        });
+    });
 }
 
 fn tabs(ui: &mut Ui, pal: &Palette, data: &Data, job: &Job, state: &mut InspectorState) {
+    let mut current = None;
     let row = ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 16.0;
         let failed = data.selected_files.iter().filter(|f| f.state == "failed").count();
@@ -337,10 +370,7 @@ fn tabs(ui: &mut Ui, pal: &Palette, data: &Data, job: &Job, state: &mut Inspecto
             );
             let r = resp.rect;
             if on {
-                ui.painter().line_segment(
-                    [Pos2::new(r.left(), r.bottom() + 4.0), Pos2::new(r.right(), r.bottom() + 4.0)],
-                    Stroke::new(2.0, pal.accent),
-                );
+                current = Some(r);
             }
             if let Some(c) = dot {
                 ui.painter().circle_filled(Pos2::new(r.right() + 5.0, r.top() + 3.0), 2.5, c);
@@ -356,6 +386,14 @@ fn tabs(ui: &mut Ui, pal: &Palette, data: &Data, job: &Job, state: &mut Inspecto
         [Pos2::new(r.left(), r.bottom() + 5.0), Pos2::new(r.left() + ui.available_width(), r.bottom() + 5.0)],
         Stroke::new(1.0, pal.border),
     );
+    if let Some(on) = current {
+        // The accent rule glides to the chosen tab.
+        let secs = ui.style().animation_time;
+        let left = ui.ctx().animate_value_with_time(egui::Id::new("inspector-tab-l"), on.left(), secs);
+        let right = ui.ctx().animate_value_with_time(egui::Id::new("inspector-tab-r"), on.right(), secs);
+        let rule = Rect::from_x_y_ranges(left..=right, (r.bottom() + 3.0)..=(r.bottom() + 5.5));
+        ui.painter().rect_filled(rule, CornerRadius::same(1), pal.accent);
+    }
     ui.add_space(4.0);
 }
 

@@ -4,7 +4,7 @@
 //! eyebrows and the quiet credit. All colors come from the [`Palette`].
 
 use eframe::egui::{
-    self, text::LayoutJob, Align, Align2, Color32, CornerRadius, FontId, Pos2, Rect, Response,
+    self, text::LayoutJob, Align, Color32, CornerRadius, FontId, Pos2, Rect, Response,
     RichText, Sense, Stroke, StrokeKind, TextFormat, Ui, Vec2,
 };
 use newskite_service::JobState;
@@ -45,6 +45,9 @@ pub enum ToolState {
     Active,
     /// Visible for layout parity but not implemented yet; clicking is harmless.
     Unavailable,
+    /// The toolbar's lead control (the queue's Start / Pause / Resume): a violet-tinted
+    /// slot, so the one thing that moves the queue reads first.
+    Accent,
 }
 
 /// Paints the ember focus ring (the one place ember borders a control).
@@ -57,8 +60,12 @@ pub fn focus_ring(ui: &Ui, pal: &Palette, rect: Rect, radius: u8) {
     );
 }
 
-/// A toolbar button: icon with an optional label underneath. Icons are text-2 at rest,
-/// text when hovered or current, text-3 when unavailable; never ember.
+/// Height of a toolbar button.
+pub const TOOL_H: f32 = 34.0;
+
+/// A toolbar button: an 18 px icon and its label side by side in a rounded slot (the
+/// icon alone on narrow windows). Icons are text-2 at rest, text when hovered or
+/// current, text-3 when unavailable; never ember. The hover wash fades in and out.
 pub fn tool_button(
     ui: &mut Ui,
     pal: &Palette,
@@ -67,72 +74,70 @@ pub fn tool_button(
     show_label: bool,
     state: ToolState,
 ) -> Response {
-    let label_font = FontId::proportional(11.5);
-    let size = if show_label {
-        let text_w = ui
-            .painter()
-            .layout_no_wrap(label.to_owned(), label_font.clone(), pal.text)
-            .size()
-            .x;
-        Vec2::new((text_w + 16.0).max(58.0), 50.0)
-    } else {
-        Vec2::new(36.0, 36.0)
+    let accent = state == ToolState::Accent;
+    let label_font = if accent { fonts::semibold_id(13.0) } else { FontId::proportional(13.0) };
+    let galley = show_label.then(|| ui.painter().layout_no_wrap(label.to_owned(), label_font, pal.text));
+    let size = match &galley {
+        Some(g) => Vec2::new(12.0 + 18.0 + 8.0 + g.size().x + 14.0, TOOL_H),
+        None => Vec2::splat(TOOL_H),
     };
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
     if ui.is_rect_visible(rect) {
+        let live = state != ToolState::Unavailable;
+        let hover = ui.ctx().animate_bool(resp.id.with("hover"), live && resp.hovered());
+        let pressed = live && resp.is_pointer_button_down_on();
         let painter = ui.painter();
-        let pressed = resp.is_pointer_button_down_on();
-        let bg = if pressed {
-            Some(pal.sunken)
-        } else if resp.hovered() || state == ToolState::Active {
-            Some(pal.hover)
-        } else {
-            None
-        };
-        if let Some(bg) = bg {
-            painter.rect_filled(rect, CornerRadius::same(4), bg);
+        let radius = CornerRadius::same(8);
+        match state {
+            ToolState::Accent => {
+                let fill = if pressed {
+                    pal.accent_soft.lerp_to_gamma(pal.accent, 0.3)
+                } else {
+                    pal.accent_soft.lerp_to_gamma(pal.accent, 0.14 * hover)
+                };
+                painter.rect(rect, radius, fill, Stroke::new(1.0, Palette::fade(pal.accent, 0.35)), StrokeKind::Inside);
+            }
+            _ if pressed => {
+                painter.rect_filled(rect, radius, pal.sunken);
+            }
+            ToolState::Active => {
+                painter.rect_filled(rect, radius, pal.hover);
+            }
+            _ if hover > 0.0 => {
+                painter.rect_filled(rect, radius, Palette::fade(pal.hover, hover));
+            }
+            _ => {}
         }
         if resp.has_focus() {
-            focus_ring(ui, pal, rect.shrink(2.0), 4);
+            focus_ring(ui, pal, rect, 8);
         }
         let fg = match state {
             ToolState::Unavailable => pal.faint,
+            ToolState::Accent => pal.accent_fg,
             ToolState::Active => pal.text,
-            ToolState::Normal if resp.hovered() => pal.text,
-            ToolState::Normal => pal.muted,
+            ToolState::Normal => pal.muted.lerp_to_gamma(pal.text, hover),
         };
-        let icon_rect = if show_label {
-            Rect::from_center_size(
-                Pos2::new(rect.center().x, rect.top() + 17.0),
-                Vec2::splat(20.0),
-            )
-        } else {
-            Rect::from_center_size(rect.center(), Vec2::splat(20.0))
+        let icon_center = match &galley {
+            Some(_) => Pos2::new(rect.left() + 12.0 + 9.0, rect.center().y),
+            None => rect.center(),
         };
-        paint_icon(painter, icon_rect, icon, fg);
-        if show_label {
+        paint_icon(painter, Rect::from_center_size(icon_center, Vec2::splat(18.0)), icon, fg);
+        if let Some(g) = galley {
             let text_color = match state {
                 ToolState::Unavailable => pal.faint,
+                ToolState::Accent => pal.accent_fg,
                 _ => pal.text,
             };
-            painter.text(
-                Pos2::new(rect.center().x, rect.bottom() - 9.0),
-                Align2::CENTER_CENTER,
-                label,
-                label_font,
+            painter.galley(
+                Pos2::new(rect.left() + 12.0 + 18.0 + 8.0, rect.center().y - g.size().y / 2.0),
+                g,
                 text_color,
             );
         }
         if state == ToolState::Active {
-            // The current view: a short accent rule under the icon.
-            let y = rect.bottom() - 1.0;
-            painter.line_segment(
-                [
-                    Pos2::new(rect.center().x - 8.0, y),
-                    Pos2::new(rect.center().x + 8.0, y),
-                ],
-                Stroke::new(2.0, pal.accent),
-            );
+            // The current view: a short accent rule along the bottom of the slot.
+            let r = Rect::from_center_size(Pos2::new(rect.center().x, rect.bottom() - 2.0), Vec2::new(18.0, 2.5));
+            painter.rect_filled(r, CornerRadius::same(1), pal.accent);
         }
     }
     resp.widget_info(|| {
@@ -156,17 +161,18 @@ pub fn icon_button(
 ) -> Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(22.0), Sense::click());
     if ui.is_rect_visible(rect) {
+        let hover = ui.ctx().animate_bool(resp.id.with("hover"), resp.hovered());
         if resp.is_pointer_button_down_on() {
             ui.painter()
-                .rect_filled(rect, CornerRadius::same(4), pal.sunken);
-        } else if resp.hovered() {
+                .rect_filled(rect, CornerRadius::same(6), pal.sunken);
+        } else if hover > 0.0 {
             ui.painter()
-                .rect_filled(rect, CornerRadius::same(4), pal.hover);
+                .rect_filled(rect, CornerRadius::same(6), Palette::fade(pal.hover, hover));
         }
         if resp.has_focus() {
-            focus_ring(ui, pal, rect, 4);
+            focus_ring(ui, pal, rect, 6);
         }
-        let fg = if resp.hovered() { pal.text } else { color };
+        let fg = color.lerp_to_gamma(pal.text, hover);
         paint_icon(ui.painter(), rect.shrink(3.0), icon, fg);
     }
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, tooltip));
@@ -217,7 +223,7 @@ pub fn kit_button(
     if ui.is_rect_visible(rect) {
         let hovered = enabled && resp.hovered();
         let pressed = enabled && resp.is_pointer_button_down_on();
-        let radius = CornerRadius::same(4);
+        let radius = CornerRadius::same(6);
         let (fill, stroke, fg) = match kind {
             ButtonKind::Primary => {
                 let f = if hovered || pressed {
@@ -253,9 +259,13 @@ pub fn kit_button(
             }
         };
         let painter = ui.painter();
+        if kind == ButtonKind::Primary {
+            // The call to action sits a little above the surface.
+            painter.add(egui::epaint::Shadow { offset: [0, 2], blur: 8, spread: 0, color: Palette::fade(pal.shadow, 0.5) }.as_shape(rect, radius));
+        }
         painter.rect(rect, radius, fill, stroke, StrokeKind::Inside);
         if resp.has_focus() {
-            focus_ring(ui, pal, rect, 4);
+            focus_ring(ui, pal, rect, 6);
         }
         let mut x = rect.left() + pad;
         if let Some(icon) = icon {
@@ -331,18 +341,25 @@ impl Status {
     }
 }
 
-/// Width a [`status_chip`] with `text` takes.
-pub fn status_chip_width(ui: &Ui, text: &str) -> f32 {
-    let galley = ui.painter().layout_no_wrap(
-        text.to_owned(),
-        FontId::proportional(12.5),
-        ui.visuals().text_color(),
-    );
-    galley.size().x + 8.0 + 12.0 + 7.0 + 9.0
+/// Font of a status chip's words.
+fn chip_font() -> FontId {
+    FontId::proportional(12.0)
 }
 
-/// An outlined status chip: a 1 px outline in the status color, its 12 px glyph and the
-/// words (12.5 px sans). Reads without color: the glyph carries the state.
+/// Horizontal room a chip needs around its words: padding, glyph and gap.
+const CHIP_CHROME: f32 = 10.0 + 11.0 + 6.0 + 11.0;
+
+/// Width a [`status_chip`] with `text` takes.
+pub fn status_chip_width(ui: &Ui, text: &str) -> f32 {
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_owned(), chip_font(), ui.visuals().text_color());
+    galley.size().x + CHIP_CHROME
+}
+
+/// A status chip: a soft pill tinted with the status color (a faint wash and a hairline
+/// of it), its 11 px glyph and the words in that color. Reads without color: the glyph
+/// carries the state.
 pub fn status_chip(ui: &mut Ui, pal: &Palette, status: Status, text: &str) -> Response {
     status_chip_live(ui, pal, status, text, None)
 }
@@ -357,21 +374,22 @@ pub fn status_chip_live(
     breath: Option<f32>,
 ) -> Response {
     let color = status.color(pal);
-    let font = FontId::proportional(12.5);
-    let galley = ui.painter().layout_no_wrap(text.to_owned(), font, color);
-    let size = Vec2::new(galley.size().x + 8.0 + 12.0 + 7.0 + 9.0, 22.0);
+    let galley = ui.painter().layout_no_wrap(text.to_owned(), chip_font(), color);
+    let size = Vec2::new(galley.size().x + CHIP_CHROME, 22.0);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::hover());
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
-        painter.rect_stroke(
+        let wash = if pal.dark { 0.16 } else { 0.11 };
+        painter.rect(
             rect,
-            CornerRadius::same(3),
-            Stroke::new(1.0, color),
+            CornerRadius::same(11),
+            Palette::fade(color, wash),
+            Stroke::new(1.0, Palette::fade(color, 0.34)),
             StrokeKind::Inside,
         );
         let glyph_rect = Rect::from_center_size(
-            Pos2::new(rect.left() + 14.0, rect.center().y),
-            Vec2::splat(12.0),
+            Pos2::new(rect.left() + 10.0 + 5.5, rect.center().y),
+            Vec2::splat(11.0),
         );
         match status.glyph() {
             Some(g) => paint_icon(painter, glyph_rect, g, color),
@@ -395,7 +413,7 @@ pub fn status_chip_live(
             }
         }
         painter.galley(
-            Pos2::new(rect.left() + 27.0, rect.center().y - galley.size().y / 2.0),
+            Pos2::new(rect.left() + 10.0 + 11.0 + 6.0, rect.center().y - galley.size().y / 2.0),
             galley,
             color,
         );
@@ -496,20 +514,23 @@ pub fn error_line(ui: &mut Ui, pal: &Palette, text: &str) -> Response {
     .response
 }
 
-/// Height of a segment track (the old progress bar's height).
+/// Height of a segment track.
 pub const TRACK_H: f32 = 6.0;
 /// Gap between the cells of a segment track.
-pub const TRACK_GAP: f32 = 2.0;
+pub const TRACK_GAP: f32 = 3.0;
+/// Preferred width of one cell: short capsules, so a track reads as a calm row of
+/// segments rather than a dotted line.
+pub const TRACK_CELL_W: f32 = 14.0;
 /// Most cells a segment track draws.
-pub const TRACK_MAX_CELLS: usize = 40;
+pub const TRACK_MAX_CELLS: usize = 24;
 
-/// Number of cells a segment track of `width` draws: as many near-square cells as fit,
-/// 1 to [`TRACK_MAX_CELLS`].
+/// Number of cells a segment track of `width` draws: as many capsules of about
+/// [`TRACK_CELL_W`] as fit, 1 to [`TRACK_MAX_CELLS`].
 pub fn track_cells(width: f32) -> usize {
     if !width.is_finite() || width <= 0.0 {
         return 1;
     }
-    (((width + TRACK_GAP) / (TRACK_H + TRACK_GAP)).floor() as usize).clamp(1, TRACK_MAX_CELLS)
+    (((width + TRACK_GAP) / (TRACK_CELL_W + TRACK_GAP)).floor() as usize).clamp(1, TRACK_MAX_CELLS)
 }
 
 /// How full each of `cells` cells is for `fraction` (clamped; NaN is 0): each cell is an
@@ -546,10 +567,19 @@ pub fn sweep_alpha(i: usize, n: usize, phase: f32) -> f32 {
     if n == 0 {
         return 1.0;
     }
+    0.78 + 0.22 * sweep_shine(i, n, phase)
+}
+
+/// How strongly the sweep lights filled cell `i` of `n` at `phase`: 1 under its head,
+/// easing to 0 two cells away. Pure, for tests.
+pub fn sweep_shine(i: usize, n: usize, phase: f32) -> f32 {
+    if n == 0 {
+        return 0.0;
+    }
     let head = phase.clamp(0.0, 1.0) * (n as f32 + 2.0) - 1.0;
     let d = (i as f32 - head).abs();
     let glow = (1.0 - d / 2.0).clamp(0.0, 1.0);
-    0.78 + 0.22 * glow * glow
+    glow * glow * (3.0 - 2.0 * glow)
 }
 
 /// [`segment_track`] with a highlight sweeping along the filled cells while the job
@@ -569,32 +599,49 @@ pub fn segment_track_live(
     };
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, TRACK_H), Sense::hover());
     if ui.is_rect_visible(rect) {
-        let cells = track_cells(rect.width());
-        let fill = track_fill(fraction, cells);
-        let cell_w = (rect.width() - TRACK_GAP * (cells as f32 - 1.0)) / cells as f32;
-        let painter = ui.painter();
-        let r = CornerRadius::same(1);
-        let filled = fill.iter().filter(|a| **a >= 1.0).count();
-        for (i, amount) in fill.iter().enumerate() {
-            let x = rect.left() + i as f32 * (cell_w + TRACK_GAP);
-            let cell = Rect::from_min_size(Pos2::new(x, rect.top()), Vec2::new(cell_w, TRACK_H));
-            if *amount >= 1.0 {
-                let c = match sweep {
-                    Some(phase) => Palette::fade(color, sweep_alpha(i, filled, phase)),
-                    None => color,
-                };
-                painter.rect_filled(cell, r, c);
-            } else {
-                painter.rect_filled(cell, r, pal.well);
-                if *amount > 0.0 {
-                    let mut part = cell;
-                    part.set_width((cell_w * amount).max(1.0));
-                    painter.rect_filled(part, r, color);
-                }
+        paint_segments(ui.painter(), pal, rect, fraction, color, sweep);
+    }
+    resp
+}
+
+/// Paints a segment track into `rect` (see [`segment_track_live`]): capsule cells, the
+/// filled ones in `color` and lit in turn by the sweep, the boundary cell filled partly,
+/// the rest quiet wells.
+pub fn paint_segments(
+    painter: &egui::Painter,
+    pal: &Palette,
+    rect: Rect,
+    fraction: f32,
+    color: Color32,
+    sweep: Option<f32>,
+) {
+    let cells = track_cells(rect.width());
+    let fill = track_fill(fraction, cells);
+    let cell_w = (rect.width() - TRACK_GAP * (cells as f32 - 1.0)) / cells as f32;
+    let h = rect.height();
+    let r = CornerRadius::same((h / 2.0).floor().clamp(1.0, 255.0) as u8);
+    let filled = fill.iter().filter(|a| **a > 0.0).count();
+    // The sweep brightens toward the text on dark grounds and toward the paper on light
+    // ones, so it always reads as light passing over the cells.
+    let shine_to = if pal.dark { pal.text } else { pal.raised };
+    for (i, amount) in fill.iter().enumerate() {
+        let x = rect.left() + i as f32 * (cell_w + TRACK_GAP);
+        let cell = Rect::from_min_size(Pos2::new(x, rect.top()), Vec2::new(cell_w, h));
+        let lit = match sweep {
+            Some(phase) => color.lerp_to_gamma(shine_to, 0.38 * sweep_shine(i, filled, phase)),
+            None => color,
+        };
+        if *amount >= 1.0 {
+            painter.rect_filled(cell, r, lit);
+        } else {
+            painter.rect_filled(cell, r, pal.well);
+            if *amount > 0.0 {
+                let mut part = cell;
+                part.set_width((cell_w * amount).max(h.min(cell_w)));
+                painter.rect_filled(part, r, lit);
             }
         }
     }
-    resp
 }
 
 /// Cells of the empty queue's article grid: `(columns, rows)`.
@@ -680,13 +727,190 @@ pub fn article_grid_lit(ui: &mut Ui, pal: &Palette, wave: Option<f32>, lit: usiz
 }
 
 /// A raised card frame used for docks and settings sections: surface 1, a hairline,
-/// the kit's 8 px radius, no shadow.
+/// a 10 px radius and a soft, short shadow that lifts it off the ground.
 pub fn card(pal: &Palette) -> egui::Frame {
     egui::Frame::new()
         .fill(pal.raised)
         .stroke(Stroke::new(1.0, pal.border))
-        .corner_radius(CornerRadius::same(8))
+        .corner_radius(CornerRadius::same(10))
+        .shadow(egui::Shadow { offset: [0, 2], blur: 10, spread: 0, color: Palette::fade(pal.shadow, 0.4) })
         .inner_margin(egui::Margin::same(12))
+}
+
+/// A circular progress ring: a quiet full track and an arc in `color` from twelve
+/// o'clock clockwise for `fraction` (clamped; NaN is 0), with round ends.
+pub fn progress_ring(painter: &egui::Painter, pal: &Palette, center: Pos2, radius: f32, width: f32, fraction: f32, color: Color32) {
+    let f = if fraction.is_finite() { fraction.clamp(0.0, 1.0) } else { 0.0 };
+    painter.circle_stroke(center, radius, Stroke::new(width, pal.well));
+    if f <= 0.0 {
+        return;
+    }
+    let n = ((96.0 * f).ceil() as usize).max(2);
+    let start = -std::f32::consts::FRAC_PI_2;
+    let pts: Vec<Pos2> = (0..=n)
+        .map(|i| {
+            let a = start + std::f32::consts::TAU * f * i as f32 / n as f32;
+            center + Vec2::new(a.cos(), a.sin()) * radius
+        })
+        .collect();
+    if f < 1.0 {
+        painter.circle_filled(pts[0], width / 2.0, color);
+        painter.circle_filled(pts[n], width / 2.0, color);
+    }
+    painter.add(egui::Shape::line(pts, Stroke::new(width, color)));
+}
+
+/// The frame of a modal sheet: the window ground, a hairline, a 14 px radius and a deep,
+/// soft shadow. Sheets lay out their own header, body and footer padding.
+pub fn dialog_frame(pal: &Palette) -> egui::Frame {
+    egui::Frame::new()
+        .fill(pal.surface)
+        .stroke(Stroke::new(1.0, pal.border_strong))
+        .corner_radius(CornerRadius::same(14))
+        .shadow(egui::Shadow { offset: [0, 18], blur: 48, spread: 0, color: pal.shadow })
+        .inner_margin(egui::Margin::ZERO)
+}
+
+/// An on/off switch with its label: a 32×18 capsule whose knob slides across as it
+/// turns on (the track fills with the accent). Assistive technology reads it as a
+/// checkbox with that label.
+pub fn toggle(ui: &mut Ui, pal: &Palette, on: &mut bool, label: &str) -> Response {
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let galley = ui.painter().layout_no_wrap(label.to_owned(), font, pal.text);
+    let track = Vec2::new(32.0, 18.0);
+    let height = galley.size().y.max(ui.spacing().interact_size.y);
+    let (rect, mut resp) =
+        ui.allocate_exact_size(Vec2::new(track.x + 10.0 + galley.size().x, height), Sense::click());
+    if resp.clicked() {
+        *on = !*on;
+        resp.mark_changed();
+    }
+    if ui.is_rect_visible(rect) {
+        let t = ui.ctx().animate_bool(resp.id.with("knob"), *on);
+        let hover = ui.ctx().animate_bool(resp.id.with("hover"), resp.hovered());
+        let painter = ui.painter();
+        let tr = Rect::from_min_size(Pos2::new(rect.left(), rect.center().y - track.y / 2.0), track);
+        let fill = pal.sunken.lerp_to_gamma(pal.accent, t);
+        let edge = pal.border_strong.lerp_to_gamma(pal.accent, t);
+        painter.rect(tr, CornerRadius::same(9), fill, Stroke::new(1.0, edge), StrokeKind::Inside);
+        let x = egui::lerp((tr.left() + 9.0)..=(tr.right() - 9.0), t);
+        let knob = Pos2::new(x, tr.center().y);
+        if hover > 0.0 {
+            painter.circle_filled(knob, 11.0, Palette::fade(pal.accent, 0.16 * hover));
+        }
+        // The knob is light when on in every theme: the paper ground on light schemes,
+        // the text color (near white) on dark ones.
+        let lit = if pal.dark { pal.text } else { pal.surface };
+        painter.circle_filled(knob, 6.5, pal.muted.lerp_to_gamma(lit, t));
+        if resp.has_focus() {
+            focus_ring(ui, pal, tr, 9);
+        }
+        painter.galley(
+            Pos2::new(tr.right() + 10.0, rect.center().y - galley.size().y / 2.0),
+            galley,
+            pal.text,
+        );
+    }
+    let enabled = ui.is_enabled();
+    let state = *on;
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Checkbox, enabled, state, label));
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// A segmented control: the options side by side in one sunken slot, the chosen one on
+/// a raised pill that glides between them. Returns the option clicked this frame.
+pub fn segmented<T: Copy + PartialEq>(
+    ui: &mut Ui,
+    pal: &Palette,
+    id: egui::Id,
+    options: &[(T, &str)],
+    current: T,
+) -> Option<T> {
+    let font = fonts::mono_id(10.5);
+    let galleys: Vec<_> = options
+        .iter()
+        .map(|(_, l)| ui.painter().layout_no_wrap((*l).to_owned(), font.clone(), pal.text))
+        .collect();
+    let pad = 10.0;
+    let widths: Vec<f32> = galleys.iter().map(|g| g.size().x + 2.0 * pad).collect();
+    let total: f32 = widths.iter().sum::<f32>() + 4.0;
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(total, 24.0), Sense::hover());
+    let mut picked = None;
+    if !ui.is_rect_visible(rect) {
+        return None;
+    }
+    ui.painter().rect_filled(rect, CornerRadius::same(7), pal.sunken);
+    let mut x = rect.left() + 2.0;
+    let mut slots = Vec::with_capacity(options.len());
+    for w in &widths {
+        slots.push(Rect::from_min_size(Pos2::new(x, rect.top() + 2.0), Vec2::new(*w, rect.height() - 4.0)));
+        x += w;
+    }
+    if let Some(sel) = options.iter().position(|(v, _)| *v == current) {
+        let ctx = ui.ctx();
+        let secs = ui.style().animation_time;
+        let left = ctx.animate_value_with_time(id.with("pill-l"), slots[sel].left(), secs);
+        let right = ctx.animate_value_with_time(id.with("pill-r"), slots[sel].right(), secs);
+        let pill = Rect::from_x_y_ranges(left..=right, slots[sel].y_range());
+        let painter = ui.painter();
+        painter.add(egui::epaint::Shadow { offset: [0, 1], blur: 3, spread: 0, color: Palette::fade(pal.shadow, 0.5) }.as_shape(pill, CornerRadius::same(5)));
+        painter.rect(pill, CornerRadius::same(5), pal.raised, Stroke::new(1.0, pal.border), StrokeKind::Inside);
+    }
+    for (i, ((value, label), galley)) in options.iter().zip(galleys).enumerate() {
+        let slot = slots[i];
+        let on = *value == current;
+        let resp = ui.interact(slot, id.with(i), Sense::click());
+        let fg = if on {
+            pal.text
+        } else if resp.hovered() {
+            pal.muted
+        } else {
+            pal.faint
+        };
+        ui.painter().galley(slot.center() - galley.size() / 2.0, galley, fg);
+        if resp.has_focus() {
+            focus_ring(ui, pal, slot, 5);
+        }
+        resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, on, *label));
+        if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+            picked = Some(*value);
+        }
+    }
+    picked
+}
+
+/// A soft shadow cast downward from the line `y` across `x`, `depth` px deep: a
+/// gradient that fades quickly, then trails off.
+pub fn shade_below(painter: &egui::Painter, pal: &Palette, x: egui::Rangef, y: f32, depth: f32) {
+    let stops = [(0.0, 0.5), (0.35, 0.18), (1.0, 0.0)];
+    let mut mesh = egui::epaint::Mesh::default();
+    for (i, w) in stops.windows(2).enumerate() {
+        let ((t0, a0), (t1, a1)) = (w[0], w[1]);
+        let (c0, c1) = (Palette::fade(pal.shadow, a0), Palette::fade(pal.shadow, a1));
+        let base = (i * 4) as u32;
+        mesh.colored_vertex(Pos2::new(x.min, y + depth * t0), c0);
+        mesh.colored_vertex(Pos2::new(x.max, y + depth * t0), c0);
+        mesh.colored_vertex(Pos2::new(x.max, y + depth * t1), c1);
+        mesh.colored_vertex(Pos2::new(x.min, y + depth * t1), c1);
+        mesh.add_triangle(base, base + 1, base + 2);
+        mesh.add_triangle(base, base + 2, base + 3);
+    }
+    painter.add(egui::Shape::mesh(mesh));
+}
+
+/// A key cap (`Ctrl`, `O`): mono text in a small raised box with a heavier bottom edge,
+/// for keyboard hints.
+pub fn keycap(ui: &mut Ui, pal: &Palette, key: &str) -> Response {
+    let galley = ui.painter().layout_no_wrap(key.to_owned(), fonts::mono_id(10.5), pal.muted);
+    let size = Vec2::new((galley.size().x + 10.0).max(20.0), 20.0);
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::hover());
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        painter.rect_filled(rect.translate(Vec2::new(0.0, 1.5)), CornerRadius::same(4), pal.border);
+        painter.rect(rect, CornerRadius::same(4), pal.raised, Stroke::new(1.0, pal.border), StrokeKind::Inside);
+        painter.galley(rect.center() - galley.size() / 2.0, galley, pal.muted);
+    }
+    resp
 }
 
 /// A mono uppercase eyebrow (11 px, 0.12em, text-3): section and dock titles.
@@ -779,7 +1003,8 @@ mod tests {
 
     #[test]
     fn segment_track_cells_and_fill() {
-        assert_eq!(track_cells(222.0), 28);
+        assert_eq!(track_cells(222.0), 13);
+        assert_eq!(track_cells(14.0), 1);
         assert_eq!(track_cells(10_000.0), TRACK_MAX_CELLS);
         assert_eq!(track_cells(0.0), 1);
         assert_eq!(track_cells(f32::NAN), 1);
