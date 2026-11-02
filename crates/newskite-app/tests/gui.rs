@@ -731,6 +731,8 @@ fn selecting_a_job_shows_its_details_and_files() {
         3
     );
     h.get_by_label("2,161 of 3,801 articles");
+    // 3,801 articles are too many for one readable cell each, so cells fold.
+    assert!(h.query_by_label_contains("1 cell = ").is_some());
     h.get_by_label("open.movie.part01.rar: 1,900 / 1,900 articles");
     h.get_by_label("open.movie.part02.rar: 260 / 1,900 articles");
     assert_no_bad_numbers(&h);

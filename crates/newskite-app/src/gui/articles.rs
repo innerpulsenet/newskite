@@ -17,11 +17,14 @@ use super::motion;
 use super::serverstrip::thousands;
 use super::theme::Palette;
 
-/// Largest and smallest square cell of a grid, px.
+/// Largest and smallest square cell of a grid, px. Smaller cells blur into texture, so a
+/// job with more articles than smallest cells folds several articles into each.
 const MAX_SIDE: f32 = 9.0;
-const MIN_SIDE: f32 = 2.0;
-/// Cell side once articles are folded into grid cells.
-const FOLDED_SIDE: f32 = 3.0;
+const MIN_SIDE: f32 = 6.0;
+/// Gap between grid cells, px.
+const GAP: f32 = 2.0;
+/// Most files a hover over a folded cell names.
+const HOVER_FILES: usize = 3;
 /// Seconds a freshly filled cell glows.
 const GLOW_SECS: f64 = 0.9;
 /// Buckets a job's map is folded into for its row strip (drawn with fewer cells when the
@@ -50,14 +53,13 @@ pub struct GridLayout {
 
 impl GridLayout {
     fn at(side: f32, size: Vec2) -> Self {
-        let gap = if side >= 5.0 { 2.0 } else { 1.0 };
-        let cols = ((size.x + gap) / (side + gap)).floor().max(0.0) as usize;
-        let rows = ((size.y + gap) / (side + gap)).floor().max(0.0) as usize;
-        Self { side, gap, cols, capacity: cols * rows }
+        let cols = ((size.x + GAP) / (side + GAP)).floor().max(0.0) as usize;
+        let rows = ((size.y + GAP) / (side + GAP)).floor().max(0.0) as usize;
+        Self { side, gap: GAP, cols, capacity: cols * rows }
     }
 
-    /// The largest cells (9 px down to 2 px) at which each of `n` articles gets its own
-    /// cell in `size`; when even 2 px cells cannot hold them all, 3 px cells that each
+    /// The largest cells (9 px down to 6 px) at which each of `n` articles gets its own
+    /// cell in `size`; when even 6 px cells cannot hold them all, 6 px cells that each
     /// take several articles. `None` when the area holds no cell at all.
     pub fn for_articles(n: usize, size: Vec2) -> Option<Self> {
         if !(size.x.is_finite() && size.y.is_finite()) {
@@ -71,7 +73,7 @@ impl GridLayout {
             }
             side -= 1.0;
         }
-        let l = Self::at(FOLDED_SIDE, size);
+        let l = Self::at(MIN_SIDE, size);
         (l.capacity > 0).then_some(l)
     }
 
@@ -146,15 +148,56 @@ pub fn summary(c: &ArticleCounts) -> String {
     s
 }
 
-/// The file and position of global article `k` (in file order).
-fn locate(map: &ArticleMap, mut k: usize) -> Option<(&str, usize, usize)> {
+/// The files a cell of `count` articles starting at global article `start` (in file
+/// order) covers: each file's name, the cell's articles in it as 0-based `first..end`, and
+/// the file's article count. A folded cell can span the end of one file and the start of
+/// the next.
+fn cell_files(map: &ArticleMap, start: usize, count: usize) -> Vec<(&str, usize, usize, usize)> {
+    let end = start + count;
+    let mut out = Vec::new();
+    let mut offset = 0;
     for f in &map.files {
-        if k < f.states.len() {
-            return Some((&f.name, k, f.states.len()));
+        let len = f.states.len();
+        let (a, b) = (start.max(offset), end.min(offset + len));
+        if a < b {
+            out.push((f.name.as_str(), a - offset, b - offset, len));
         }
-        k -= f.states.len();
+        offset += len;
+        if offset >= end {
+            break;
+        }
     }
-    None
+    out
+}
+
+/// What hovering cell `cell` (of `per` articles, counted in `c`) says: the file and state
+/// of a single article, or for a folded cell the articles of each file it covers and their
+/// counts.
+fn hover_text(map: &ArticleMap, cell: usize, per: usize, c: &ArticleCounts) -> String {
+    let parts = cell_files(map, cell * per, c.total());
+    if per == 1 {
+        let Some((name, k, _, len)) = parts.first() else { return String::new() };
+        let state = if c.missing > 0 { "missing" } else if c.done > 0 { "downloaded" } else { "waiting" };
+        return format!("{name}\narticle {} of {}: {state}", thousands(*k as u64 + 1), thousands(*len as u64));
+    }
+    let mut lines: Vec<String> = parts
+        .iter()
+        .take(HOVER_FILES)
+        .map(|(name, a, b, len)| {
+            let span = if b - a == 1 {
+                format!("article {}", thousands(*a as u64 + 1))
+            } else {
+                format!("articles {}–{}", thousands(*a as u64 + 1), thousands(*b as u64))
+            };
+            format!("{name}  ·  {span} of {}", thousands(*len as u64))
+        })
+        .collect();
+    if parts.len() > HOVER_FILES {
+        let more = parts.len() - HOVER_FILES;
+        lines.push(format!("+{more} more file{}", if more == 1 { "" } else { "s" }));
+    }
+    lines.push(format!("{} downloaded, {} missing, {} waiting", c.done, c.missing, c.waiting));
+    lines.join("\n")
 }
 
 /// Draws `map` as a grid filling `size` on `ground` (the color behind it). `id` keeps the
@@ -240,22 +283,7 @@ pub fn grid(
             egui::Stroke::new(1.0, pal.text),
             egui::StrokeKind::Outside,
         );
-        let c = cells[i];
-        let text = match locate(map, i * per) {
-            Some((name, k, len)) if per == 1 => {
-                let state = if c.missing > 0 { "missing" } else if c.done > 0 { "downloaded" } else { "waiting" };
-                format!("{name}\narticle {} of {len}: {state}", k + 1)
-            }
-            Some((name, k, _)) => format!(
-                "{name}\narticles {}–{}: {} downloaded, {} missing, {} waiting",
-                k + 1,
-                k + c.total(),
-                c.done,
-                c.missing,
-                c.waiting
-            ),
-            None => String::new(),
-        };
+        let text = hover_text(map, i, per, &cells[i]);
         if !text.is_empty() {
             return resp.on_hover_text_at_pointer(text);
         }
@@ -381,20 +409,22 @@ pub fn lanes(ui: &mut Ui, pal: &Palette, map: &ArticleMap, held: bool, ground: C
 }
 
 /// The height a grid of `n` articles needs at `width`, at most `max_h`: the largest cells
-/// that fit, with no empty rows below them.
+/// that fit, with no empty rows below them. When articles fold, only the rows the folded
+/// cells fill.
 pub fn fit_height(n: usize, width: f32, max_h: f32) -> f32 {
     let mut side = MAX_SIDE;
     while side >= MIN_SIDE {
-        let gap = if side >= 5.0 { 2.0 } else { 1.0 };
-        let cols = ((width + gap) / (side + gap)).floor().max(1.0) as usize;
+        let cols = ((width + GAP) / (side + GAP)).floor().max(1.0) as usize;
         let rows = n.div_ceil(cols).max(1);
-        let h = rows as f32 * (side + gap) - gap;
+        let h = rows as f32 * (side + GAP) - GAP;
         if h <= max_h {
             return h;
         }
         side -= 1.0;
     }
-    max_h
+    let Some(l) = GridLayout::for_articles(n, Vec2::new(width, max_h)) else { return max_h };
+    let cells = n.div_ceil(n.div_ceil(l.capacity));
+    cells.div_ceil(l.cols).max(1) as f32 * (l.side + GAP) - GAP
 }
 
 /// Articles per cell `grid` uses for `map` in `size` (for the key).
@@ -441,12 +471,12 @@ mod tests {
         let l = GridLayout::for_articles(40, size).unwrap();
         assert_eq!(l.side, MAX_SIDE);
         assert!(l.capacity >= 40);
-        // 1,500 articles fit one per cell at 3 px (75 × 25 cells).
+        // 400 articles fit one per cell at 6 px (37 × 12 cells).
+        let l = GridLayout::for_articles(400, size).unwrap();
+        assert!(l.side == MIN_SIDE && l.capacity >= 400, "{l:?}");
+        // 1,500 do not, and cells never shrink below 6 px: they fold instead.
         let l = GridLayout::for_articles(1_500, size).unwrap();
-        assert!(l.side == 3.0 && l.capacity >= 1_500, "{l:?}");
-        // 5,000 do not fit even at 2 px (100 × 33), so cells fold.
-        let l = GridLayout::for_articles(5_000, size).unwrap();
-        assert!(l.side == FOLDED_SIDE && l.capacity < 5_000, "{l:?}");
+        assert!(l.side == MIN_SIDE && l.capacity < 1_500, "{l:?}");
         assert!(GridLayout::for_articles(10, Vec2::ZERO).is_none());
         assert!(GridLayout::for_articles(10, Vec2::new(f32::NAN, 5.0)).is_none());
     }
@@ -455,11 +485,36 @@ mod tests {
     fn grids_take_only_the_rows_they_need() {
         // 40 articles at 9 px in 300 px: 27 per row, two rows.
         assert_eq!(fit_height(40, 300.0, 120.0), 2.0 * 11.0 - 2.0);
+        // 2,000 fold: 4 per cell at most height, 500 cells in 14 of the 15 rows.
+        let full = per_cell(&map_of(2_000), Vec2::new(300.0, 120.0));
         let h = fit_height(2_000, 300.0, 120.0);
-        assert!(h <= 120.0);
-        let l = GridLayout::for_articles(2_000, Vec2::new(300.0, h)).unwrap();
-        assert!(l.capacity >= 2_000, "the fitted height still holds every article");
-        assert_eq!(fit_height(1_000_000, 300.0, 120.0), 120.0);
+        assert_eq!(h, 14.0 * 8.0 - 2.0);
+        assert_eq!(per_cell(&map_of(2_000), Vec2::new(300.0, h)), full, "the fitted height folds the same");
+        assert!(fit_height(1_000_000, 300.0, 120.0) <= 120.0);
+    }
+
+    fn map_of(n: usize) -> ArticleMap {
+        ArticleMap { files: vec![newskite_service::FileArticles { name: "a.rar".into(), states: vec![ArticleState::Waiting; n] }] }
+    }
+
+    #[test]
+    fn folded_cells_name_every_file_they_span() {
+        use newskite_service::FileArticles;
+        let file = |name: &str, states: Vec<ArticleState>| FileArticles { name: name.into(), states };
+        let (d, w) = (ArticleState::Done, ArticleState::Waiting);
+        let map = ArticleMap {
+            files: vec![file("a.rar", vec![d; 5]), file("b.rar", vec![d, w, w]), file("c.par2", vec![w])],
+        };
+        assert_eq!(cell_files(&map, 4, 3), vec![("a.rar", 4, 5, 5), ("b.rar", 0, 2, 3)]);
+        assert_eq!(cell_files(&map, 6, 3), vec![("b.rar", 1, 3, 3), ("c.par2", 0, 1, 1)]);
+        let (per, cells) = map.cells(3);
+        assert_eq!(per, 3);
+        assert_eq!(
+            hover_text(&map, 1, per, &cells[1]),
+            "a.rar  ·  articles 4–5 of 5\nb.rar  ·  article 1 of 3\n3 downloaded, 0 missing, 0 waiting"
+        );
+        let (_, single) = map.cells(9);
+        assert_eq!(hover_text(&map, 6, 1, &single[6]), "b.rar\narticle 2 of 3: waiting");
     }
 
     #[test]
