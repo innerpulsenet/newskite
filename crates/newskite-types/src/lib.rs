@@ -2,13 +2,15 @@
 //! human-readable formatting helpers. This crate has no I/O beyond resolving default
 //! directories, so every other crate (and the UI) can depend on it cheaply.
 
+pub mod articles;
 pub mod config;
 pub mod events;
 pub mod format;
 pub mod outcome;
 
 pub use config::{PostProcessSettings, ServerConfig, Settings};
-pub use events::EngineEvent;
+pub use articles::{ArticleCounts, ArticleMap, ArticleState, FileArticles};
+pub use events::{EngineEvent, FileLayout};
 pub use outcome::{FailureKind, JobOutcome, ServerHealth, StepRecord, StepState};
 
 /// Application name used for data/config directories and window titles.

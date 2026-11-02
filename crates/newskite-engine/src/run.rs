@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use newskite_nntp::{NntpConnection, NntpError};
 use newskite_nzb::nzb::{sanitize_filename, Segment};
 use newskite_nzb::yenc::{self, YencPart};
-use newskite_types::{format, EngineEvent, ServerConfig};
+use newskite_types::{format, EngineEvent, FileLayout, ServerConfig};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::{Notify, OnceCell, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
@@ -477,6 +477,15 @@ pub(crate) async fn run(
     for name in &skipped_names {
         shared.log(format!("{name}: already complete, skipping"));
     }
+    // Before any file event: the article events place themselves in this layout.
+    shared.emit(EngineEvent::Layout {
+        files: shared
+            .files
+            .iter()
+            .zip(&pre_skipped)
+            .map(|(f, &complete)| FileLayout { name: f.label.clone(), segments: f.segments.len(), complete })
+            .collect(),
+    });
 
     let mut set = JoinSet::new();
     for _ in 0..workers {
@@ -699,7 +708,7 @@ async fn process_segment(shared: &Arc<Shared>, held: &mut Option<Held>, st: &mut
     let (fi, si) = (st.fi, st.si);
     let file = &shared.files[fi];
     if file.is_skipped() {
-        return finish_segment(shared, fi, None).await;
+        return finish_segment(shared, fi, si, None).await;
     }
     let seg = &file.segments[si];
 
@@ -778,7 +787,7 @@ async fn process_segment(shared: &Arc<Shared>, held: &mut Option<Held>, st: &mut
                             h.articles += 1;
                             h.bytes += received;
                         });
-                        return store_part(shared, fi, part).await;
+                        return store_part(shared, fi, si, part).await;
                     }
                     Ok(Err(why)) => {
                         shared.note_error(server, &why);
@@ -870,7 +879,7 @@ async fn prefetch_next(shared: &Arc<Shared>, h: &mut Held) {
     while let Some(item) = shared.next_item() {
         let file = &shared.files[item.0];
         if file.is_skipped() {
-            if let Flow::Stop = finish_segment(shared, item.0, None).await {
+            if let Flow::Stop = finish_segment(shared, item.0, item.1, None).await {
                 return;
             }
             continue;
@@ -966,11 +975,12 @@ async fn record_missing(shared: &Arc<Shared>, fi: usize, si: usize, reason: Opti
         tracing::debug!(target: "newskite_engine", reason = %r, "segment failed");
     }
     lock(&file.missing).push((seg.number, seg.message_id.clone()));
-    finish_segment(shared, fi, None).await
+    shared.emit(EngineEvent::SegmentMissing { file: fi, index: si });
+    finish_segment(shared, fi, si, None).await
 }
 
 /// Writes a decoded part into its file (deciding the output on the first part).
-async fn store_part(shared: &Arc<Shared>, fi: usize, part: YencPart) -> Flow {
+async fn store_part(shared: &Arc<Shared>, fi: usize, si: usize, part: YencPart) -> Flow {
     let file = &shared.files[fi];
     let part = Arc::new(part);
     let init = {
@@ -986,7 +996,7 @@ async fn store_part(shared: &Arc<Shared>, fi: usize, part: YencPart) -> Flow {
         }
     };
     if out.skipped {
-        return finish_segment(shared, fi, None).await;
+        return finish_segment(shared, fi, si, None).await;
     }
     if part.crc_ok == Some(false) {
         file.crc_errors.fetch_add(1, Ordering::Relaxed);
@@ -1015,19 +1025,26 @@ async fn store_part(shared: &Arc<Shared>, fi: usize, part: YencPart) -> Flow {
     file.max_end.fetch_max(end, Ordering::SeqCst);
     shared.bytes_written.fetch_add(len, Ordering::SeqCst);
     shared.progress.bytes_down.fetch_add(len, Ordering::Relaxed);
-    finish_segment(shared, fi, Some((out.name.as_str(), len))).await
+    finish_segment(shared, fi, si, Some((out.name.as_str(), len))).await
 }
 
-/// Counts a processed segment, emits `SegmentDone` for stored ones and finalizes the
-/// file after its last segment.
-async fn finish_segment(shared: &Arc<Shared>, fi: usize, stored: Option<(&str, u64)>) -> Flow {
+/// Counts processed segment `si` of file `fi`, emits `SegmentDone` for stored ones and
+/// finalizes the file after its last segment.
+async fn finish_segment(shared: &Arc<Shared>, fi: usize, si: usize, stored: Option<(&str, u64)>) -> Flow {
     let file = &shared.files[fi];
     let total = file.segments.len();
     let done = {
         let mut p = lock(&file.processed);
         *p += 1;
         if let Some((name, bytes)) = stored {
-            shared.emit(EngineEvent::SegmentDone { name: name.to_string(), done: *p, total, bytes });
+            shared.emit(EngineEvent::SegmentDone {
+                name: name.to_string(),
+                done: *p,
+                total,
+                bytes,
+                file: fi,
+                index: si,
+            });
         }
         *p
     };
@@ -1051,6 +1068,7 @@ async fn open_output(shared: Arc<Shared>, fi: usize, first: Arc<YencPart>) -> io
     let file = &shared.files[fi];
     if out.skipped {
         shared.log(format!("{}: already complete, skipping", out.name));
+        shared.emit(EngineEvent::FileComplete { file: fi });
     } else {
         shared.emit(EngineEvent::FileStarted { name: out.name.clone(), segments: file.segments.len() });
     }

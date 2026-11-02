@@ -9,6 +9,7 @@
 pub mod about;
 pub mod app;
 pub mod appearance;
+pub mod articles;
 pub mod brand;
 pub mod brand_tokens;
 pub mod disk;

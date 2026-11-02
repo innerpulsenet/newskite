@@ -8,7 +8,10 @@ use std::time::{Duration, Instant};
 use newskite_engine::{download_with_pool, DownloadRequest, EngineError, EngineOptions, JobReport};
 use newskite_postproc::{PostEvent, PostOptions, PostReport, PostStage, Verdict};
 use newskite_store::{Job, JobFile, JobState, StoreError};
-use newskite_types::{format, EngineEvent, FailureKind, JobOutcome, ServerConfig, Settings, StepRecord, StepState};
+use newskite_types::{
+    format, ArticleMap, ArticleState, EngineEvent, FailureKind, JobOutcome, ServerConfig, Settings, StepRecord,
+    StepState,
+};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -771,6 +774,19 @@ async fn forward_events(
 
     while let Some(ev) = rx.recv().await {
         match &ev {
+            EngineEvent::Layout { files } => {
+                lock(&inner.articles).insert(job_id, ArticleMap::from_layout(files));
+            }
+            EngineEvent::SegmentMissing { file, index } => {
+                if let Some(m) = lock(&inner.articles).get_mut(&job_id) {
+                    m.set(*file, *index, ArticleState::Missing);
+                }
+            }
+            EngineEvent::FileComplete { file } => {
+                if let Some(m) = lock(&inner.articles).get_mut(&job_id) {
+                    m.complete_file(*file);
+                }
+            }
             EngineEvent::FileStarted { name, segments } => {
                 upsert_file(&inner, job_id, name, 0, 0, "downloading");
                 inner.log_job(job_id, 
@@ -778,7 +794,10 @@ async fn forward_events(
                     format!("downloading {name} ({segments} segment{})", if *segments == 1 { "" } else { "s" }),
                 );
             }
-            EngineEvent::SegmentDone { name, bytes, .. } => {
+            EngineEvent::SegmentDone { name, bytes, file, index, .. } => {
+                if let Some(m) = lock(&inner.articles).get_mut(&job_id) {
+                    m.set(*file, *index, ArticleState::Done);
+                }
                 fetched += 1;
                 run_bytes = run_bytes.saturating_add(*bytes);
                 *per_file.entry(name.clone()).or_default() += *bytes;
@@ -814,6 +833,16 @@ async fn forward_events(
         inner.emit(ServiceEvent::Engine { job_id, event: ev });
     }
     persist(run_bytes, &mut persist_error_logged);
+    // The run's article map is saved before it leaves memory, so `Service::article_map`
+    // finds it in one place or the other at every moment.
+    let map = lock(&inner.articles).get(&job_id).cloned();
+    if let Some(map) = map {
+        match inner.store.save_article_map(job_id, &map.to_stored()) {
+            Ok(()) | Err(StoreError::NotFound) => {}
+            Err(e) => inner.log_job(job_id, LogLevel::Warn, format!("could not save the article map of job {job_id}: {e}")),
+        }
+        lock(&inner.articles).remove(&job_id);
+    }
     (fetched, missing_n)
 }
 

@@ -491,6 +491,7 @@ impl Store {
         let tx = conn.transaction()?;
         tx.execute("DELETE FROM job_files WHERE job_id = ?1", [id])?;
         tx.execute("DELETE FROM job_log WHERE job_id = ?1", [id])?;
+        tx.execute("DELETE FROM article_maps WHERE job_id = ?1", [id])?;
         let n = tx.execute("DELETE FROM jobs WHERE id = ?1", [id])?;
         if n == 0 {
             // Dropping the transaction rolls back (nothing was deleted anyway).
@@ -598,6 +599,29 @@ impl Store {
         )?;
         let rows = stmt.query_map([job_id], job_file_from_row)?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Saves a job's article map (encoded text, see the service), replacing an earlier
+    /// one. [`StoreError::NotFound`] for unknown jobs.
+    pub fn save_article_map(&self, job_id: i64, map: &str) -> Result<(), StoreError> {
+        let conn = self.conn();
+        if Self::get_job_locked(&conn, job_id)?.is_none() {
+            return Err(StoreError::NotFound);
+        }
+        conn.execute(
+            "INSERT INTO article_maps (job_id, map) VALUES (?1, ?2)
+             ON CONFLICT (job_id) DO UPDATE SET map = excluded.map",
+            params![job_id, map],
+        )?;
+        Ok(())
+    }
+
+    /// The saved article map of a job, if one was saved.
+    pub fn article_map(&self, job_id: i64) -> Result<Option<String>, StoreError> {
+        let conn = self.conn();
+        Ok(conn
+            .query_row("SELECT map FROM article_maps WHERE job_id = ?1", [job_id], |r| r.get(0))
+            .optional()?)
     }
 
     // -----------------------------------------------------------------------------------

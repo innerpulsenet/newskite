@@ -88,6 +88,7 @@ use newskite_engine::{ConnectionPool, Progress};
 use newskite_nzb::NzbError;
 pub use newskite_postproc::PostStage;
 use newskite_types::{format, EngineEvent, ServerConfig, Settings};
+pub use newskite_types::{ArticleCounts, ArticleMap, ArticleState, FileArticles};
 use tokio::runtime::Handle;
 use tokio::sync::{broadcast, watch};
 use tokio_util::sync::CancellationToken;
@@ -372,6 +373,9 @@ pub(crate) struct Inner {
     /// missing before: their next download asks the fail-over servers first. Cleared when that download ends (not when it is merely
     /// interrupted, so a paused backup retry resumes as one).
     pub(crate) backup_first: Mutex<HashMap<i64, u64>>,
+    /// Article maps of the jobs downloading now, kept up to date from engine events and
+    /// saved to the store when their run ends (see [`Service::article_map`]).
+    pub(crate) articles: Mutex<HashMap<i64, ArticleMap>>,
 }
 
 /// Lock a mutex, recovering the data if a panicking thread poisoned it.
@@ -637,6 +641,7 @@ impl Service {
             sampler_error_logged: AtomicBool::new(false),
             settings_override: Mutex::new(None),
             backup_first: Mutex::new(HashMap::new()),
+            articles: Mutex::new(HashMap::new()),
         });
         match inner.store.reset_interrupted() {
             Ok(0) => {}
@@ -1029,6 +1034,7 @@ impl Service {
             if let Some(token) = cancel {
                 token.cancel();
             }
+            lock(&self.inner.articles).remove(&id);
             Ok(job)
         })();
         match result {
@@ -1124,6 +1130,22 @@ impl Service {
             self.inner.log(LogLevel::Error, format!("could not list jobs: {e}"));
             Vec::new()
         })
+    }
+
+    /// Which articles of a job arrived, are missing or still wait: live while the job
+    /// downloads, else the map saved when its last run ended. `None` for a job that has
+    /// not run since article maps were introduced (or whose saved map is unreadable).
+    pub fn article_map(&self, job_id: i64) -> Option<ArticleMap> {
+        if let Some(m) = lock(&self.inner.articles).get(&job_id) {
+            return Some(m.clone());
+        }
+        match self.inner.store.article_map(job_id) {
+            Ok(text) => text.and_then(|t| ArticleMap::from_stored(&t)),
+            Err(e) => {
+                self.inner.log(LogLevel::Error, format!("could not read the article map of job {job_id}: {e}"));
+                None
+            }
+        }
     }
 
     /// Per-file rows of a job (empty on error).

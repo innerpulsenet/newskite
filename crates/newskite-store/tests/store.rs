@@ -781,3 +781,16 @@ fn job_stats_outcome_and_log_round_trip() {
     let t = s.totals().unwrap();
     assert_eq!((t.articles_fetched, t.articles_missing), (15, 2));
 }
+
+#[test]
+fn article_maps_save_replace_and_go_with_their_job() {
+    let s = mem();
+    let job = s.insert_job(&new_job("maps")).unwrap();
+    assert_eq!(s.article_map(job.id).unwrap(), None);
+    s.save_article_map(job.id, "first").unwrap();
+    s.save_article_map(job.id, "second").unwrap();
+    assert_eq!(s.article_map(job.id).unwrap().as_deref(), Some("second"));
+    assert!(matches!(s.save_article_map(job.id + 100, "x"), Err(StoreError::NotFound)));
+    s.remove_job(job.id).unwrap();
+    assert_eq!(s.article_map(job.id).unwrap(), None);
+}

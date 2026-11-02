@@ -23,7 +23,10 @@ types ← postproc ← service
 
 ## newskite-types (done)
 `config::{Settings, ServerConfig, PostProcessSettings, default_download_dir, default_data_dir}`,
-`events::EngineEvent`, `format::{bytes, speed, percent, fraction, duration_secs}`.
+`events::{EngineEvent, FileLayout}`, `format::{bytes, speed, percent, fraction, duration_secs}`,
+`articles::{ArticleMap, ArticleState, ArticleCounts, FileArticles}` (a job's per-article map:
+`from_layout`, `set`, `complete_file`, `counts`, `cells(max)` folding articles into grid cells,
+and a run-length `to_stored`/`from_stored` text form).
 
 ## newskite-nzb — NZB parsing + yEnc
 ```rust
@@ -170,9 +173,14 @@ Implemented additions (additive): `pub const PART_EXTENSION = "nkpart"`, `BACKOF
 Debug + PartialEq` (8 connections, 2 retries, unlimited, 30 s connect timeout); `DownloadRequest: Clone`
 with a hand-written `Debug` that omits passwords; `FileReport`/`JobReport: Clone + Debug + PartialEq`;
 `Progress: Default` plus `new()`, `bytes_down()`, `segments_done()` getters. Semantics: event `name`s are
-the resolved output name; `FileStarted` is emitted when the name is decided (first decoded part), before
-any `SegmentDone` of that file; `SegmentDone.done` counts every processed segment of the file (missing
-ones included) so it reaches `total`; files skipped for resume emit only a `Log` line and appear in
+the resolved output name; `Layout{files}` comes first, once: every file in NZB order with its segment
+count and whether it is already complete (resume), and a file's index in it is the `file` of the
+article events; `FileStarted` is emitted when the name is decided (first decoded part), before
+any `SegmentDone` of that file; `SegmentDone{file,index}` places each stored segment (index = position
+in the file's segment-number order), `SegmentMissing{file,index}` reports an article no server could
+supply, `FileComplete{file}` a file found complete on disk by content once the run started;
+`SegmentDone.done` counts every processed segment of the file (missing ones included) so it reaches
+`total`; files skipped for resume emit only a `Log` line and appear in
 `JobReport` with their on-disk size; `Progress::bytes_down` counts decoded bytes stored this run,
 `segments_done` counts processed segments. Missing/undecodable articles are tried once on every other
 usable server. A segment that exhausts `retries` on transient errors stops the job with `Connect`
@@ -234,6 +242,7 @@ impl Store {
   pub fn set_queue_order(&self,ids:&[i64])->Result<(),_> /* positions 1.. in the given order */;
   pub fn reset_interrupted(&self)->Result<usize,_> /* downloading -> queued, at startup (the lock makes the opener the only owner) */;
   pub fn upsert_job_file(&self,f:&JobFile)->Result<(),_>; pub fn job_files(&self,job_id:i64)->Result<Vec<JobFile>,_>;
+  pub fn save_article_map(&self,job_id:i64,map:&str)->Result<(),_>; pub fn article_map(&self,job_id:i64)->Result<Option<String>,_>; // schema v5
   // bookmarks
   pub fn list_bookmarks(&self)->Result<Vec<Bookmark>,_> /* tree order: parents before children, by order */;
   pub fn add_bookmark(&self,b:&NewBookmark)->Result<Bookmark,_>; pub fn update_bookmark(&self,b:&Bookmark)->Result<(),_>;
@@ -394,6 +403,8 @@ Implemented additions (additive): consts `LOG_CAPACITY` (50), `EVENT_CAPACITY` (
 `pub type ShutdownHook = Arc<dyn Fn()->Result<(),String>+Send+Sync>` and
 `Service::set_shutdown_hook(&self, ShutdownHook)` (replaces the power-off command; still only used
 when `allow_shutdown`); `pub fn shutdown_command()->Option<(&str,&[&str])>`; `Service::job_files(id)`,
+`Service::article_map(id)->Option<ArticleMap>` (live while the job downloads, else the map saved when
+its last run ended; re-exports `ArticleMap, ArticleState, ArticleCounts, FileArticles`),
 `Service::options()`; `LogLevel::as_str` + `Display`; `ServiceEvent: Clone+Debug+PartialEq+Eq`,
 `Status: Default`; re-exports `Store, StoreError, Job, JobFile, JobState, NewBookmark, Bookmark,
 ThroughputSample, Totals`. Semantics: `with_store` also resets interrupted jobs and starts the timers;

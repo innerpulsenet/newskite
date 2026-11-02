@@ -24,6 +24,7 @@ use super::app::{Action, Data, HISTORY_SECS, LIVE_WINDOW_SECS};
 use super::fonts;
 use super::queue::eta_secs;
 use super::theme::Palette;
+use super::articles;
 use super::motion;
 use super::widgets::{
     card, icon_button, paint_icon, section_title, segment_track, segmented, spaced, state_badge,
@@ -53,10 +54,10 @@ const LEVEL_COL_W: f32 = 14.0;
 const TIME_COL_W: f32 = 58.0;
 /// Seconds a new message stays marked.
 const MESSAGE_NEW_SECS: f64 = 6.0;
-/// Width of the Throughput card in the row, as a share of the window and its bounds.
-const THROUGHPUT_SHARE: f32 = 0.24;
-const THROUGHPUT_MIN_W: f32 = 250.0;
-const THROUGHPUT_MAX_W: f32 = 340.0;
+/// Width of the Articles card in the row, as a share of the window and its bounds.
+const ARTICLES_SHARE: f32 = 0.28;
+const ARTICLES_MIN_W: f32 = 260.0;
+const ARTICLES_MAX_W: f32 = 420.0;
 /// Width of the Details card in the row (only while a job is selected), share and bounds.
 const DETAILS_SHARE: f32 = 0.3;
 const DETAILS_MIN_W: f32 = 300.0;
@@ -233,7 +234,7 @@ pub fn time_points(
 
 #[derive(Clone, Copy)]
 enum Dock {
-    Throughput,
+    Articles,
     Details,
     Log,
 }
@@ -242,20 +243,20 @@ impl Dock {
     /// The docks to show, left to right (top to bottom in the stack, where the log leads).
     fn shown(details: bool, stack: bool) -> Vec<Dock> {
         match (details, stack) {
-            (true, false) => vec![Dock::Throughput, Dock::Details, Dock::Log],
-            (false, false) => vec![Dock::Throughput, Dock::Log],
-            (true, true) => vec![Dock::Log, Dock::Details, Dock::Throughput],
-            (false, true) => vec![Dock::Log, Dock::Throughput],
+            (true, false) => vec![Dock::Articles, Dock::Details, Dock::Log],
+            (false, false) => vec![Dock::Articles, Dock::Log],
+            (true, true) => vec![Dock::Log, Dock::Details, Dock::Articles],
+            (false, true) => vec![Dock::Log, Dock::Articles],
         }
     }
 }
 
-/// Widths of the row's cards for a row `width` px wide: Throughput, Details (0 when not
+/// Widths of the row's cards for a row `width` px wide: Articles, Details (0 when not
 /// shown) and Log, which takes what is left. Gaps between cards are subtracted first.
 pub fn row_widths(width: f32, details: bool) -> (f32, f32, f32) {
     let width = if width.is_finite() { width.max(0.0) } else { 0.0 };
     let gaps = DOCK_GAP * if details { 2.0 } else { 1.0 };
-    let t = (width * THROUGHPUT_SHARE).clamp(THROUGHPUT_MIN_W, THROUGHPUT_MAX_W);
+    let t = (width * ARTICLES_SHARE).clamp(ARTICLES_MIN_W, ARTICLES_MAX_W);
     let d = if details { (width * DETAILS_SHARE).clamp(DETAILS_MIN_W, DETAILS_MAX_W) } else { 0.0 };
     let log = (width - gaps - t - d).max(0.0);
     (t, d, log)
@@ -358,7 +359,7 @@ fn dock(
         ui.horizontal(|ui| {
             ui.set_min_height(18.0);
             let title = match which {
-                Dock::Throughput => "Throughput",
+                Dock::Articles => "Articles",
                 Dock::Details => "Details",
                 Dock::Log => "Log",
             };
@@ -380,7 +381,7 @@ fn dock(
         });
         ui.add_space(6.0);
         match which {
-            Dock::Throughput => graph(ui, pal, c.data, c.motion),
+            Dock::Articles => articles_dock(ui, pal, c.data, c.motion.animate),
             Dock::Log => messages(ui, pal, c.data, state.log_filter, c.motion.animate, actions),
             Dock::Details => {
                 if let Some(job) = c.selected {
@@ -425,7 +426,7 @@ pub fn show(
                 ui.spacing_mut().item_spacing.x = DOCK_GAP;
                 for which in Dock::shown(with_details, false) {
                     let w = match which {
-                        Dock::Throughput => tw,
+                        Dock::Articles => tw,
                         Dock::Details => dw,
                         Dock::Log => lw,
                     };
@@ -509,6 +510,66 @@ fn gradient_fill(points: &[Pos2], bottom: f32, top: Color32, clear: Color32) -> 
         mesh.add_triangle(i, i + 2, i + 3);
     }
     Shape::mesh(mesh)
+}
+
+/// What the Articles dock shows when there is no job to show.
+pub const NO_ARTICLES: &str = "Nothing downloading. Select a job to see its articles.";
+
+/// The Articles dock: the article grid of the job downloading now, else of the selected
+/// job, with its name, counts and the key.
+fn articles_dock(ui: &mut Ui, pal: &Palette, data: &Data, animate: bool) {
+    let Some(job) = data.activity_job.and_then(|id| data.jobs.iter().find(|j| j.id == id)) else {
+        ui.add_space(12.0);
+        ui.vertical_centered(|ui| ui.label(RichText::new(NO_ARTICLES).color(pal.muted)));
+        return;
+    };
+    ui.spacing_mut().item_spacing.y = 5.0;
+    let map = data.article_maps.get(&job.id);
+    // The name, with the counts at the right end of the same line, or under it when the
+    // card is too narrow for both.
+    let counts = map.map(|m| articles::summary(&m.counts())).unwrap_or_default();
+    let fig_w = ui.painter().layout_no_wrap(counts.clone(), fonts::mono_id(11.0), pal.muted).size().x;
+    let name = |ui: &mut Ui| {
+        ui.add(egui::Label::new(RichText::new(&job.name).font(fonts::semibold_id(12.5)).color(pal.text)).truncate());
+    };
+    let name_w = ui.available_width() - fig_w - 12.0;
+    if name_w >= 120.0 {
+        ui.horizontal(|ui| {
+            ui.allocate_ui_with_layout(Vec2::new(name_w, 18.0), egui::Layout::left_to_right(egui::Align::Center), name);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(RichText::new(&counts).font(fonts::mono_id(11.0)).color(pal.muted));
+            });
+        });
+    } else {
+        name(ui);
+        if !counts.is_empty() {
+            ui.add(egui::Label::new(RichText::new(&counts).font(fonts::mono_id(11.0)).color(pal.muted)).truncate());
+        }
+    }
+    let Some(map) = map else {
+        ui.label(
+            RichText::new("No article map yet: it is recorded while this job downloads.")
+                .small()
+                .color(pal.muted),
+        );
+        return;
+    };
+    // The grid takes the rows it needs, at most what the card has left above the key.
+    let w = ui.available_width();
+    let room = Vec2::new(w, (ui.available_height() - 40.0).max(12.0));
+    let per = articles::per_cell(map, room);
+    let legend_h = articles::legend_height(ui, pal, per, w);
+    let max_h = (ui.available_height() - legend_h - 6.0).max(12.0);
+    let size = Vec2::new(w, articles::fit_height(map.len(), w, max_h));
+    articles::grid(ui, pal, Id::new(("articles-dock", job.id)), map, size, !animate);
+    articles::legend(ui, pal, articles::per_cell(map, size));
+}
+
+/// The throughput readout and graph: speed and what is left, the live plot of the last
+/// minutes over the 24 h strip (shown when hovering the status bar's sparkline).
+pub fn throughput_graph(ui: &mut Ui, pal: &Palette, data: &Data, reduced_motion: bool) {
+    let motion = Motion::new(ui, data, reduced_motion);
+    graph(ui, pal, data, motion);
 }
 
 fn graph(ui: &mut Ui, pal: &Palette, data: &Data, motion: Motion) {
@@ -1403,10 +1464,10 @@ mod tests {
     fn the_log_takes_the_rest_of_the_row() {
         let (t, d, l) = row_widths(1600.0, false);
         assert_eq!(d, 0.0);
-        assert!(l > 3.0 * t, "{t} {l}");
+        assert!(l > 2.0 * t, "{t} {l}");
         assert_eq!(t + l + DOCK_GAP, 1600.0);
         let (t, d, l) = row_widths(944.0, true);
-        assert!(t >= THROUGHPUT_MIN_W && d >= DETAILS_MIN_W && l > 0.0);
+        assert!(t >= ARTICLES_MIN_W && d >= DETAILS_MIN_W && l > 0.0);
         assert_eq!(t + d + l + 2.0 * DOCK_GAP, 944.0);
         assert_eq!(row_widths(f32::NAN, true).2, 0.0);
     }

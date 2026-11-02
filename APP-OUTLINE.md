@@ -176,9 +176,10 @@ intent is a focused NZB downloader: everything on screen is about the queue.
 │ summary: 3 jobs · 4.2 GB to go · about 21 min at 3.4 MB/s · 1 held           │
 │ #  Name / folder or live speed   State   Size   Progress   ▶/⏸ ↑ ⋯ ×  │ INSP- │
 ├─────────────────────────────────────────────────────────────────────┤ ECTOR │
-│ Throughput             │ Server (+ health)        │ Log [All|Warn|Err]│(sel.) │
+│ Articles (grid)        │ Log [All|Warn|Err]                         │(sel.) │
 ├──────────────────────────────────────────────────────────────────────────────┤
-│ STATUS BAR: 128 GB free · 2.2 GB downloaded           N in queue  [Online]   │
+│ SERVER STRIP: host:port TLS · articles · missing · CONN ▮▮▮▯ 12/20  [Retry]  │
+│ [Online] 2 servers · 20 conn · TLS   ∿ Idle · peak 6.4 MB/s ~~~   ⛁ 128 GB free│
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -242,10 +243,13 @@ Header (state chip, name, NZB, open folder, close). Tabs:
 
 Toasts in the lower right announce each finished (6 s) or failed (15 s) job, with Show.
 
-### 6.3 Bottom docks (three, equal width)
-1. **Throughput** — current speed (live dot while bytes move), bytes left and time left;
-   a live plot of the last 10 min over a 24 h history strip (two time axes never share one
-   plot). One stored sample must still draw a visible (flat) trace.
+### 6.3 Bottom docks
+1. **Articles** — the article grid of the job downloading now, else of the selected job:
+   one cell per article in file and segment order (arrived, missing on every server,
+   waiting), several articles per cell for big jobs (said in the key; a cell with any
+   missing article shows missing). The map comes from the engine's per-article events and
+   is saved when a run ends, so finished jobs keep theirs; the inspector shows it too.
+   Hovering a cell names its file and articles; freshly arrived cells glow briefly.
 2. **Server** — `host:port`, TLS/Plain chip, username, fail-over count, per-server health
    this session (ok / errors / login refused; articles, not-on-server, errors; last error on
    hover), connection slots (`effective / max`), and tiles for articles fetched and missing
@@ -259,10 +263,15 @@ Toasts in the lower right announce each finished (6 s) or failed (15 s) job, wit
 All dock motion stops under reduced motion.
 
 ### 6.4 Status bar
-Left: free space on the download folder's filesystem (warning color when low or smaller
-than what the queue still needs) and the lifetime downloaded total. Right: jobs in queue, a
-state pill — `Online` when connected and idle, `Downloading`/speed while active, `Paused`,
-`No server`, or the error cause — and the innerpulse credit.
+Left: a state pill — `Online` when a server is set and the queue is idle, `Downloading`
+while active, `Paused`, `No server`, or the error cause — and the servers a run uses
+(`2 servers · 20 conn · TLS`). Center: the speed, what is left and the time left while a
+run is active (`Idle · peak …` otherwise, the fastest second on record) beside a sparkline
+of the last 10 min (or the stored 24 h); hovering it shows the throughput graph: the live
+plot over the 24 h history strip (two time axes never share one plot; one stored sample
+still draws a visible, flat trace). Right: free space on the download folder's filesystem
+(warning color when low or smaller than what the queue still needs; the lifetime total on
+hover) and the innerpulse credit.
 
 ### 6.5 Settings sheet (modal)
 Sections, each a labeled group; footer `Cancel` / `Save`:

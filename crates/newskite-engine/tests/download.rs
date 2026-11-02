@@ -42,19 +42,24 @@ async fn acceptance_two_mib_eight_parts_with_auth() {
     assert_eq!(server.body_requests(), 8);
     assert!(server.connections_accepted() <= 4, "reuses at most 4 connections");
 
-    // Event order: FileStarted, 8 x SegmentDone (done reaching 8), FileDone.
+    // Event order: Layout, FileStarted, 8 x SegmentDone (done reaching 8), FileDone.
     let file_events: Vec<&EngineEvent> = out.events.iter().filter(|e| !matches!(e, EngineEvent::Log(_) | EngineEvent::Warn(_))).collect();
-    assert!(matches!(file_events[0], EngineEvent::FileStarted { name, segments: 8 } if name == "payload.bin"));
-    let dones: Vec<usize> = file_events[1..9]
+    assert!(matches!(file_events[0], EngineEvent::Layout { files }
+        if files.len() == 1 && files[0].segments == 8 && !files[0].complete));
+    assert!(matches!(file_events[1], EngineEvent::FileStarted { name, segments: 8 } if name == "payload.bin"));
+    let (dones, mut places): (Vec<usize>, Vec<(usize, usize)>) = file_events[2..10]
         .iter()
         .map(|e| match e {
-            EngineEvent::SegmentDone { done, total: 8, .. } => *done,
+            EngineEvent::SegmentDone { done, total: 8, file, index, .. } => (*done, (*file, *index)),
             other => panic!("unexpected {other:?}"),
         })
-        .collect();
+        .unzip();
     assert_eq!(dones, (1..=8).collect::<Vec<_>>());
-    assert!(matches!(file_events[9], EngineEvent::FileDone { bytes, .. } if *bytes == (2 * MIB) as u64));
-    assert_eq!(file_events.len(), 10);
+    // Every article reported once, at its own place in the layout.
+    places.sort();
+    assert_eq!(places, (0..8).map(|i| (0, i)).collect::<Vec<_>>());
+    assert!(matches!(file_events[10], EngineEvent::FileDone { bytes, .. } if *bytes == (2 * MIB) as u64));
+    assert_eq!(file_events.len(), 11);
 
     let logs = logs(&out.events);
     assert!(logs.iter().any(|l| l.starts_with("Starting download: 1 file(s)")));
@@ -115,6 +120,17 @@ async fn missing_article_fails_job_and_keeps_part_file() {
         |e| matches!(e, EngineEvent::FileFailed { name, missing } if name == "movie.mkv" && missing == &vec![missing_id.clone()])
     ));
     assert!(!out.events.iter().any(|e| matches!(e, EngineEvent::FileDone { .. })));
+    // The missing article is reported at its place, and only there.
+    let missing_at: Vec<usize> = out
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            EngineEvent::SegmentMissing { file: 0, index } => Some(*index),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(missing_at.len(), 1);
+    assert!(!out.events.iter().any(|e| matches!(e, EngineEvent::SegmentDone { index, .. } if *index == missing_at[0])));
     let logs = logs(&out.events);
     assert!(logs.iter().any(|l| l.contains("1 missing article(s)") && l.contains(&missing_id)));
     // Missing on the only server: asked exactly once.
@@ -301,6 +317,9 @@ async fn resume_skips_completed_files() {
     assert_eq!(listing(dir.path()), vec!["done.bin", "todo.bin"]);
     assert!(logs(&out.events).iter().any(|l| l.contains("done.bin: already complete")));
     assert!(!out.events.iter().any(|e| matches!(e, EngineEvent::FileStarted { name, .. } if name == "done.bin")));
+    // The layout says which file is already complete.
+    assert!(out.events.iter().any(|e| matches!(e, EngineEvent::Layout { files }
+        if files.iter().map(|f| (f.segments, f.complete)).collect::<Vec<_>>() == vec![(4, true), (3, false)])));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -319,6 +338,8 @@ async fn resume_skips_when_yenc_name_differs_from_subject() {
     assert_eq!(server.body_requests(), 1, "only the first part was needed to learn the name");
     assert_eq!(report.files[0].name, "real.bin");
     assert_eq!(listing(dir.path()), vec!["real.bin"]);
+    // Found complete by content: every article of it counts as done.
+    assert!(out.events.iter().any(|e| matches!(e, EngineEvent::FileComplete { file: 0 })));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
