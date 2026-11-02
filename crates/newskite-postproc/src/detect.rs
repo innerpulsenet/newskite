@@ -241,10 +241,10 @@ fn should_sniff(name: &str) -> bool {
 /// One archive set ready to extract.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ArchiveSet {
-    /// Format used to choose the tool (from magic bytes when they are recognized,
+    /// Format used to choose the backend (from magic bytes when they are recognized,
     /// otherwise from the file name).
     pub kind: ArchiveKind,
-    /// The file handed to the tool (first volume).
+    /// The first volume (the one opened; later volumes are found from it).
     pub first: PathBuf,
     /// All files belonging to the set, including `first` (removed on cleanup).
     pub volumes: Vec<PathBuf>,
