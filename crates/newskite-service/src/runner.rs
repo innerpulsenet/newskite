@@ -447,11 +447,11 @@ async fn post_process(inner: &Arc<Inner>, job: &Job, settings: &Settings) -> Res
             inner.log(
                 LogLevel::Info,
                 format!(
-                    "post-processing {} took {}: par2 {}, extract {}",
+                    "post-processing {}: par2 {}, extract {} ({})",
                     job.name,
-                    format::duration_secs(secs),
                     post.par2,
-                    post.extract
+                    post.extract,
+                    format::duration_secs(secs)
                 ),
             );
             if post.par2.is_failed() || post.extract.is_failed() {
