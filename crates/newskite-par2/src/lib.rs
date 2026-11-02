@@ -4,13 +4,19 @@
 //! * [`load`] parses every packet of the given files (names do not matter, so obfuscated
 //!   PAR2 files work as-is) and builds the [`RecoverySet`]s found. Corrupt packets are
 //!   skipped by their checksum; the parser resynchronizes on the packet magic.
-//! * [`verify`] checks each protected file slice by slice, finds complete copies under
+//! * [`verify`] checks each protected file slice by slice (MD5 of every slice; a file is
+//!   intact when all its slices are and its length is right), finds complete copies under
 //!   other names (obfuscated posts) by size and MD5, and collects good slices at aligned
 //!   offsets of other files. It reports a [`FileStatus`] per file.
-//! * [`repair`] rebuilds the missing slices into temporary copies, checks each copy's
-//!   MD5, and only then keeps the damaged original as `name.1` and moves the copy into
+//! * [`repair`] rebuilds the missing slices into temporary copies, checks every slice of
+//!   each copy against its MD5, and only then keeps the damaged original as `name.1` and moves the copy into
 //!   place; misnamed copies are renamed to their real names. Target names that are not
 //!   plain relative paths are refused, and folders are never created through links.
+//!
+//! Slice checks, recovery checks and the repair arithmetic run on several threads; the
+//! GF(2^16) multiply-accumulate uses SSSE3 or AVX2 when the CPU has them (detected at run
+//! time, with a portable fallback), so repair speed is bounded by the disk rather than the
+//! CPU on most machines.
 //!
 //! Progress is reported through [`Event`]s (per file, and bytes/work units per stage) so
 //! callers can show it. Data shifted by inserted or deleted bytes (not slice aligned) is
@@ -19,6 +25,7 @@
 mod create;
 mod gf;
 mod packet;
+mod pio;
 mod repair;
 mod verify;
 

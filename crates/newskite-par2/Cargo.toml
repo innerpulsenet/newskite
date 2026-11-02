@@ -13,3 +13,7 @@ thiserror.workspace = true
 
 [dev-dependencies]
 tempfile = "3.27"
+
+[[bench]]
+name = "par2"
+harness = false

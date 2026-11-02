@@ -5,8 +5,9 @@
 //! `DATE`, `MODE READER` and `QUIT`; anything else gets `500`. When credentials are
 //! configured, `BODY`/`STAT`/`GROUP` before authentication get `480`.
 //!
-//! Article bodies are stored raw and dot-stuffed on the way out, each line sent with
-//! `\r\n`. Note the server is for tests only: credentials are compared naively.
+//! Article bodies are given raw and dot-stuffed once when the server starts, each line sent
+//! with `\r\n` (so serving an article costs a copy, and throughput benchmarks measure the
+//! client). Note the server is for tests only: credentials are compared naively.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -72,7 +73,10 @@ impl MockServer {
     ///
     /// # Panics
     /// If the loopback listener cannot be bound (test-environment failure).
-    pub async fn start(cfg: MockConfig) -> MockServer {
+    pub async fn start(mut cfg: MockConfig) -> MockServer {
+        for body in cfg.articles.values_mut() {
+            *body = dot_stuff(body);
+        }
         let listener = TcpListener::bind(("127.0.0.1", 0))
             .await
             .expect("mock NNTP server: bind 127.0.0.1:0");
@@ -205,10 +209,11 @@ async fn serve(socket: TcpStream, cfg: &MockConfig, counters: &Counters) -> std:
                     if cfg.delay_ms > 0 {
                         tokio::time::sleep(Duration::from_millis(cfg.delay_ms)).await;
                     }
+                    // Bodies were dot-stuffed in `start`.
                     match cfg.articles.get(strip_brackets(arg)) {
-                        Some(body) => {
+                        Some(stuffed) => {
                             let mut out = format!("222 0 {arg}\r\n").into_bytes();
-                            out.extend_from_slice(&dot_stuff(body));
+                            out.extend_from_slice(stuffed);
                             out
                         }
                         None => b"430 no such article\r\n".to_vec(),

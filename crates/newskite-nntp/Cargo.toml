@@ -15,6 +15,7 @@ testkit = []
 newskite-types.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+memchr = "2"
 tokio = { workspace = true }
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12", "logging"] }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"] }
