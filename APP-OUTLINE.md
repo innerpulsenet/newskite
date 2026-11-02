@@ -165,113 +165,125 @@ Each feature lists: what it does, rules, and edge cases the implementation must 
 
 ## 5. Interface overview — window
 
-Single window: a toolbar, the job tables, a strip of three docks, and a status bar. The
-intent is a focused NZB downloader: everything on screen is about the queue.
+Single window, a quiet list: a sidebar, a header over the job list, a detail pane for the
+selected job, the server strip and a status bar. The intent is a focused NZB downloader:
+everything on screen is about the queue.
 
 ```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│ MASTHEAD │ Add NZB  Start/Pause/Resume  Scan Folder  Downloads       Settings │
-├──────────────────────────────────────────────────────────────────────────────┤
-│ TABS: Queue (n) | History (n)                              [Filter by name]  │
-│ summary: 3 jobs · 4.2 GB to go · about 21 min at 3.4 MB/s · 1 held           │
-│ #  Name / folder or live speed   State   Size   Progress   ▶/⏸ ↑ ⋯ ×  │ INSP- │
-├─────────────────────────────────────────────────────────────────────┤ ECTOR │
-│ Articles (grid)        │ Log [All|Warn|Err]                         │(sel.) │
-├──────────────────────────────────────────────────────────────────────────────┤
-│ SERVER STRIP: host:port TLS · articles · missing · CONN ▮▮▮▯ 12/20  [Retry]  │
-│ [Online] 2 servers · 20 conn · TLS   ∿ Idle · peak 6.4 MB/s ~~~   ⛁ 128 GB free│
-└──────────────────────────────────────────────────────────────────────────────┘
+┌──────────┬───────────────────────────────────────────────┬────────────────────┐
+│ ▮ newsk… │ Queue                  [Filter] All|Active|Held│ ◔ 39%  Name        │
+│          │ 3 jobs · 4.2 GB to go · about 21 min at …      │   ~/Downloads/…    │
+│ Queue  3 │      [Start/Pause/Resume]  [ADD NZB]           │ Overview | Log n   │
+│ History 9│ ┌───────────────────────────────────────────┐ │ LIFECYCLE          │
+│ Log    2 │ │ Name  State  39% · 1.0 MB/s · 1:40 left ▶↑⋯×│ │ ARTICLE MAP ▦▦▦▦  │
+│ Watch    │ │ ~/Downloads/Newskite/Name                 │ │ FILES  name ▦▦ n/N │
+│ Settings │ │ ▪▪▪▪▪▪▪▪▪▪▪▪▫▫▫▫▫▫▫▫▫ (article strip)      │ │ NUMBERS · WHERE    │
+│          │ └───────────────────────────────────────────┘ │                    │
+│ disk ▬▬▭ │ RECENTLY FINISHED (rows in the same style)     │                    │
+├──────────┴───────────────────────────────────────────────┴────────────────────┤
+│ SERVER STRIP: host:port TLS · articles · missing · CONN ▮▮▮▯ 12/20  [Retry]   │
+│ ● 2 servers · 20 TLS     ∿ Downloading · 18.4 MB/s · peak 31.2 MB/s ~~~  ⛁ free│
+└───────────────────────────────────────────────────────────────────────────────┘
 ```
 
 Rules:
-- The window resizes gracefully down to ~960×600; docks stack in one column below 900 px.
-- From 1100 px wide, a selected job opens the **Inspector** as a full-height right column;
-  narrower windows show the selection in the Details dock instead.
+- The window resizes gracefully down to ~960×600; below 1100 px the sidebar is a rail of
+  icons with the same entries.
+- A selected job opens the **detail pane** as a full-height right column; it slides in and
+  out.
 - Empty states everywhere (no server, no jobs, no history) must render as readable text, never
   `NaN`, `Infinity`, `undefined`, or a blank panel.
-- All colors from theme tokens; all numbers formatted (e.g. `1.4 MB`, `0 B/s`).
-- Time left is shown only from a measured speed, never guessed.
+- All colors from theme tokens; all numbers formatted (e.g. `1.4 MB`, `0 B/s`); small text
+  reaches 4.5:1 on every surface in every theme.
+- Time left is shown only from a measured speed, never guessed. Article cells show only what
+  the engine reported (downloaded, missing, waiting); none claims an article is in flight.
 
 ---
 
 ## 6. Interface overview — controls
 
-### 6.1 Toolbar (left→right)
+### 6.1 Sidebar and header
 | Control | Behavior |
 |---|---|
-| Masthead | Mark, wordmark and server readout; opens About |
-| **Add NZB** | Reveals an inline path field (Browse…, Add); on success: queue reload, Queue tab, the new job selected |
-| Start / Pause / Resume | The whole queue; label and icon follow the state; Start is disabled with nothing queued |
-| Scan Folder | Import new `.nzb` files from the watch folder now (shown only when one is set) |
-| Downloads | Opens the download folder in the file manager |
+| Mark and wordmark | The mark beats while Newskite works; opens About (the server readout on hover) |
+| Queue / History / Log | The views, with their counts (Log: warnings and errors) |
+| Watch folder | Import new `.nzb` files from the watch folder now (Settings when none is set) |
 | Settings | Opens the Settings sheet |
+| Disk meter | Free space on the download folder's disk and how full it is; opens the folder |
+| Header | The view's title and a one-line summary; filter by name; All / Active / Held |
+| Start / Pause / Resume | The whole queue; label and icon follow the state; Start is disabled with nothing queued |
+| **Add NZB** | Reveals an inline path field (Browse…, Add); on success: queue reload, Queue view, the new job selected |
 
-### 6.2 Queue tab
+### 6.2 Queue
 - Summary line: job count, bytes to go, time left at the measured speed, held count; a
   `Start all` button when a run limited to single jobs leaves others queued.
-- Columns: `#` (queue position), `Name` (subline: folder, live speed + time left while
-  downloading, or the error), `State` badge, `Size`, `Progress` (segment track + `NN%` +
-  `done / total`), controls.
+- Each row: the name, the state in words (Downloading, Queued, Held, or the post-processing
+  stage), the figure (percent and the live speed with time left, or done / total, or the
+  size), the controls; then the folder (or why it is held); then a thin strip of the job's
+  articles (downloaded, missing outlined, waiting; held jobs in the muted tone). A job
+  without an article map shows a plain progress line instead.
 - Controls per row: start/pause toggle (downloading → pause; queued in the active run → hold;
   queued outside any run or held → start on its own; failed → retry), move up, a `⋯` menu,
   remove (inline `Remove?` Yes/No). Right click opens the same menu: pause/hold/resume/download
   now, move to top/up/down/bottom, open download folder, archive password, remove.
-- Click selects a row (Details dock). Keys on the selection: Space toggles, Delete asks to
-  remove, Alt+↑/↓ move, Esc clears. Ctrl+F focuses the filter.
+- Click selects a row (the detail pane opens). Keys on the selection: Space toggles, Delete
+  asks to remove, Alt+↑/↓ move, Esc clears. Ctrl+F focuses the filter.
+- Under the queue, the jobs that finished in the last 24 hours, in the same row style.
 - Empty state: "The queue is empty. Add an NZB to begin." with an Add NZB button.
 
-### 6.2b History tab
-Done and failed jobs, most recently finished first: `Name` (subline: total time and average
-speed, or the error), `Result` (chip plus what decided it: repaired / extracted / verified,
-or the failure kind), `Size`, `Finished` (relative; exact UTC time on hover), actions (open
-folder, retry and archive password for failed jobs, delete files, remove). Double-click
-opens the folder. `Clear history` with inline confirmation removes the rows (files stay on
-disk) or, via `Delete files too…` and a second confirmation, deletes their folders.
+### 6.2b History
+Done and failed jobs, most recently finished first, in the queue's row style: the state
+(Done / Failed), size and when it finished (relative; exact times on hover), how it went
+(total time, average speed, repaired / extracted / verified) or the error, the article
+strip, and actions (open folder, retry and archive password for failed jobs, delete files,
+remove). Double-click opens the folder. `Clear history` with inline confirmation removes the
+rows (files stay on disk) or, via `Delete files too…` and a second confirmation, deletes
+their folders.
 
-### 6.2c Inspector (selected job)
-Header (state chip, name, NZB, open folder, close). Tabs:
+### 6.2c Detail pane (selected job)
+Header: the state in words, open folder, close; a progress ring, the name and the folder.
+Tabs:
 - **Overview** — for a failed job a problem card first (failure kind, the full selectable
   reason, what to do, Retry / Set password / Servers / Copy error). Then the **lifecycle**:
   Added → Download → Verify → Repair → Extract → Clean up → Done/Failed, each step marked
   done, live (with its fraction and detail), needs-a-look, failed, skipped or waiting, with
-  its duration. Then **numbers** (size, average speed, time downloading and
-  post-processing, articles, missing, slices rebuilt, files cleaned up; only measured
-  values) and **where** (folder, extraction folder, NZB).
-- **Files** — per-file tracks, incomplete files first.
+  its duration. Then the **article map** (one cell per article, several per cell for big
+  jobs, said in its key; hovering a cell names its file and articles; freshly downloaded
+  cells glow briefly), the **files** (one lane of cells per file with `n / N` articles;
+  per-file byte tracks for jobs without a map), the **numbers** (size, average speed, time
+  downloading and post-processing, articles, missing, slices rebuilt, files cleaned up;
+  only measured values) and **where** (folder, extraction folder, NZB).
 - **Log** — the job's own log (kept across restarts, newest 500 lines), Copy log, Open log
   file.
 
+The article map comes from the engine's per-article events and is saved when a run ends, so
+finished jobs keep theirs.
+
 Toasts in the lower right announce each finished (6 s) or failed (15 s) job, with Show.
 
-### 6.3 Bottom docks
-1. **Articles** — the article grid of the job downloading now, else of the selected job:
-   one cell per article in file and segment order (arrived, missing on every server,
-   waiting), several articles per cell for big jobs (said in the key; a cell with any
-   missing article shows missing). The map comes from the engine's per-article events and
-   is saved when a run ends, so finished jobs keep theirs; the inspector shows it too.
-   Hovering a cell names its file and articles; freshly arrived cells glow briefly.
-2. **Server** — `host:port`, TLS/Plain chip, username, fail-over count, per-server health
-   this session (ok / errors / login refused; articles, not-on-server, errors; last error on
-   hover), connection slots (`effective / max`), and tiles for articles fetched and missing
-   this session and the lifetime total. On narrow windows a selected job shows here as
-   **Details** instead.
-3. **Log** — last 500 lines, newest first, level filter (All / Warnings / Errors); three
-   columns (level mark, clock, text) so long lines wrap under their own text. A line about
-   a job opens it. Everything is also written to `newskite.log` in the data folder
-   (rotated at 4 MB).
+### 6.3 Log and server strip
+- **Log** (a view of its own) — last 500 lines, newest first, level filter (All / Warnings /
+  Errors); three columns (level mark, clock, text) so long lines wrap under their own text.
+  A line about a job opens it. Everything is also written to `newskite.log` in the data
+  folder (rotated at 4 MB).
+- **Server strip** (above the status bar) — `host:port`, TLS/Plain, role, per-server health
+  this session (ok / errors / login refused; articles, not-on-server), connection slots
+  (`effective / max`) and `Retry N on backup` for failed jobs, with a confirmation that
+  says what will happen.
 
-All dock motion stops under reduced motion.
+All motion stops under reduced motion.
 
 ### 6.4 Status bar
-Left: a state pill — `Online` when a server is set and the queue is idle, `Downloading`
-while active, `Paused`, `No server`, or the error cause — and the servers a run uses
-(`2 servers · 20 conn · TLS`). Center: the speed, what is left and the time left while a
-run is active (`Idle · peak …` otherwise, the fastest second on record) beside a sparkline
-of the last 10 min (or the stored 24 h); hovering it shows the throughput graph: the live
-plot over the 24 h history strip (two time axes never share one plot; one stored sample
-still draws a visible, flat trace). Right: free space on the download folder's filesystem
-(warning color when low or smaller than what the queue still needs; the lifetime total on
-hover) and the innerpulse credit.
+Left: a state dot (Online, Downloading, Pausing, Paused, No server, or the error) and the
+servers a run uses (`2 servers · 20 TLS`; hovering shows each server's health this
+session); with no server, a link to Settings; on an error, the cause (a click opens the
+failed job). Center: what the queue is doing (`Downloading · 18.4 MB/s`, `Paused`, `Idle`)
+and the fastest second on record (`peak …`) beside a sparkline of the last 10 min (or the
+stored 24 h); hovering it shows the throughput graph: the live plot over the 24 h history
+strip (two time axes never share one plot; one stored sample still draws a visible, flat
+trace). Right: free space on the download folder's filesystem (warning color when low or
+smaller than what the queue still needs; the lifetime total on hover) and the innerpulse
+credit.
 
 ### 6.5 Settings sheet (modal)
 Sections, each a labeled group; footer `Cancel` / `Save`:
