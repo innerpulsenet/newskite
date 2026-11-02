@@ -136,6 +136,10 @@ pub enum Action {
     MoveJob(i64, JobMove),
     /// Remove every finished job from the list.
     ClearHistory,
+    /// Remove every finished job and delete its download folder.
+    ClearHistoryAndFiles,
+    /// Remove a finished job and delete its download folder.
+    DeleteJobFiles(i64),
     /// Open a job's download folder in the file manager.
     OpenJobFolder(i64),
     /// Select a job (its details show in the Details dock) or clear the selection.
@@ -734,6 +738,20 @@ impl NewskiteApp {
                 self.reload_jobs();
                 self.data.logs = self.service.logs();
             }
+            Action::ClearHistoryAndFiles => {
+                self.service.clear_history_and_files();
+                self.reload_jobs();
+                self.data.logs = self.service.logs();
+            }
+            Action::DeleteJobFiles(id) => {
+                let _ = self.service.delete_job_files(id);
+                if self.view.queue.selected == Some(id) {
+                    self.view.queue.selected = None;
+                    self.data.selected_files.clear();
+                }
+                self.reload_jobs();
+                self.data.logs = self.service.logs();
+            }
             Action::OpenJobFolder(id) => self.open_job_folder(id),
             Action::Select(id) => {
                 if self.view.queue.selected != id {
@@ -1123,8 +1141,12 @@ impl NewskiteApp {
             } else if self.view.open_nzb.visible {
                 self.view.open_nzb.visible = false;
                 self.view.open_nzb.error = None;
-            } else if self.view.queue.confirm_remove.is_some() {
+            } else if self.view.queue.confirm_remove.is_some() || self.view.queue.confirm_delete.is_some() {
                 self.view.queue.confirm_remove = None;
+                self.view.queue.confirm_delete = None;
+            } else if self.view.queue.confirm_clear || self.view.queue.confirm_clear_files {
+                self.view.queue.confirm_clear = false;
+                self.view.queue.confirm_clear_files = false;
             } else if self.view.queue.selected.is_some() {
                 self.actions.push(Action::Select(None));
             }

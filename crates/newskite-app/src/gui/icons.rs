@@ -46,6 +46,8 @@ pub enum Icon {
     Retry,
     /// Key (drawn here).
     Key,
+    /// Bin with a lid (drawn here): delete files.
+    Trash,
     /// Downward chevron (kit `chevron-down`).
     ChevronDown,
     /// Upward chevron (drawn here).
@@ -70,7 +72,7 @@ pub enum Icon {
 
 impl Icon {
     /// Every icon (for registration and tests).
-    pub const ALL: [Icon; 25] = [
+    pub const ALL: [Icon; 26] = [
         Icon::Search,
         Icon::Scan,
         Icon::More,
@@ -86,6 +88,7 @@ impl Icon {
         Icon::Close,
         Icon::Retry,
         Icon::Key,
+        Icon::Trash,
         Icon::ChevronDown,
         Icon::ChevronUp,
         Icon::ChevronRight,
@@ -116,6 +119,7 @@ impl Icon {
             Icon::Plus => "bytes://newskite/icon/plus.svg",
             Icon::Close => "bytes://newskite/icon/close.svg",
             Icon::Key => "bytes://newskite/icon/key.svg",
+            Icon::Trash => "bytes://newskite/icon/trash.svg",
             Icon::ChevronDown => "bytes://newskite/icon/chevron-down.svg",
             Icon::ChevronUp => "bytes://newskite/icon/chevron-up.svg",
             Icon::ChevronRight => "bytes://newskite/icon/chevron-right.svg",
@@ -151,6 +155,7 @@ impl Icon {
             Icon::Key => drawn(
                 "M10.5 12a3.5 3.5 0 1 1-7 0a3.5 3.5 0 1 1 7 0M10.5 12h10M17.5 12v3M20.5 12v2.5",
             ),
+            Icon::Trash => drawn("M4.5 6.5h15M9.5 6.5v-2h5v2M6.5 6.5l1 13h9l1-13M10.5 10v6M13.5 10v6"),
             Icon::ChevronUp => drawn("M6 14.5l6-6 6 6"),
             Icon::Search => kit!("search"),
             Icon::Retry => kit!("refresh"),

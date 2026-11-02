@@ -2418,6 +2418,7 @@ dependencies = [
 name = "newskite-service"
 version = "0.1.0"
 dependencies = [
+ "directories",
  "newskite-engine",
  "newskite-nntp",
  "newskite-nzb",

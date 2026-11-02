@@ -17,6 +17,7 @@ thiserror.workspace = true
 tracing.workspace = true
 tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
 tokio-util.workspace = true
+directories.workspace = true
 
 [dev-dependencies]
 newskite-nntp = { workspace = true, features = ["testkit"] }

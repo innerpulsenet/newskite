@@ -580,9 +580,14 @@ fn postprocess_section(ui: &mut Ui, pal: &Palette, s: &mut Settings) {
         ui.add_enabled_ui(p.enabled, |ui| {
             ui.checkbox(&mut p.repair, "Verify and repair with PAR2");
             ui.checkbox(&mut p.extract, "Extract archives (7z, rar, zip)");
+            ui.checkbox(&mut p.cleanup, "Delete archives after a successful extraction");
             ui.checkbox(
-                &mut p.cleanup,
-                "Delete archives and parity files after a successful extraction",
+                &mut p.remove_leftovers,
+                "Remove leftover files (.par2, repair backups, .sfv, .nfo) once verified",
+            )
+            .on_hover_text(
+                "Runs when PAR2 verified or repaired the download and nothing failed to extract. \
+                 Other files (samples, subtitles) are kept.",
             );
         });
         ui.label(

@@ -258,7 +258,7 @@ pub(crate) fn run(
 ) -> (Verdict, Vec<PathBuf>) {
     let sets = find_par2_sets(files);
     if sets.is_empty() {
-        return (Verdict::Skipped("no PAR2 files".into()), Vec::new());
+        return (Verdict::Skipped(crate::NO_PAR2.into()), Vec::new());
     }
     let Some(par2) = par2 else {
         log("par2: tool not found; skipping verification".into());
