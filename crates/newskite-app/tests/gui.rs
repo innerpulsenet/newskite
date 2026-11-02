@@ -144,6 +144,24 @@ fn now() -> i64 {
         .unwrap_or(0)
 }
 
+/// Saves an article map for `job` as the service would when a run ends: `files` are
+/// (name, articles) in NZB order, `state` says what became of article `i` (counted over
+/// all files).
+fn seed_map(store: &Store, job: i64, files: &[(&str, usize)], state: impl Fn(usize) -> newskite_types::ArticleState) {
+    use newskite_types::{ArticleMap, FileLayout};
+    let layout: Vec<FileLayout> =
+        files.iter().map(|(n, s)| FileLayout { name: (*n).into(), segments: *s, complete: false }).collect();
+    let mut map = ArticleMap::from_layout(&layout);
+    let mut k = 0;
+    for (fi, (_, n)) in files.iter().enumerate() {
+        for i in 0..*n {
+            map.set(fi, i, state(k));
+            k += 1;
+        }
+    }
+    store.save_article_map(job, &map.to_stored()).expect("article map");
+}
+
 fn seed_populated(store: &Store, dir: &Path) {
     let mut settings = store.load_settings().expect("load");
     settings.servers[0] = ServerConfig {
@@ -219,6 +237,17 @@ fn seed_populated(store: &Store, dir: &Path) {
             },
         )
         .expect("outcome");
+    // What each run recorded, article by article.
+    use newskite_types::ArticleState::{Done, Missing, Waiting};
+    seed_map(store, a.id, &[("debian-12.iso", 13_000), ("debian-12.par2", 460)], |k| {
+        if [1_201, 1_202, 5_577, 9_001].contains(&k) { Missing } else { Done }
+    });
+    seed_map(store, b.id, &[("open.movie.part01.rar", 1_900), ("open.movie.part02.rar", 1_900), ("open.movie.par2", 1)], |k| {
+        if k < 2_160 || k == 3_800 { Done } else { Waiting }
+    });
+    seed_map(store, c.id, &[("samples.part1.rar", 832), ("samples.part2.rar", 832), ("samples.part3.rar", 832)], |k| {
+        if [0, 6, 8].contains(&k) { Missing } else { Done }
+    });
     store.append_job_log(a.id, t0 + 5, "info", "started Debian.12.Netinst.amd64").expect("log");
     store.append_job_log(a.id, t0 + 32, "warn", "debian-12.iso: 4 missing article(s): <a@x>, <b@x>, <c@x>, ...").expect("log");
     store.append_job_log(a.id, t0 + 40, "info", "completed Debian.12.Netinst.amd64: PAR2 repaired 4 missing articles").expect("log");
@@ -361,10 +390,10 @@ fn empty_state_renders_cleanly() {
         h.get_by_label("Add NZB…");
         h.get_by_label("No throughput history yet");
         h.get_by_label("No server configured");
-        h.get_by_label("Nothing left");
+        h.get_by_label(newskite_app::gui::docks::NO_ARTICLES);
         h.get_by_label("No server");
-        h.get_by_label("0 B/s");
-        h.get_by_label("128 GB free  ·  0 B downloaded");
+        h.get_by_label("Idle");
+        h.get_by_label("128 GB free");
         h.get_by_label("Queue (0)");
         h.get_by_label("History (0)");
         // Nothing queued: Start cannot act.
@@ -482,8 +511,8 @@ fn import_nzb_switches_to_queue_and_errors_inline() {
         "the new job is selected"
     );
     assert!(a.view.open_nzb.error.is_none());
-    // In the queue and, selected, in the Details dock.
-    assert_eq!(h.get_all_by_label("Sample Release").count(), 2);
+    // In the queue and, selected, in the Details and Articles docks.
+    assert_eq!(h.get_all_by_label("Sample Release").count(), 3);
     h.get_by_label("0%  ·  0 B / 977 KB");
 }
 
@@ -788,7 +817,10 @@ fn single_stored_sample_and_live_series_draw() {
     });
     let mut h = fx.harness_with(true, SIZE, false);
     h.run_steps(3);
-    h.get_by_label_contains("Throughput graph, 1 stored samples, 0 live");
+    // The graph opens from the status bar's sparkline (tooltips without delay here).
+    h.ctx.all_styles_mut(|s| s.interaction.tooltip_delay = 0.0);
+    h.get_by_label_contains("Throughput graph, 1 stored samples, 0 live").hover();
+    h.run_steps(3);
     snapshot(&mut h, "single-sample-dark");
 
     let tx = h.state().as_ref().expect("app").sender();
@@ -799,7 +831,11 @@ fn single_stored_sample_and_live_series_draw() {
         .expect("send");
     }
     h.run_steps(3);
-    h.get_by_label_contains("Throughput graph, 1 stored samples, 4 live");
+    // The sparkline and, still hovered, the graph it opened.
+    assert_eq!(h.get_all_by_label_contains("Throughput graph, 1 stored samples, 4 live").count(), 2);
+    // Idle: the footer names the fastest second on record (the stored 3 MiB/s).
+    h.get_by_label("Idle  ·  peak 3.0 MB/s");
+    // The graph's own figure is the latest live sample.
     h.get_by_label("1.0 MB/s");
     assert_no_bad_numbers(&h);
     snapshot(&mut h, "live-series-dark");
@@ -829,6 +865,11 @@ fn downloading_row_shows_eta_and_finish_flash() {
         store
             .set_job_state(job.id, JobState::Downloading, None)
             .expect("state");
+        // Half of the articles in, a few of them ahead of the rest (parallel fetches).
+        use newskite_types::ArticleState::{Done, Waiting};
+        seed_map(store, job.id, &[("live.part1.rar", 140), ("live.part2.rar", 140)], |k| {
+            if k < 132 || [134, 137, 139, 141, 146, 150, 153, 158].contains(&k) { Done } else { Waiting }
+        });
     });
     let mut h = fx.harness_with(true, SIZE, false);
     h.run_steps(3);
@@ -1102,6 +1143,8 @@ fn nntp_activity_counts_articles_and_missing() {
                     done,
                     total: 9,
                     bytes: 1000,
+                    file: 0,
+                    index: done - 1,
                 },
             },
         ))

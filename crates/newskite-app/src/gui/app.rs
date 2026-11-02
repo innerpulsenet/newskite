@@ -24,6 +24,8 @@ use super::{about, disk, docks, fonts, icons, motion, queue, settings, statusbar
 
 /// How often the job list is re-read while a job is downloading (outline §7).
 pub const JOBS_REFRESH: Duration = Duration::from_millis(1500);
+/// How often the article maps of downloading jobs are read again.
+const MAPS_REFRESH: Duration = Duration::from_millis(200);
 /// Shortest gap between event-driven job reloads: a burst of finished files (each one
 /// an event) reads the store once per gap instead of once per frame.
 const JOBS_RELOAD_MIN: Duration = Duration::from_millis(150);
@@ -238,6 +240,10 @@ pub struct Data {
     pub articles_missing: u64,
     /// Why the stored settings document could not be read, if it could not.
     pub settings_load_error: Option<String>,
+    /// Article maps of the jobs on show (the downloading ones and the selection).
+    pub article_maps: HashMap<i64, newskite_service::ArticleMap>,
+    /// The job the Articles dock shows: the one downloading, else the selection.
+    pub activity_job: Option<i64>,
 }
 
 impl Data {
@@ -390,6 +396,10 @@ pub struct NewskiteApp {
     last_jobs_reload: Instant,
     /// Events asked for a job reload that was deferred (see [`JOBS_RELOAD_MIN`]).
     jobs_dirty: bool,
+    /// When the article maps of downloading jobs were last read.
+    last_maps_reload: Instant,
+    /// A run ended or jobs changed: saved article maps may be new.
+    maps_dirty: bool,
     notifications: bool,
     /// Jobs already finished when last notified (so only new completions notify).
     finished_seen: HashSet<i64>,
@@ -480,6 +490,8 @@ impl NewskiteApp {
             actions: Vec::new(),
             last_jobs_reload: Instant::now(),
             jobs_dirty: false,
+            last_maps_reload: Instant::now(),
+            maps_dirty: true,
             notifications: config.notifications,
             finished_seen: HashSet::new(),
             last_notice: None,
@@ -551,6 +563,40 @@ impl NewskiteApp {
         }
         self.reload_jobs();
         self.data.logs = self.service.logs();
+    }
+
+    /// Keeps the article maps of the jobs on show: downloading jobs are read every
+    /// [`MAPS_REFRESH`] (their maps change constantly), the selection once, and again
+    /// after a run ends. Maps of jobs no longer on show are dropped.
+    fn refresh_article_maps(&mut self) {
+        let downloading: Vec<i64> =
+            self.data.jobs.iter().filter(|j| j.state == JobState::Downloading).map(|j| j.id).collect();
+        let selected = self.view.queue.selected;
+        self.data.activity_job = downloading.first().copied().or(selected);
+        let wanted: HashSet<i64> = downloading.iter().copied().chain(selected).collect();
+        self.data.article_maps.retain(|id, _| wanted.contains(id));
+        let live_due = !downloading.is_empty() && self.last_maps_reload.elapsed() >= MAPS_REFRESH;
+        for &id in &wanted {
+            let due = self.maps_dirty || !self.data.article_maps.contains_key(&id) || (live_due && downloading.contains(&id));
+            if !due {
+                continue;
+            }
+            match self.service.article_map(id) {
+                Some(m) => {
+                    self.data.article_maps.insert(id, m);
+                }
+                None => {
+                    self.data.article_maps.remove(&id);
+                }
+            }
+        }
+        if live_due || self.maps_dirty {
+            self.last_maps_reload = Instant::now();
+        }
+        self.maps_dirty = false;
+        if !downloading.is_empty() {
+            self.ctx.request_repaint_after(MAPS_REFRESH);
+        }
     }
 
     /// Re-reads jobs and totals.
@@ -701,6 +747,8 @@ impl NewskiteApp {
                     *reload_jobs = true
                 }
                 EngineEvent::FileDone { .. } => *reload_jobs = true,
+                // Article maps are read from the service on their own cadence.
+                EngineEvent::Layout { .. } | EngineEvent::SegmentMissing { .. } | EngineEvent::FileComplete { .. } => {}
                 EngineEvent::FileStarted { .. } | EngineEvent::Log(_) | EngineEvent::Warn(_) => {}
             },
             ServiceEvent::JobLog(_) | ServiceEvent::Error(_) => *reload_logs = true,
@@ -721,6 +769,7 @@ impl NewskiteApp {
             ServiceEvent::ShutdownCanceled => self.data.shutdown_secs = None,
             ServiceEvent::PostProgress(p) => self.data.status.post = Some(p),
             ServiceEvent::JobFinished { job_id, name, ok, detail } => {
+                self.maps_dirty = true;
                 self.toast_seq += 1;
                 self.data.toasts.push(super::toast::Toast {
                     id: self.toast_seq,
@@ -1339,6 +1388,7 @@ impl NewskiteApp {
         if self.last_history_reload.elapsed() >= HISTORY_REFRESH {
             self.reload_history();
         }
+        self.refresh_article_maps();
         self.shortcuts(ctx);
         self.dropped_files(ctx);
         self.animate_marks(ctx);

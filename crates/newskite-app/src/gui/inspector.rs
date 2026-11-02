@@ -404,6 +404,18 @@ fn overview(ui: &mut Ui, pal: &Palette, data: &Data, job: &Job, reduced: bool, a
         problem(ui, pal, data, job, actions);
         ui.add_space(12.0);
     }
+    // Every article of the job, as recorded by its last run.
+    if let Some(map) = data.article_maps.get(&job.id).filter(|m| !m.is_empty()) {
+        section_title(ui, pal, "Articles");
+        ui.add_space(6.0);
+        let w = ui.available_width();
+        let size = Vec2::new(w, super::articles::fit_height(map.len(), w, 120.0));
+        super::articles::grid(ui, pal, egui::Id::new(("inspector-articles", job.id)), map, size, reduced);
+        ui.add_space(4.0);
+        ui.label(RichText::new(super::articles::summary(&map.counts())).font(fonts::mono_id(11.0)).color(pal.muted));
+        super::articles::legend(ui, pal, super::articles::per_cell(map, size));
+        ui.add_space(12.0);
+    }
     let post = data.status.post.as_ref().filter(|p| p.job_id == job.id);
     let speed = if job.state == JobState::Downloading { data.speed() } else { 0 };
     section_title(ui, pal, "Lifecycle");

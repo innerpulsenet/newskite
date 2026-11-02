@@ -96,6 +96,14 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX job_log_job ON job_log (job_id, id);
     "#,
+    // v5: each job's article map (which articles arrived or were missing), saved by the
+    // service when a run ends, as encoded text.
+    r#"
+    CREATE TABLE article_maps (
+        job_id  INTEGER PRIMARY KEY REFERENCES jobs (id) ON DELETE CASCADE,
+        map     TEXT    NOT NULL
+    );
+    "#,
 ];
 
 /// The schema version this build writes.

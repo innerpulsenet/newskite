@@ -104,6 +104,10 @@ async fn full_run_downloads_byte_exact_and_samples_throughput() {
     let segment_events =
         events.iter().filter(|e| matches!(e, ServiceEvent::Engine { event: EngineEvent::SegmentDone { .. }, .. })).count();
     assert_eq!(segment_events, 8);
+    // The article map was saved when the run ended: every article arrived.
+    let map = svc.article_map(job.id).expect("article map saved");
+    assert_eq!(map.files.len(), 1);
+    assert_eq!(map.counts(), newskite_service::ArticleCounts { done: 8, missing: 0, waiting: 0 });
     let logs: Vec<String> = svc.logs().into_iter().map(|l| l.text).collect();
     assert!(logs.iter().any(|l| l.starts_with("completed big")), "{logs:?}");
     assert!(logs.iter().any(|l| l.starts_with("post-processing big: par2 skipped")), "{logs:?}");
@@ -389,6 +393,9 @@ async fn missing_article_fails_the_job_with_the_id_and_retry_requeues() {
     assert!(!job.dest_dir.join("m.bin").exists(), "an incomplete file must not look complete");
     assert!(job.dest_dir.join("m.bin.nkpart").exists());
     assert_eq!(svc.job_files(job.id)[0].state, "failed");
+    // The map shows exactly which article was missing.
+    use newskite_service::ArticleState::{Done, Missing};
+    assert_eq!(svc.article_map(job.id).expect("article map saved").files[0].states, vec![Done, Missing, Done]);
     assert!(svc.status().last_error.unwrap().contains(&gone));
 
     svc.retry_job(job.id).unwrap();

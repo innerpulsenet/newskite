@@ -70,10 +70,15 @@
 //!
 //! # Events
 //!
-//! For each downloaded file: `FileStarted` (once the output name is decided, before any
-//! `SegmentDone` of that file), one `SegmentDone` per stored segment (`done` counts every
-//! processed segment of the file, including missing ones, so it reaches `total`), then
-//! either `FileDone` (after the rename) or `FileFailed`. All events of a file carry the same
+//! First, once: `Layout`, every file of the job in NZB order with its segment count and
+//! whether it was found complete from an earlier run; a file's position in it is the
+//! `file` of the article events. For each downloaded file: `FileStarted` (once the output
+//! name is decided, before any `SegmentDone` of that file), one `SegmentDone` per stored
+//! segment (`done` counts every processed segment of the file, including missing ones, so
+//! it reaches `total`; `file` and `index` place the segment), a `SegmentMissing` for each
+//! article no server could supply, then either `FileDone` (after the rename) or
+//! `FileFailed`. A file found complete on disk by its content once the run started emits
+//! `FileComplete` instead. All events of a file carry the same
 //! resolved name. `Log` lines report job start, server fail-over, retries, completed files,
 //! CRC problems and missing-article summaries. Passwords never appear in any event.
 //!
