@@ -262,6 +262,12 @@ The icons are generated, not hand-drawn; see [Brand](#brand) for the command.
 Licensed under either of the MIT license or the Apache License, Version 2.0, at your option
 (`MIT OR Apache-2.0`, as declared in `Cargo.toml`).
 
+The binary also includes the UnRAR library by Alexander Roshal, which reads RAR archives
+under its own freeware license: it may be redistributed freely, but its code may not be used
+to create RAR archives or to rebuild the RAR compression algorithm. The full text is in
+[`packaging/debian/copyright`](packaging/debian/copyright); the `.deb` installs it as
+`/usr/share/doc/newskite/copyright` and the AppImage carries it at the same path inside.
+
 ## Brand
 
 Newskite is an [innerpulse](https://innerpulse.net) product.
