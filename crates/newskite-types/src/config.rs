@@ -132,6 +132,18 @@ impl Settings {
         v
     }
 
+    /// [`Settings::usable_servers`] with the fail-over servers moved ahead of the primary,
+    /// which goes last: the order of a "retry on backup" run. `None` with fewer than two
+    /// usable servers (there is no backup to ask).
+    pub fn backup_first_servers(&self) -> Option<Vec<ServerConfig>> {
+        let mut v = self.usable_servers();
+        if v.len() < 2 {
+            return None;
+        }
+        v.rotate_left(1);
+        Some(v)
+    }
+
     /// Effective number of simultaneous fetches: `max_connections` capped by the sum of
     /// usable servers' connection counts, never below 1.
     pub fn effective_connections(&self) -> usize {
@@ -202,6 +214,21 @@ mod tests {
         let partial: Settings = serde_json::from_str(r#"{"max_connections": 4}"#).unwrap();
         assert_eq!(partial.max_connections, 4);
         assert_eq!(partial.retries, 2);
+    }
+
+    #[test]
+    fn backup_first_puts_the_primary_last() {
+        let mut s = Settings::default();
+        s.servers = vec![ServerConfig { host: "only".into(), ..Default::default() }];
+        assert_eq!(s.backup_first_servers(), None);
+        s.servers = vec![
+            ServerConfig { host: "a".into(), ..Default::default() },
+            ServerConfig { host: "off".into(), enabled: false, ..Default::default() },
+            ServerConfig { host: "c".into(), priority: 2, ..Default::default() },
+            ServerConfig { host: "b".into(), priority: 1, ..Default::default() },
+        ];
+        let hosts: Vec<String> = s.backup_first_servers().unwrap().into_iter().map(|c| c.host).collect();
+        assert_eq!(hosts, ["b", "c", "a"]);
     }
 
     #[test]

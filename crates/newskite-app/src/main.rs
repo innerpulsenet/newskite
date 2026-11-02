@@ -75,37 +75,29 @@ fn show_message(title: &str, message: &str, error: bool) {
     }
 }
 
-/// A desktop dialog for when no window of our own can open: kdialog on KDE, zenity
-/// (rfd's backend) elsewhere. Only tools that are installed are tried, so a missing one
-/// never swallows the message silently; stderr always has it.
+/// The desktop's own message for when no window of our own can open: a notification over
+/// D-Bus on Linux (no helper program is run), the platform message box elsewhere. stderr
+/// always has the message too.
+#[cfg(all(unix, not(target_os = "macos")))]
 fn native_dialog(title: &str, message: &str, error: bool) {
-    let on_path = |tool: &str| {
-        std::env::var_os("PATH")
-            .is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(tool).is_file()))
-    };
-    if on_path("kdialog") {
-        let shown = std::process::Command::new("kdialog")
-            .arg("--title")
-            .arg(title)
-            .arg(if error { "--error" } else { "--msgbox" })
-            .arg(message)
-            .status();
-        if shown.is_ok() {
-            return;
-        }
+    let mut n = notify_rust::Notification::new();
+    n.appname("Newskite").summary(title).body(message).icon(newskite_types::APP_ID);
+    if error {
+        n.urgency(notify_rust::Urgency::Critical);
     }
-    if on_path("zenity") {
-        let _ = rfd::MessageDialog::new()
-            .set_level(if error {
-                rfd::MessageLevel::Error
-            } else {
-                rfd::MessageLevel::Info
-            })
-            .set_title(title)
-            .set_description(message)
-            .set_buttons(rfd::MessageButtons::Ok)
-            .show();
+    if let Err(e) = n.show() {
+        eprintln!("could not show a desktop notification: {e}");
     }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn native_dialog(title: &str, message: &str, error: bool) {
+    let _ = rfd::MessageDialog::new()
+        .set_level(if error { rfd::MessageLevel::Error } else { rfd::MessageLevel::Info })
+        .set_title(title)
+        .set_description(message)
+        .set_buttons(rfd::MessageButtons::Ok)
+        .show();
 }
 
 /// The message window: the title, the text and an OK button, in the desktop theme.

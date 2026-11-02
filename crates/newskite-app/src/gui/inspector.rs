@@ -363,7 +363,7 @@ fn overview(ui: &mut Ui, pal: &Palette, data: &Data, job: &Job, reduced: bool, a
     let now = now_secs();
     let done = data.shown_done(job);
     if job.state == JobState::Failed {
-        problem(ui, pal, job, actions);
+        problem(ui, pal, data, job, actions);
         ui.add_space(12.0);
     }
     let post = data.status.post.as_ref().filter(|p| p.job_id == job.id);
@@ -437,7 +437,7 @@ fn place(ui: &mut Ui, pal: &Palette, key: &str, path: &std::path::Path, open: Op
 }
 
 /// The problem card of a failed job.
-fn problem(ui: &mut Ui, pal: &Palette, job: &Job, actions: &mut Vec<Action>) {
+fn problem(ui: &mut Ui, pal: &Palette, data: &Data, job: &Job, actions: &mut Vec<Action>) {
     let kind = job.stats.outcome.as_ref().and_then(|o| o.failure);
     let reason = job.error.clone().unwrap_or_else(|| "No reason was recorded.".into());
     let frame = egui::Frame::new()
@@ -462,6 +462,15 @@ fn problem(ui: &mut Ui, pal: &Palette, job: &Job, actions: &mut Vec<Action>) {
             ui.spacing_mut().item_spacing.x = 6.0;
             if kit_button(ui, pal, ButtonKind::Outline, Some(Icon::Retry), "Retry", true).clicked() {
                 actions.push(Action::RetryJob(job.id));
+            }
+            // Missing articles and server trouble are what a fail-over server can fix.
+            if matches!(kind, None | Some(FailureKind::MissingArticles | FailureKind::Connection | FailureKind::Auth | FailureKind::Repair)) {
+                let servers = data.settings.usable_servers();
+                let ok = servers.len() >= 2;
+                let r = kit_button(ui, pal, ButtonKind::Outline, Some(Icon::RetryBackup), "Retry on backup", ok);
+                if r.on_hover_text(super::serverstrip::backup_retry_explainer(&servers)).clicked() && ok {
+                    actions.push(Action::RetryOnBackup(job.id));
+                }
             }
             if matches!(kind, Some(FailureKind::Password | FailureKind::Extract))
                 && kit_button(ui, pal, ButtonKind::Text, Some(Icon::Key), "Set password…", true).clicked()

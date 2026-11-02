@@ -12,7 +12,7 @@ use newskite_types::{format, EngineEvent, FailureKind, JobOutcome, ServerConfig,
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::{shutdown, Inner, LogLevel, PostProgress, ServiceEvent, NO_SERVER_MESSAGE};
+use crate::{lock, shutdown, Inner, LogLevel, PostProgress, ServiceEvent, NO_SERVER_MESSAGE};
 
 /// How long to wait for the event forwarder to drain after the engine returned.
 const FORWARDER_DRAIN: Duration = Duration::from_secs(10);
@@ -256,16 +256,60 @@ async fn process_job(
     token: CancellationToken,
 ) -> Outcome {
     let mut interrupted = false;
-    let end = download_job(inner, job, servers, settings, token, &mut interrupted).await;
+    let (id, name) = (job.id, job.name.clone());
+    let backup = lock(&inner.backup_first).get(&id).copied();
+    // A backup retry runs on the fail-over servers' own connections, so no worker spills
+    // onto the primary while it has room there: the primary only gets what they lack.
+    let (servers, connections) = match settings.backup_first_servers() {
+        Some(order) if backup.is_some() => {
+            let backups: usize = order[..order.len() - 1].iter().map(|s| s.connections.max(1) as usize).sum();
+            (order, settings.effective_connections().min(backups))
+        }
+        _ => (servers, settings.effective_connections()),
+    };
+    if backup.is_some() {
+        let first = servers.first().map(ServerConfig::address).unwrap_or_default();
+        inner.log_job(id, LogLevel::Info, format!("{name}: backup retry, asking {first} first"));
+    }
+    let end = download_job(inner, job, servers, connections, settings, token, &mut interrupted).await;
+    if let (Some(before), false) = (backup, interrupted) {
+        lock(&inner.backup_first).remove(&id);
+        report_backup_retry(inner, id, &name, before);
+    }
     Outcome { end, interrupted }
 }
 
-/// [`process_job`]'s body. Returns `Some(end)` when the run must stop; sets `interrupted`
+/// One log line on how a backup retry of job `id` ended, read back from the store so it
+/// states what was recorded; `before` is the count of articles it was missing.
+fn report_backup_retry(inner: &Inner, id: i64, name: &str, before: u64) {
+    match inner.store.get_job(id) {
+        Ok(Some(job)) if job.state == JobState::Done => {
+            inner.log_job(id, LogLevel::Info, format!("{name}: backup retry succeeded"));
+        }
+        Ok(Some(job)) if job.state == JobState::Failed => {
+            let after = job.stats.articles_missing;
+            let s = if after == 1 { "" } else { "s" };
+            let change = if before > 0 && after > 0 && after < before {
+                format!("missing articles down from {before} to {after}")
+            } else if before > 0 && after >= before {
+                format!("still {after} missing article{s}; no server delivered them")
+            } else {
+                job.error.unwrap_or_else(|| "no reason recorded".into())
+            };
+            inner.log_job(id, LogLevel::Warn, format!("{name}: backup retry failed: {change}"));
+        }
+        // Removed, requeued by a shutdown, or unreadable: nothing final to report.
+        _ => {}
+    }
+}
+
+/// [`process_job`]'s body, fetching with at most `connections` at once. Returns `Some(end)` when the run must stop; sets `interrupted`
 /// when the user stopped the job.
 async fn download_job(
     inner: &Arc<Inner>,
     job: Job,
     servers: Vec<ServerConfig>,
+    connections: usize,
     settings: &Settings,
     token: CancellationToken,
     interrupted: &mut bool,
@@ -329,7 +373,7 @@ async fn download_job(
     }
 
     let options = EngineOptions {
-        connections: settings.effective_connections(),
+        connections,
         retries: settings.retries,
         speed_limit_bps: settings.speed_limit_bps(),
         connect_timeout: crate::CONNECT_TIMEOUT,

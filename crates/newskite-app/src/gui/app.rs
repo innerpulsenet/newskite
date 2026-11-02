@@ -94,6 +94,8 @@ pub enum UiMsg {
     FolderPicked(FolderTarget, PathBuf),
     /// A native dialog closed without a choice.
     DialogClosed,
+    /// The picker could not be shown (why).
+    DialogFailed(String),
     /// Result of a server "Test".
     TestResult {
         /// Row the test belongs to.
@@ -160,6 +162,10 @@ pub enum Action {
     RemoveJob(i64),
     /// Failed → queued, and download it.
     RetryJob(i64),
+    /// Failed → queued with the fail-over servers asked first, and download it.
+    RetryOnBackup(i64),
+    /// Every failed job → queued with the fail-over servers asked first, and download them.
+    RetryAllOnBackup,
     /// Set or clear a job's archive password.
     SetJobPassword(i64, Option<String>),
     /// Show the settings modal.
@@ -309,6 +315,8 @@ pub struct ViewState {
     pub open_nzb: OpenNzbState,
     /// Bottom dock state.
     pub docks: docks::DockState,
+    /// Server strip state.
+    pub strip: super::serverstrip::StripState,
     /// Queue tab state.
     pub queue: queue::QueueState,
     /// Inspector (selected job) state.
@@ -454,6 +462,7 @@ impl NewskiteApp {
                 filter: String::new(),
                 open_nzb: OpenNzbState::default(),
                 docks: docks::DockState::default(),
+                strip: Default::default(),
                 queue: queue::QueueState::default(),
                 inspector: Default::default(),
                 settings: None,
@@ -519,6 +528,24 @@ impl NewskiteApp {
         self.data.history = self.service.throughput_history(HISTORY_SECS);
         self.data.disk_free = disk::free_bytes(&self.data.settings.download_dir);
         self.last_history_reload = Instant::now();
+    }
+
+    /// Requeues `ids` with the fail-over servers asked first and downloads them. The
+    /// service logs each step and, when a download ends, how the backup retry went.
+    fn retry_on_backup(&mut self, ids: &[i64]) {
+        let mut started = false;
+        for &id in ids {
+            if self.service.retry_job_on_backup(id).is_ok() && self.service.start_job(id).is_ok() {
+                // Its next completion is news again.
+                self.finished_seen.remove(&id);
+                started = true;
+            }
+        }
+        if started {
+            self.view.tab = Tab::Queue;
+        }
+        self.reload_jobs();
+        self.data.logs = self.service.logs();
     }
 
     /// Re-reads jobs and totals.
@@ -600,6 +627,11 @@ impl NewskiteApp {
                     }
                 }
                 UiMsg::DialogClosed => self.view.dialog_open = false,
+                UiMsg::DialogFailed(why) => {
+                    self.view.dialog_open = false;
+                    self.service.log(LogLevel::Error, why);
+                    self.data.logs = self.service.logs();
+                }
                 UiMsg::TestResult { row_id, result } => {
                     if let Some(d) = self.view.settings.as_mut() {
                         d.set_test_result(row_id, result);
@@ -857,6 +889,13 @@ impl NewskiteApp {
                 self.reload_jobs();
                 self.data.logs = self.service.logs();
             }
+            Action::RetryOnBackup(id) => {
+                self.retry_on_backup(&[id]);
+            }
+            Action::RetryAllOnBackup => {
+                let ids: Vec<i64> = super::serverstrip::failed_jobs(&self.data).iter().map(|j| j.id).collect();
+                self.retry_on_backup(&ids);
+            }
             Action::SetJobPassword(id, pw) => {
                 let _ = self.service.set_job_password(id, pw);
                 self.reload_jobs();
@@ -923,7 +962,7 @@ impl NewskiteApp {
             }
             Action::CloseAbout => self.view.about_open = false,
             Action::OpenUrl(url) => {
-                if let Err(e) = open::that_detached(&url) {
+                if let Err(e) = crate::desktop::open_url(&url) {
                     self.service.log(
                         LogLevel::Error,
                         format!("cannot open {url} in the browser: {e}"),
@@ -968,17 +1007,17 @@ impl NewskiteApp {
         self.view.dialog_open = true;
         let tx = self.tx.clone();
         let ctx = self.ctx.clone();
-        self.rt.spawn(async move {
-            let picked = rfd::AsyncFileDialog::new()
-                .set_title("Open NZB")
-                .add_filter("NZB files", &["nzb", "NZB"])
-                .pick_files()
-                .await;
+        self.rt.spawn_blocking(move || {
+            let picked = crate::desktop::pick(&crate::desktop::Pick {
+                title: "Open NZB".into(),
+                multiple: true,
+                filter: Some(("NZB files".into(), vec!["nzb".into()])),
+                ..Default::default()
+            });
             let msg = match picked {
-                Some(files) if !files.is_empty() => {
-                    UiMsg::NzbPicked(files.iter().map(|f| f.path().to_path_buf()).collect())
-                }
-                _ => UiMsg::DialogClosed,
+                Ok(Some(files)) if !files.is_empty() => UiMsg::NzbPicked(files),
+                Ok(_) => UiMsg::DialogClosed,
+                Err(e) => UiMsg::DialogFailed(format!("cannot show the file picker: {e}")),
             };
             let _ = tx.send(msg);
             ctx.request_repaint();
@@ -998,14 +1037,17 @@ impl NewskiteApp {
             .filter(|p| p.is_dir());
         let tx = self.tx.clone();
         let ctx = self.ctx.clone();
-        self.rt.spawn(async move {
-            let mut dlg = rfd::AsyncFileDialog::new().set_title(target.title());
-            if let Some(dir) = start {
-                dlg = dlg.set_directory(dir);
-            }
-            let msg = match dlg.pick_folder().await {
-                Some(f) => UiMsg::FolderPicked(target, f.path().to_path_buf()),
-                None => UiMsg::DialogClosed,
+        self.rt.spawn_blocking(move || {
+            let picked = crate::desktop::pick(&crate::desktop::Pick {
+                title: target.title().into(),
+                directory: true,
+                start,
+                ..Default::default()
+            });
+            let msg = match picked {
+                Ok(Some(mut dirs)) if !dirs.is_empty() => UiMsg::FolderPicked(target, dirs.remove(0)),
+                Ok(_) => UiMsg::DialogClosed,
+                Err(e) => UiMsg::DialogFailed(format!("cannot show the folder picker: {e}")),
             };
             let _ = tx.send(msg);
             ctx.request_repaint();
@@ -1028,7 +1070,7 @@ impl NewskiteApp {
         } else {
             dir.parent().map(PathBuf::from).unwrap_or(dir)
         };
-        if let Err(e) = open::that_detached(&target) {
+        if let Err(e) = crate::desktop::show_folder(&target) {
             self.service.log(
                 LogLevel::Error,
                 format!("cannot open {} in the file manager: {e}", target.display()),
@@ -1038,7 +1080,8 @@ impl NewskiteApp {
     }
 
     fn open_path(&mut self, p: &std::path::Path) {
-        if let Err(e) = open::that_detached(p) {
+        let opened = if p.is_dir() { crate::desktop::show_folder(p) } else { crate::desktop::open_file(p) };
+        if let Err(e) = opened {
             self.service.log(LogLevel::Error, format!("cannot open {}: {e}", p.display()));
             self.data.logs = self.service.logs();
         }
@@ -1054,7 +1097,7 @@ impl NewskiteApp {
                 LogLevel::Error,
                 format!("cannot create download folder {}: {e}", dir.display()),
             );
-        } else if let Err(e) = open::that_detached(&dir) {
+        } else if let Err(e) = crate::desktop::show_folder(&dir) {
             self.service.log(
                 LogLevel::Error,
                 format!("cannot open {} in the file manager: {e}", dir.display()),
@@ -1316,8 +1359,21 @@ impl NewskiteApp {
                 statusbar::show(ui, &pal, &self.data, self.reduced_motion, &mut actions)
             });
 
-        // The inspector is a full-height column on wide windows; the docks then keep the
-        // server card instead of the compact details.
+        // The server readings: one quiet line above the status bar.
+        egui::TopBottomPanel::bottom("serverstrip")
+            .exact_height(super::serverstrip::STRIP_H)
+            .frame(
+                egui::Frame::new()
+                    .fill(pal.surface)
+                    .inner_margin(egui::Margin::symmetric(12, 0))
+                    .stroke(egui::Stroke::new(1.0, pal.border)),
+            )
+            .show(ctx, |ui| {
+                super::serverstrip::show(ui, &pal, &self.data, &mut self.view.strip, &mut actions)
+            });
+
+        // The inspector is a full-height column on wide windows; narrower, the docks show
+        // the selected job's details instead.
         let side = width >= super::inspector::SIDE_PANEL_MIN_WINDOW;
         let selected_job = self.view.queue.selected.and_then(|id| self.data.jobs.iter().find(|j| j.id == id)).cloned();
         if let (true, Some(job)) = (side, &selected_job) {

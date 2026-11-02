@@ -2,6 +2,7 @@
 //! `newskite` binary (`src/main.rs`) is a thin wrapper around this library so the GUI
 //! can be exercised headlessly in tests.
 
+pub mod desktop;
 pub mod gui;
 pub mod launch;
 

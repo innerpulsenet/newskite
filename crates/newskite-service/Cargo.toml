@@ -19,6 +19,10 @@ tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
 tokio-util.workspace = true
 directories.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# Auto-shutdown asks logind over D-Bus instead of running systemctl.
+zbus = { version = "5.19", default-features = false, features = ["async-io", "blocking-api"] }
+
 [dev-dependencies]
 newskite-nntp = { workspace = true, features = ["testkit"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

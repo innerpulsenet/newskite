@@ -382,7 +382,7 @@ second and at file end. Restart resume: `reset_interrupted` + JobFile rows with 
 become `skip_files`, except a row whose file is missing or whose on-disk length differs from
 `bytes_total` (a shorter one, as lost writes leave it, is deleted so it is fetched again under its
 own name; any other mismatch is left alone and the engine picks a free name). Post-process after a successful job if enabled. Idle event + optional
-auto-shutdown countdown (cancellable; only when `allow_shutdown`; Linux `systemctl poweroff`,
+auto-shutdown countdown (cancellable; only when `allow_shutdown`; Linux asks logind's `PowerOff` over D-Bus,
 Windows `shutdown /s /t 0`, macOS `osascript -e 'tell app "System Events" to shut down'`).
 Throughput sampler stores one sample per second only while bytes moved or a run is active,
 prunes >7 days. Bytes not yet sampled are flushed (added to the current second's sample and the
@@ -537,9 +537,11 @@ data directory lock, the binary shows a native "Newskite is already open" messag
 NZB arguments that were not queued and exits 1 (no hand-off to the running window yet).
 
 Review fixes (additive). The "already open" and fatal start-up messages are drawn in a small
-eframe window of the app's own (rfd's message dialog needs `zenity`, which KDE does not
-install); only when no window can open (eframe itself failed) is `kdialog` or `zenity` tried,
-and the .deb recommends `zenity | kdialog` for that case. The app icon is the stock innerpulse
+eframe window of the app's own; only when no window can open (eframe itself failed) does
+it fall back to a desktop notification over D-Bus (Linux) or the platform message box
+(Windows, macOS). No helper program is run. File pickers and opening folders, files and
+pages go through `desktop` (XDG portal `FileChooser`/`OpenURI` and `FileManager1` over
+`zbus` on Linux; `rfd`/`open` only on Windows and macOS). The app icon is the stock innerpulse
 app icon at every size (`packaging/icons/make-icons.mjs` installs the kit's renders; no accent
 in the icon). The .deb and AppImage install `fonts-OFL.txt` and a DEP-5
 `packaging/debian/copyright`. New pub items: `launch::{percent_decode_bytes, home_dir,

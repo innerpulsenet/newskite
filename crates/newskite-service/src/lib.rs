@@ -77,7 +77,7 @@ mod runner;
 mod shutdown;
 mod timers;
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -370,6 +370,10 @@ pub(crate) struct Inner {
     /// In-memory settings used instead of the stored document (never persisted); set by
     /// [`Service::set_runtime_settings_override`] (the headless CLI).
     settings_override: Mutex<Option<Settings>>,
+    /// Jobs requeued by [`Service::retry_job_on_backup`], with the articles they were
+    /// missing before: their next download asks the fail-over servers first. Cleared when that download ends (not when it is merely
+    /// interrupted, so a paused backup retry resumes as one).
+    pub(crate) backup_first: Mutex<HashMap<i64, u64>>,
 }
 
 /// Lock a mutex, recovering the data if a panicking thread poisoned it.
@@ -635,6 +639,7 @@ impl Service {
             settings_error_logged: AtomicBool::new(false),
             sampler_error_logged: AtomicBool::new(false),
             settings_override: Mutex::new(None),
+            backup_first: Mutex::new(HashMap::new()),
         });
         match inner.store.reset_interrupted() {
             Ok(0) => {}
@@ -1073,6 +1078,26 @@ impl Service {
                 Err(e)
             }
         }
+    }
+
+    /// Like [`Service::retry_job`], but the job's next download asks the fail-over servers
+    /// first, in priority order, and the primary server only for articles none of them
+    /// has. Completed files are kept; files with missing articles are downloaded again.
+    /// Refused with [`ServiceError::Other`] when fewer than two servers are usable. The
+    /// outcome is logged when that download ends. Does not start the queue.
+    pub fn retry_job_on_backup(&self, id: i64) -> Result<(), ServiceError> {
+        let Some(order) = self.inner.settings().backup_first_servers() else {
+            let e = ServiceError::Other("no fail-over server is configured".into());
+            self.inner.log(LogLevel::Error, format!("could not retry job {id} on a backup server: {e}"));
+            return Err(e);
+        };
+        let before = self.inner.store.get_job(id).ok().flatten();
+        self.retry_job(id)?;
+        let (name, missing) = before.map_or_else(|| (format!("job {id}"), 0), |j| (j.name, j.stats.articles_missing));
+        lock(&self.inner.backup_first).insert(id, missing);
+        let hosts: Vec<String> = order.iter().map(ServerConfig::address).collect();
+        self.inner.log_job(id, LogLevel::Info, format!("{name}: backup retry queued; servers in order {}", hosts.join(" → ")));
+        Ok(())
     }
 
     /// Sets (or clears with `None`/empty) the archive password used by post-processing.

@@ -360,7 +360,7 @@ fn empty_state_renders_cleanly() {
         h.get_by_label(EMPTY_QUEUE);
         h.get_by_label("Add NZB…");
         h.get_by_label("No throughput history yet");
-        h.get_by_label("No server configured.");
+        h.get_by_label("No server configured");
         h.get_by_label("Nothing left");
         h.get_by_label("No server");
         h.get_by_label("0 B/s");
@@ -401,12 +401,10 @@ fn populated_window_renders() {
         h.get_by_label("Resume this job");
         h.get_by_label("Online");
         h.get_by_label("news.example.net:563");
-        h.get_by_label("reader");
         h.get_by_label("12 / 20");
         h.get_by_label_contains("Throughput graph, 600 stored samples");
         h.get_by_label("20%  ·  20.0 MB / 96.0 MB");
         h.get_by_label("Newskite · NNTP · NEWS.EXAMPLE.NET:563 TLS · 12 CONN");
-        h.get_by_label("Articles: 0");
         assert!(
             h.query_by_label_contains("not-shown").is_none(),
             "password must never be displayed"
@@ -689,9 +687,10 @@ fn selecting_a_job_shows_its_details_and_files() {
         .find(|j| j.name == "Open.Movie.Project.2160p")
         .map(|j| j.id);
     assert_eq!(app(&h).view.queue.selected, movie);
-    // A wide window shows the inspector as a side panel; the dock keeps the server.
+    // A wide window shows the inspector as a side panel; the docks stay throughput and log.
     h.get_by_label("LIFECYCLE");
-    h.get_by_label("SERVER");
+    h.get_by_label("LOG");
+    assert!(h.query_by_label("DETAILS").is_none());
     h.get_by_label("Waiting in the queue");
     // The folder: the row's subline and the inspector's link.
     assert_eq!(
@@ -707,11 +706,11 @@ fn selecting_a_job_shows_its_details_and_files() {
     h.get_by_label("open.movie.part02.rar");
     h.get_by_label("2 of 3 done");
     snapshot(&mut h, "inspector-files-dark");
-    // Esc clears the selection; the dock shows the server again.
+    // Esc clears the selection; the server stays in its strip.
     h.key_press(egui::Key::Escape);
     h.run_steps(3);
     assert_eq!(app(&h).view.queue.selected, None);
-    h.get_by_label("SERVER");
+    h.get_by_label("news.example.net:563");
 }
 
 #[test]
@@ -1091,7 +1090,7 @@ fn nntp_activity_counts_articles_and_missing() {
     let fx = Fixture::new(seed_populated);
     let mut h = fx.harness_with(true, SIZE, false);
     h.run_steps(2);
-    h.get_by_label("Articles: 0");
+    assert_eq!(app(&h).data.articles_fetched, 0);
     let tx = app(&h).sender();
     let job_id = app(&h).data.jobs[1].id;
     for done in 1..=3 {
@@ -1119,7 +1118,7 @@ fn nntp_activity_counts_articles_and_missing() {
     ))
     .expect("send");
     h.run_steps(2);
-    h.get_by_label("Articles: 3");
+    assert_eq!(app(&h).data.articles_fetched, 3);
     assert_eq!(app(&h).data.articles_missing, 2);
     assert_no_bad_numbers(&h);
 }
@@ -1182,10 +1181,10 @@ fn minimum_window_keeps_remove_confirmation_and_docks_on_screen() {
             "{label} at {r:?}"
         );
     }
-    // Account readings fit in their card, above the status bar.
-    for label in ["Downloaded", "Missing"] {
+    // The server strip's readings sit inside the window, above the status bar.
+    for label in ["news.example.net:563", "12 / 20"] {
         let r = h.get_by_label(label).rect();
-        assert!(r.bottom() <= size.y - 28.0, "{label} at {r:?}");
+        assert!(r.bottom() <= size.y - 28.0 && r.right() <= size.x, "{label} at {r:?}");
     }
     snapshot(&mut h, "populated-dark-minimum");
     h.get_by_label("No").click();
@@ -1254,7 +1253,8 @@ fn toasts_and_server_health_render() {
     }
     h.run_steps(30);
     h.get_by_label("Download failed");
-    h.get_by_label("12840 art · 3 missing");
+    // The strip names the server; its counts are painted beside it.
+    h.get_by_label("news.example.net:563");
     assert_no_bad_numbers(&h);
     snapshot(&mut h, "toast-health-dark");
     // Clicking the toast opens the job in the History tab.
@@ -1262,4 +1262,152 @@ fn toasts_and_server_health_render() {
     h.run_steps(3);
     assert_eq!(app(&h).view.tab, Tab::History);
     assert_eq!(app(&h).view.queue.selected, Some(failed));
+}
+
+/// The primary plus a fail-over server, as a two-provider setup has them.
+fn seed_failover(store: &Store, dir: &Path) {
+    seed_populated(store, dir);
+    let mut settings = store.load_settings().expect("load");
+    settings.servers[0].host = "newshosting.tweaknews.example".into();
+    settings.servers[0].connections = 20;
+    settings.servers.push(ServerConfig {
+        host: "news.backup-provider.example".into(),
+        port: 563,
+        tls: true,
+        username: "reader".into(),
+        password: "not-shown".into(),
+        connections: 10,
+        priority: 1,
+        ..Default::default()
+    });
+    store.save_settings(&settings).expect("settings");
+}
+
+/// Readings and log lines like a run that lost articles on both providers.
+fn feed_failover(h: &mut Harness<'_, Option<NewskiteApp>>) -> i64 {
+    let a = h.state_mut().as_mut().expect("app");
+    let failed = a.data.jobs.iter().find(|j| j.state == JobState::Failed).expect("failed job").id;
+    let health = |address: &str, articles: u64, missing: u64| newskite_types::ServerHealth {
+        address: address.into(),
+        articles,
+        bytes: articles * 750_000,
+        missing,
+        errors: 0,
+        unusable: None,
+        last_error: None,
+    };
+    a.data.servers = vec![
+        health("newshosting.tweaknews.example:563", 24_310, 179),
+        health("news.backup-provider.example:563", 179, 179),
+    ];
+    let t = now() - 30;
+    let line = |dt: i64, level: LogLevel, text: &str, job: bool| newskite_service::LogLine {
+        ts: t + dt,
+        level,
+        text: text.into(),
+        job_id: job.then_some(failed),
+    };
+    let ids = "<1454628461.28666.1@reader.easyusenet.example>, <1454628461.31340.2@reader.easyusenet.example>, \
+               <1454628461.33416.3@reader.easyusenet.example>, ...";
+    // Newest first.
+    a.data.logs = vec![
+        line(9, LogLevel::Error, "failed Linux.Audio.Samples.Pack: 66 missing articles: 1454628461.28666.1@reader.easyusenet.example, 1454628461.31340.2@reader.easyusenet.example, 1454628461.33416.3@reader.easyusenet.example, 1454628461.35102.4@reader.easyusenet.example, 1454628461.37744.5@reader.easyusenet.example, ... (+61 more)", true),
+        line(8, LogLevel::Warn, &format!("Linux.Audio.Samples.Pack.r01: 66 missing article(s): {ids}"), true),
+        line(6, LogLevel::Info, "Article <1454628461.28666.1@reader.easyusenet.example> not on newshosting.tweaknews.example:563; trying news.backup-provider.example:563", true),
+        line(1, LogLevel::Info, "started Linux.Audio.Samples.Pack", true),
+    ];
+    failed
+}
+
+/// Rects of the nodes named `labels` that are on screen; panics when two overlap.
+fn assert_disjoint(h: &Harness<'_, Option<NewskiteApp>>, labels: &[&str]) {
+    let rects: Vec<(String, egui::Rect)> = labels
+        .iter()
+        .filter_map(|l| h.query_by_label(l).map(|n| (l.to_string(), n.rect())))
+        .collect();
+    for (i, (a, ra)) in rects.iter().enumerate() {
+        for (b, rb) in &rects[i + 1..] {
+            assert!(!ra.intersects(*rb), "{a} {ra:?} overlaps {b} {rb:?}");
+        }
+    }
+}
+
+#[test]
+fn failover_strip_wide_log_and_backup_retry_render() {
+    let fx = Fixture::new(seed_failover);
+    let strip_labels = [
+        "newshosting.tweaknews.example:563",
+        "newshosting.tweaknews.example",
+        "news.backup-provider.example:563",
+        "news.backup-provider.example",
+        "+1 backup",
+        "20 / 20",
+        "Retry 1 on backup",
+    ];
+    for (size, name) in [
+        (egui::vec2(1600.0, 900.0), "failover-dark-wide"),
+        (egui::vec2(960.0, 600.0), "failover-dark-minimum"),
+        (egui::vec2(880.0, 640.0), "failover-dark-narrow"),
+    ] {
+        let mut h = fx.harness_with(true, size, false);
+        h.run_steps(3);
+        feed_failover(&mut h);
+        h.run_steps(3);
+        // The strip: primary always named, connections and retry-all on the same line, apart.
+        assert!(
+            h.query_by_label("newshosting.tweaknews.example:563").is_some()
+                || h.query_by_label("newshosting.tweaknews.example").is_some(),
+            "{name}: primary named"
+        );
+        h.get_by_label("20 / 20");
+        h.get_by_label("Retry 1 on backup");
+        assert_disjoint(&h, &strip_labels);
+        // The id list is folded into its summary; the newest failure offers the backup retry.
+        let summary = h.get_by_label("Linux.Audio.Samples.Pack.r01: 66 missing articles").rect();
+        assert!(summary.right() <= size.x, "{name}: {summary:?}");
+        assert_eq!(h.get_all_by_label("Retry on backup").count(), 1, "{name}");
+        assert!(h.query_by_label_contains("1454628461.31340.2").is_none(), "{name}: ids folded");
+        assert_no_bad_numbers(&h);
+        snapshot(&mut h, name);
+    }
+
+    // Wide window: open an id list, mark a fresh line, show the retry-all confirmation.
+    let size = egui::vec2(1600.0, 900.0);
+    let mut h = fx.harness_with(true, size, false);
+    h.run_steps(3);
+    feed_failover(&mut h);
+    h.run_steps(3);
+    h.get_all_by_label("▸ Show first ids").next().expect("disclosure").click();
+    h.run_steps(2);
+    h.get_by_label("<1454628461.31340.2@reader.easyusenet.example>");
+    h.get_by_label("5 of 66 ids are listed in this message");
+    {
+        let a = h.state_mut().as_mut().expect("app");
+        a.data.logs.insert(
+            0,
+            newskite_service::LogLine {
+                ts: now(),
+                level: LogLevel::Warn,
+                text: "Linux.Audio.Samples.Pack: backup retry failed: still 66 missing articles; no server delivered them".into(),
+                job_id: None,
+            },
+        );
+    }
+    h.run_steps(2);
+    h.get_by_label("Retry 1 on backup").click();
+    h.run_steps(2);
+    assert!(app(&h).view.strip.confirm_retry_all);
+    h.get_by_label_contains("incomplete files download again from news.backup-provider.example:563 first");
+    snapshot(&mut h, "failover-dark-confirm");
+    h.get_by_label("Cancel").click();
+    h.run_steps(2);
+    assert!(!app(&h).view.strip.confirm_retry_all);
+
+    // Light theme, wide.
+    let mut h = fx.harness_with(false, size, false);
+    h.run_steps(3);
+    feed_failover(&mut h);
+    h.run_steps(3);
+    assert_disjoint(&h, &strip_labels);
+    snapshot(&mut h, "failover-light-wide");
 }

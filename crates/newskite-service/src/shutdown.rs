@@ -7,14 +7,15 @@ use newskite_types::Settings;
 
 use crate::{lock, Inner, LogLevel, ServiceEvent};
 
-/// The platform power-off command as `(program, arguments)`, or `None` where unsupported.
+/// The platform power-off command as `(program, arguments)`, or `None` where none is run.
 ///
-/// Linux: `systemctl poweroff`; Windows: `shutdown /s /t 0`; macOS:
-/// `osascript -e 'tell app "System Events" to shut down'`.
+/// Windows: `shutdown /s /t 0`; macOS: `osascript -e 'tell app "System Events" to shut
+/// down'`. Linux runs no program: it asks logind (systemd or elogind) over D-Bus, see
+/// [`platform_shutdown`].
 pub fn shutdown_command() -> Option<(&'static str, &'static [&'static str])> {
     #[cfg(target_os = "linux")]
     {
-        Some(("systemctl", &["poweroff"]))
+        None
     }
     #[cfg(target_os = "windows")]
     {
@@ -30,9 +31,27 @@ pub fn shutdown_command() -> Option<(&'static str, &'static [&'static str])> {
     }
 }
 
+/// Powers off through logind's `PowerOff` on the system bus (non-interactive: polkit
+/// decides, as it does for `systemctl poweroff`). Compiled out of this crate's unit tests,
+/// which therefore can never power off the machine.
+#[cfg(all(target_os = "linux", not(test)))]
+fn platform_shutdown() -> Result<(), String> {
+    let conn = zbus::blocking::Connection::system().map_err(|e| format!("cannot reach the system bus: {e}"))?;
+    let proxy = zbus::blocking::Proxy::new(
+        &conn,
+        "org.freedesktop.login1",
+        "/org/freedesktop/login1",
+        "org.freedesktop.login1.Manager",
+    )
+    .map_err(|e| format!("cannot reach logind: {e}"))?;
+    proxy
+        .call::<_, _, ()>("PowerOff", &(false,))
+        .map_err(|e| format!("logind refused to power off: {e}"))
+}
+
 /// Runs the platform power-off command. Compiled out of this crate's unit tests, which
 /// therefore can never power off the machine.
-#[cfg(not(test))]
+#[cfg(all(not(target_os = "linux"), not(test)))]
 fn platform_shutdown() -> Result<(), String> {
     let (program, args) = shutdown_command().ok_or("shutting down is not supported on this platform")?;
     let status = std::process::Command::new(program)
