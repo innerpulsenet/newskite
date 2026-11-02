@@ -18,6 +18,7 @@ newskite-engine = { path = "crates/newskite-engine" }
 newskite-store = { path = "crates/newskite-store" }
 newskite-theme = { path = "crates/newskite-theme" }
 newskite-postproc = { path = "crates/newskite-postproc" }
+newskite-par2 = { path = "crates/newskite-par2" }
 newskite-service = { path = "crates/newskite-service" }
 newskite-cli = { path = "crates/newskite-cli" }
 

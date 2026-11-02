@@ -670,9 +670,19 @@ where
                     finalize_idle(service, tracked, ui);
                 }
                 if ui.progress.is_some() && tracked.iter().any(|t| t.outcome.is_none()) {
-                    let (done, total) = byte_progress(service, tracked);
+                    // Post-processing (PAR2, extraction) shows its stage instead of bytes.
+                    let text = match service.status().post {
+                        Some(p) => match p.permille {
+                            Some(m) => format!("{} {:.0}% · {}", p.stage.label(), m as f32 / 10.0, p.detail),
+                            None => format!("{} · {}", p.stage.label(), p.detail),
+                        },
+                        None => {
+                            let (done, total) = byte_progress(service, tracked);
+                            progress_text(done, total, speed)
+                        }
+                    };
                     if let Some(p) = &mut ui.progress {
-                        p.update(&progress_text(done, total, speed));
+                        p.update(&text);
                     }
                 }
             }

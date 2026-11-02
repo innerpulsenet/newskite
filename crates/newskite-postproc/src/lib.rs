@@ -7,13 +7,19 @@
 //!
 //! # Behavior
 //!
-//! 1. **PAR2.** `.par2` files are grouped into sets (`name.par2` + `name.volNN+MM.par2`).
-//!    For each set the main file (no `.volNN+MM`, else the smallest) is verified with
-//!    `par2 verify`. Damaged/missing files are repaired with `par2 repair` when
-//!    [`PostOptions::repair`] is set; unmatched files in the folder are passed as extra
-//!    files so obfuscated (renamed) copies are recognized and renamed back. Exit codes
-//!    (0 ok, 1 repair possible, 2 repair not possible) are cross-checked with the output.
-//!    With repair disabled, a damaged set is a failure.
+//! 1. **PAR2** runs natively ([`newskite_par2`]): every file holding PAR2 packets (any
+//!    name) is parsed, each recovery set is verified slice by slice, and damaged or
+//!    missing files are rebuilt when [`PostOptions::repair`] is set. Complete copies under
+//!    other names (obfuscated posts) are renamed back, good slices are collected from
+//!    other files, and the engine's incomplete `.nkpart` files (articles missing) serve
+//!    as slice sources too, so a download with missing articles can still be completed.
+//!    After a successful PAR2 step, a `.nkpart` file is deleted when it supplied slices
+//!    or its final name is now a correct protected file; the rest are reported in
+//!    [`PostReport::incomplete`]. Per-file results are logged and summed in
+//!    [`PostReport::par2_stats`]; progress goes to [`PostEvent::Stage`]. Only when no
+//!    recovery set parses is the external `par2` tool tried (verify, then repair with
+//!    unmatched files as extras; exit codes cross-checked with its output). With repair
+//!    disabled, a damaged set is a failure.
 //! 2. **Extraction** (when [`PostOptions::extract`] is set and PAR2 did not fail).
 //!    Archive sets are detected by name (`.rar`, `.partNN.rar`, `.rNN`, `.7z`,
 //!    `.7z.NNN`, `.zip`, `.zNN`, `.zip.NNN`) and magic bytes (files with no or a
@@ -60,6 +66,7 @@ use std::path::{Path, PathBuf};
 
 pub use detect::{sniff_bytes, sniff_file, ArchiveKind, Magic};
 pub use extract::{is_unsafe_entry, parse_7z_listing, parse_bare_listing};
+pub use par2::Par2Stats;
 pub use tools::{detect_tools, detect_tools_in, find_tool, Tools};
 
 use newskite_types::PostProcessSettings;
@@ -158,6 +165,41 @@ pub struct PostReport {
     pub extracted_to: Option<PathBuf>,
     /// Files deleted by cleanup.
     pub removed: Vec<PathBuf>,
+    /// Counts from the native PAR2 step (`None` when it did not run natively).
+    pub par2_stats: Option<Par2Stats>,
+    /// Incomplete `.nkpart` files that are superseded by repaired files and were deleted.
+    pub partials_removed: Vec<PathBuf>,
+    /// Incomplete `.nkpart` files that are still incomplete (not covered by PAR2).
+    pub incomplete: Vec<PathBuf>,
+}
+
+/// Post-processing stage, for progress display.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PostStage {
+    Verify,
+    Repair,
+    Extract,
+    Cleanup,
+}
+
+impl PostStage {
+    pub fn label(self) -> &'static str {
+        match self {
+            PostStage::Verify => "Verifying",
+            PostStage::Repair => "Repairing",
+            PostStage::Extract => "Extracting",
+            PostStage::Cleanup => "Cleaning up",
+        }
+    }
+}
+
+/// What [`process_with_events`] reports while it runs.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PostEvent {
+    /// A human-readable progress line (never a password).
+    Log(String),
+    /// The current stage, its fraction done when known, and a short detail.
+    Stage { stage: PostStage, fraction: Option<f32>, detail: String },
 }
 
 /// Errors that prevent post-processing from running at all. Tool failures are reported
@@ -221,6 +263,25 @@ fn list_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
     Ok(v)
 }
 
+/// True when `dir` directly holds a file with PAR2 packets (any name).
+pub fn has_par2(dir: &Path) -> bool {
+    list_files(dir).map(|v| v.iter().any(|f| newskite_par2::has_magic(f))).unwrap_or(false)
+}
+
+/// Engine partial files (`*.nkpart`) directly in `dir`; sorted.
+fn list_partials(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut v = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_file() && path.extension().is_some_and(|e| e.eq_ignore_ascii_case("nkpart")) {
+            v.push(path);
+        }
+    }
+    v.sort();
+    Ok(v)
+}
+
 /// Run PAR2 verify/repair, extraction and cleanup for the download in `dir`.
 /// See the crate documentation for the exact behavior. `log` receives human-readable
 /// progress lines (never passwords).
@@ -230,6 +291,36 @@ pub fn process(
     opts: &PostOptions,
     tools: &Tools,
     log: &mut dyn FnMut(String),
+) -> Result<PostReport, PostError> {
+    process_with_events(dir, job_name, opts, tools, &mut |e| {
+        if let PostEvent::Log(l) = e {
+            log(l)
+        }
+    })
+}
+
+/// [`process`] with stage progress as well as log lines.
+pub fn process_with_events(
+    dir: &Path,
+    job_name: &str,
+    opts: &PostOptions,
+    tools: &Tools,
+    on: &mut dyn FnMut(PostEvent),
+) -> Result<PostReport, PostError> {
+    let on = std::cell::RefCell::new(on);
+    let mut log = |l: String| (on.borrow_mut())(PostEvent::Log(l));
+    let mut progress =
+        |stage: PostStage, fraction: Option<f32>, detail: String| (on.borrow_mut())(PostEvent::Stage { stage, fraction, detail });
+    run_all(dir, job_name, opts, tools, &mut log, &mut progress)
+}
+
+fn run_all(
+    dir: &Path,
+    job_name: &str,
+    opts: &PostOptions,
+    tools: &Tools,
+    log: &mut dyn FnMut(String),
+    progress: &mut dyn FnMut(PostStage, Option<f32>, String),
 ) -> Result<PostReport, PostError> {
     let dir = std::path::absolute(dir)?;
     if !std::fs::metadata(&dir)?.is_dir() {
@@ -244,15 +335,58 @@ pub fn process(
     if par2::name_obfuscated_par2(&dir, &files, log) > 0 {
         files = list_files(&dir)?;
     }
-    let (par2_verdict, backups) = par2::run(&dir, &files, tools.par2.as_deref(), opts.repair, log);
+    let partials = list_partials(&dir)?;
+    let outcome = par2::run(&dir, &files, &partials, tools.par2.as_deref(), opts.repair, log, progress);
+    let par2_verdict = outcome.verdict.unwrap_or_else(|| Verdict::Skipped(NO_PAR2.into()));
+    let backups = outcome.backups;
     log(format!("par2: {par2_verdict}"));
 
-    let mut report = PostReport { par2: par2_verdict, extract: Verdict::Skipped(String::new()), extracted_to: None, removed: Vec::new() };
+    let mut report = PostReport {
+        par2: par2_verdict,
+        extract: Verdict::Skipped(String::new()),
+        extracted_to: None,
+        removed: Vec::new(),
+        par2_stats: outcome.stats,
+        partials_removed: Vec::new(),
+        incomplete: Vec::new(),
+    };
+
+    // Partial files that PAR2 made redundant go; the others are still incomplete.
+    for p in partials {
+        let final_path = p.with_extension("");
+        let superseded = report.par2.is_success()
+            && (outcome.partials_used.contains(&p) || outcome.good_targets.contains(&final_path));
+        if superseded {
+            match std::fs::remove_file(&p) {
+                Ok(()) => report.partials_removed.push(p),
+                Err(e) => {
+                    log(format!("par2: could not remove {}: {e}", p.display()));
+                    report.incomplete.push(p);
+                }
+            }
+        } else {
+            report.incomplete.push(p);
+        }
+    }
+    if !report.partials_removed.is_empty() {
+        log(format!("par2: {} incomplete download file(s) are complete now", report.partials_removed.len()));
+    }
+    if !report.incomplete.is_empty() {
+        log(format!(
+            "par2: {} file(s) are still incomplete: {}",
+            report.incomplete.len(),
+            report.incomplete.iter().map(|p| p.file_name().unwrap_or_default().to_string_lossy().into_owned()).collect::<Vec<_>>().join(", ")
+        ));
+    }
 
     // 2. Extraction
+    if opts.extract {
+        progress(PostStage::Extract, None, "Extracting archives".into());
+    }
     let extracted = extract_phase(&dir, job_name, opts, tools, &mut report, log)?;
 
     // 3. Cleanup. `files` is listed after par2 renamed obfuscated files back.
+    progress(PostStage::Cleanup, None, "Cleaning up".into());
     let files = list_files(&dir)?;
     let mut doomed: Vec<PathBuf> = Vec::new();
     if opts.cleanup && report.extract == Verdict::Ok {

@@ -647,6 +647,7 @@ impl NewskiteApp {
                 self.data.shutdown_secs = Some(secs_left)
             }
             ServiceEvent::ShutdownCanceled => self.data.shutdown_secs = None,
+            ServiceEvent::PostProgress(p) => self.data.status.post = Some(p),
         }
     }
 

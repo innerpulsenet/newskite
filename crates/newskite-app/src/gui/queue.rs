@@ -836,6 +836,33 @@ fn name_cell(
 }
 
 fn progress_cell(ui: &mut Ui, pal: &Palette, data: &Data, job: &Job, width: f32, busy: Beat) {
+    // After the download: the post-processing stage replaces the byte figures.
+    if let Some(p) = data.status.post.as_ref().filter(|p| p.job_id == job.id) {
+        let fraction = p.permille.map(|m| m as f32 / 1000.0);
+        let color = match p.stage {
+            newskite_service::PostStage::Repair => pal.warning,
+            _ => pal.accent,
+        };
+        let sweep = (fraction.is_none() && busy.moving).then_some(busy.phase);
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 4.0;
+            segment_track_live(ui, pal, fraction.unwrap_or(1.0), color, width, sweep);
+            let head = match fraction {
+                Some(f) => format!("{} {:.0}%", p.stage.label(), f * 100.0),
+                None => p.stage.label().to_string(),
+            };
+            ui.add(
+                egui::Label::new(
+                    RichText::new(format!("{head}  ·  {}", p.detail))
+                        .font(fonts::mono_id(11.0))
+                        .color(pal.muted),
+                )
+                .truncate(),
+            )
+            .on_hover_text(&p.detail);
+        });
+        return;
+    }
     let done = data.shown_done(job);
     // Segment cells fill in the accent; a held job's cells rest in the muted tone.
     let color = match job.state {

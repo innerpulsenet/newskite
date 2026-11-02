@@ -6,13 +6,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use newskite_engine::{download_with_pool, DownloadRequest, EngineError, EngineOptions, JobReport};
-use newskite_postproc::{detect_tools, PostOptions};
+use newskite_postproc::{detect_tools, PostEvent, PostOptions, PostReport};
 use newskite_store::{Job, JobFile, JobState, StoreError};
 use newskite_types::{format, EngineEvent, ServerConfig, Settings};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::{shutdown, Inner, LogLevel, ServiceEvent, NO_SERVER_MESSAGE};
+use crate::{shutdown, Inner, LogLevel, PostProgress, ServiceEvent, NO_SERVER_MESSAGE};
 
 /// How long to wait for the event forwarder to drain after the engine returned.
 const FORWARDER_DRAIN: Duration = Duration::from_secs(10);
@@ -380,7 +380,16 @@ async fn download_job(
             Some(End::Shutdown)
         }
         Err(EngineError::MissingArticles { ids }) => {
-            fail_job(inner, &job, &missing_message(&ids));
+            let p = &settings.postprocess;
+            let dir = job.dest_dir.clone();
+            let par2 = p.enabled && p.repair && tokio::task::spawn_blocking(move || newskite_postproc::has_par2(&dir)).await.unwrap_or(false);
+            if par2 {
+                // PAR2 can often rebuild what the servers no longer have.
+                inner.log(LogLevel::Warn, format!("{}: {}; trying a PAR2 repair", job.name, missing_message(&ids)));
+                finish_partial(inner, &job, settings, &ids).await;
+            } else {
+                fail_job(inner, &job, &missing_message(&ids));
+            }
             None
         }
         Err(EngineError::AuthFailed(m)) => {
@@ -403,58 +412,73 @@ async fn download_job(
     }
 }
 
+/// Runs post-processing for `job`, streaming its progress into [`crate::Status::post`]
+/// and [`ServiceEvent::PostProgress`]. `Err` carries the failure reason.
+async fn post_process(inner: &Arc<Inner>, job: &Job, settings: &Settings) -> Result<PostReport, String> {
+    inner.log(LogLevel::Info, format!("post-processing {}", job.name));
+    let opts = PostOptions::from_settings(&settings.postprocess, job.password.clone());
+    let dir = job.dest_dir.clone();
+    let name = job.name.clone();
+    let job_id = job.id;
+    let task_inner = inner.clone();
+    let started = Instant::now();
+    let result = tokio::task::spawn_blocking(move || {
+        let tools = task_inner.tools.get_or_init(detect_tools);
+        let ev = task_inner.clone();
+        newskite_postproc::process_with_events(&dir, &name, &opts, tools, &mut |e| match e {
+            PostEvent::Log(line) => ev.log(LogLevel::Info, line),
+            PostEvent::Stage { stage, fraction, detail } => {
+                let p = PostProgress {
+                    job_id,
+                    stage,
+                    permille: fraction.map(|f| (f.clamp(0.0, 1.0) * 1000.0) as u16),
+                    detail,
+                };
+                ev.lock_state().post = Some(p.clone());
+                ev.emit(ServiceEvent::PostProgress(p));
+            }
+        })
+    })
+    .await;
+    inner.lock_state().post = None;
+    let secs = started.elapsed().as_secs();
+    match result {
+        Ok(Ok(post)) => {
+            inner.log(
+                LogLevel::Info,
+                format!(
+                    "post-processing {} took {}: par2 {}, extract {}",
+                    job.name,
+                    format::duration_secs(secs),
+                    post.par2,
+                    post.extract
+                ),
+            );
+            if post.par2.is_failed() || post.extract.is_failed() {
+                return Err(format!("post-processing failed: par2 {}, extract {}", post.par2, post.extract));
+            }
+            Ok(post)
+        }
+        Ok(Err(e)) => Err(format!("post-processing error: {e}")),
+        Err(e) => Err(format!("post-processing stopped unexpectedly: {e}")),
+    }
+}
+
 /// Post-processing (when enabled) and the final `done`/`failed` state of a downloaded job.
 async fn finish_ok(inner: &Arc<Inner>, job: &Job, settings: &Settings, report: &JobReport) {
     if settings.postprocess.enabled {
-        inner.log(LogLevel::Info, format!("post-processing {}", job.name));
-        let opts = PostOptions::from_settings(&settings.postprocess, job.password.clone());
-        let dir = job.dest_dir.clone();
-        let name = job.name.clone();
-        let task_inner = inner.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            let tools = task_inner.tools.get_or_init(detect_tools);
-            let log_inner = task_inner.clone();
-            let mut log = move |line: String| log_inner.log(LogLevel::Info, line);
-            newskite_postproc::process(&dir, &name, &opts, tools, &mut log)
-        })
-        .await;
-        match result {
-            Ok(Ok(post)) => {
-                inner.log(
-                    LogLevel::Info,
-                    format!("post-processing {}: par2 {}, extract {}", job.name, post.par2, post.extract),
-                );
-                if post.par2.is_failed() || post.extract.is_failed() {
-                    fail_job(
-                        inner,
-                        job,
-                        &format!("post-processing failed: par2 {}, extract {}", post.par2, post.extract),
-                    );
-                    return;
-                }
-            }
-            Ok(Err(e)) => {
-                fail_job(inner, job, &format!("post-processing error: {e}"));
-                return;
-            }
-            Err(e) => {
-                fail_job(inner, job, &format!("post-processing stopped unexpectedly: {e}"));
-                return;
-            }
+        if let Err(reason) = post_process(inner, job, settings).await {
+            fail_job(inner, job, &reason);
+            return;
         }
         if inner.lock_state().removed_active {
             return;
         }
     }
-
-    let _ = inner.store.set_job_progress(job.id, job.bytes_total);
-    match inner.store.set_job_state(job.id, JobState::Done, None) {
-        Ok(()) | Err(StoreError::NotFound) => {}
-        Err(e) => inner.log(LogLevel::Error, format!("could not mark {} done: {e}", job.name)),
-    }
     let written: u64 = report.files.iter().map(|f| f.bytes).sum();
-    inner.log(
-        LogLevel::Info,
+    mark_done(
+        inner,
+        job,
         format!(
             "completed {} ({} file{}, {})",
             job.name,
@@ -463,6 +487,44 @@ async fn finish_ok(inner: &Arc<Inner>, job: &Job, settings: &Settings, report: &
             format::bytes(written)
         ),
     );
+}
+
+/// A download with missing articles and PAR2 data: post-process it anyway. Done when PAR2
+/// rebuilt every incomplete file, else failed with both reasons.
+async fn finish_partial(inner: &Arc<Inner>, job: &Job, settings: &Settings, ids: &[String]) {
+    let missing = missing_message(ids);
+    match post_process(inner, job, settings).await {
+        Ok(post) if post.incomplete.is_empty() => {
+            if inner.lock_state().removed_active {
+                return;
+            }
+            mark_done(
+                inner,
+                job,
+                format!(
+                    "completed {}: PAR2 repaired {} missing article{}",
+                    job.name,
+                    ids.len(),
+                    if ids.len() == 1 { "" } else { "s" }
+                ),
+            );
+        }
+        Ok(post) => fail_job(
+            inner,
+            job,
+            &format!("{missing}; {} file(s) still incomplete after PAR2 (not covered by the recovery data)", post.incomplete.len()),
+        ),
+        Err(reason) => fail_job(inner, job, &format!("{missing}; {reason}")),
+    }
+}
+
+fn mark_done(inner: &Inner, job: &Job, line: String) {
+    let _ = inner.store.set_job_progress(job.id, job.bytes_total);
+    match inner.store.set_job_state(job.id, JobState::Done, None) {
+        Ok(()) | Err(StoreError::NotFound) => {}
+        Err(e) => inner.log(LogLevel::Error, format!("could not mark {} done: {e}", job.name)),
+    }
+    inner.log(LogLevel::Info, line);
     inner.emit(ServiceEvent::JobsChanged);
 }
 
