@@ -529,10 +529,11 @@ impl NntpConnection {
 
     /// Reads a dot-terminated multi-line block, unstuffing leading dots.
     ///
-    /// Works on the reader's buffer chunk by chunk instead of line by line: runs of body
-    /// bytes are appended in one copy, only line starts (where a stuffed dot or the
-    /// terminator can be) are examined one byte at a time, and the inactivity timeout wraps
-    /// each socket read rather than each line.
+    /// Works on the reader's buffer chunk by chunk instead of line by line: consecutive
+    /// CRLF lines that need no unstuffing are found with `memchr` and appended in one copy,
+    /// only line starts with a dot (stuffing or the terminator) and bare LFs are handled
+    /// one byte at a time, and the inactivity timeout wraps each socket read rather than
+    /// each line.
     async fn read_multiline(&mut self) -> Result<Vec<u8>, NntpError> {
         let capacity = match self.body_hint {
             0 => BODY_INITIAL,
@@ -683,7 +684,22 @@ fn unstuff_chunk(chunk: &[u8], out: &mut Vec<u8>, state: &mut Block) -> Result<(
             }
             Block::Mid => {
                 let rest = &chunk[i..];
-                match rest.iter().position(|&b| b == b'\n') {
+                // Fast path: whole CRLF lines whose next line does not start with a dot
+                // need no change, so they are found with memchr and copied as one run.
+                let mut run = 0;
+                for nl in memchr::memchr_iter(b'\n', rest) {
+                    if nl == 0 || rest[nl - 1] != b'\r' || rest.get(nl + 1).is_none_or(|&b| b == b'.') {
+                        break;
+                    }
+                    run = nl + 1;
+                }
+                if run > 0 {
+                    check_limit(out.len(), run)?;
+                    out.extend_from_slice(&rest[..run]);
+                    i += run;
+                    continue;
+                }
+                match memchr::memchr(b'\n', rest) {
                     Some(n) => {
                         // Normalize the line ending: `\r\n` as is, bare `\n` becomes `\r\n`.
                         let line = &rest[..n];
@@ -848,6 +864,101 @@ mod tests {
         assert_eq!(unstuff_split(b".\r\n", 2), (Vec::new(), true, 3));
         // No terminator yet: everything consumed, not done.
         assert_eq!(unstuff_split(b"abc\r\nde", 3), (b"abc\r\nde".to_vec(), false, 7));
+    }
+
+    /// Line-by-line unstuffing (the definition the chunk parser must meet): the output and
+    /// the bytes consumed through the terminator, or `None` without one.
+    fn unstuff_reference(input: &[u8]) -> Option<(Vec<u8>, usize)> {
+        let mut out = Vec::new();
+        let mut at = 0;
+        while let Some(n) = input[at..].iter().position(|&b| b == b'\n') {
+            let line = &input[at..at + n];
+            at += n + 1;
+            if line == b"." || line == b".\r" {
+                return Some((out, at));
+            }
+            let line = line.strip_prefix(b".").unwrap_or(line);
+            out.extend_from_slice(line.strip_suffix(b"\r").unwrap_or(line));
+            out.extend_from_slice(b"\r\n");
+        }
+        None
+    }
+
+    /// Random blocks dense in dots, CR and LF, split into chunks of many sizes, unstuff
+    /// exactly as the line-by-line reference does.
+    #[test]
+    fn unstuffing_matches_line_reference() {
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for len in 0..120 {
+            for _ in 0..30 {
+                let mut input: Vec<u8> = (0..len).map(|_| b".\r\nab"[(next() % 5) as usize]).collect();
+                input.extend_from_slice(b"\r\n.\r\n");
+                let (want, used) = unstuff_reference(&input).unwrap();
+                for split in [1, 2, 3, 7, 16, 64, input.len()] {
+                    let (out, done, got_used) = unstuff_split(&input, split);
+                    assert!(done);
+                    assert_eq!((out, got_used), (want.clone(), used), "{input:?} split {split}");
+                }
+            }
+        }
+    }
+
+    /// A yEnc-like article body: 128-byte data lines (a few dot-stuffed), CRLF endings and
+    /// the terminator, as a server sends it.
+    fn wire_body(lines: usize) -> Vec<u8> {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut wire = Vec::new();
+        for n in 0..lines {
+            if n % 97 == 0 {
+                wire.extend_from_slice(b"..");
+            }
+            for _ in 0..128 {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let b = x as u8;
+                wire.push(if b == b'\r' || b == b'\n' { b'a' } else { b });
+            }
+            wire.extend_from_slice(b"\r\n");
+        }
+        wire.extend_from_slice(b".\r\n");
+        wire
+    }
+
+    /// Unstuffing throughput (not run by default):
+    /// `cargo test --release -p newskite-nntp unstuff_throughput -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn unstuff_throughput() {
+        let wire = wire_body(6000);
+        let reps = 400;
+        let mut best = f64::MAX;
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            for _ in 0..reps {
+                let mut out = Vec::with_capacity(wire.len());
+                let mut state = Block::LineStart;
+                let mut pos = 0;
+                // Chunks the size of the socket read buffer.
+                while pos < wire.len() {
+                    let end = (pos + READ_BUFFER).min(wire.len());
+                    let (used, done) = unstuff_chunk(&wire[pos..end], &mut out, &mut state).unwrap();
+                    pos += used;
+                    if done {
+                        break;
+                    }
+                }
+                std::hint::black_box(out);
+            }
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        println!("unstuff: {:.0} MB/s", (wire.len() * reps) as f64 / best / 1e6);
     }
 
     #[test]
