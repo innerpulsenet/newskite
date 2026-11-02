@@ -185,7 +185,7 @@ fn scan_file(path: &Path, sets: &mut BTreeMap<Id, Partial>, bad: &mut usize) -> 
             }
         }
         let plen = u64le(&header[8..]);
-        if plen < HEADER as u64 || plen % 4 != 0 || plen > MAX_PACKET || pos + plen > len {
+        if plen < HEADER as u64 || !plen.is_multiple_of(4) || plen > MAX_PACKET || pos + plen > len {
             *bad += 1;
             pos += 1;
             continue;
@@ -243,7 +243,7 @@ fn parse_body(ptype: &[u8; 16], body: &[u8], set_id: Id, p: &mut Partial) {
         }
         let slice_size = u64le(body);
         let n = u32le(&body[8..]) as usize;
-        if slice_size == 0 || slice_size % 4 != 0 || body.len() < 12 + n * 16 {
+        if slice_size == 0 || !slice_size.is_multiple_of(4) || body.len() < 12 + n * 16 {
             return;
         }
         let ids = (0..n).map(|i| id(&body[12 + i * 16..])).collect();
@@ -257,7 +257,7 @@ fn parse_body(ptype: &[u8; 16], body: &[u8], set_id: Id, p: &mut Partial) {
         let end = raw.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
         let name = String::from_utf8_lossy(&raw[..end]).into_owned();
         p.descs.entry(fid).or_insert((name, length, md5, md5_16k));
-    } else if ptype == T_IFSC && body.len() >= 16 && (body.len() - 16) % 20 == 0 {
+    } else if ptype == T_IFSC && body.len() >= 16 && (body.len() - 16).is_multiple_of(20) {
         let fid = id(body);
         let slices = body[16..].chunks_exact(20).map(|c| SliceHash { md5: id(c), crc: u32le(&c[16..]) }).collect();
         p.ifsc.entry(fid).or_insert(slices);

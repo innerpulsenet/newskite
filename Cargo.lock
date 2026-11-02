@@ -2443,6 +2443,7 @@ dependencies = [
  "newskite-engine",
  "newskite-nntp",
  "newskite-nzb",
+ "newskite-par2",
  "newskite-postproc",
  "newskite-store",
  "newskite-types",
