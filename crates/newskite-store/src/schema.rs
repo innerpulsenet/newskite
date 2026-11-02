@@ -77,6 +77,25 @@ const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE jobs ADD COLUMN position INTEGER NOT NULL DEFAULT 0;
     "#,
+    // v4: what happened to a job (timings, article counts, post-processing outcome as
+    // JSON) and a per-job log that survives restarts.
+    r#"
+    ALTER TABLE jobs ADD COLUMN started_at INTEGER;
+    ALTER TABLE jobs ADD COLUMN finished_at INTEGER;
+    ALTER TABLE jobs ADD COLUMN download_ms INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE jobs ADD COLUMN post_ms INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE jobs ADD COLUMN articles_total INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE jobs ADD COLUMN articles_missing INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE jobs ADD COLUMN outcome TEXT;
+    CREATE TABLE job_log (
+        id      INTEGER PRIMARY KEY AUTOINCREMENT,
+        job_id  INTEGER NOT NULL REFERENCES jobs (id) ON DELETE CASCADE,
+        ts      INTEGER NOT NULL,
+        level   TEXT    NOT NULL,
+        text    TEXT    NOT NULL
+    );
+    CREATE INDEX job_log_job ON job_log (job_id, id);
+    "#,
 ];
 
 /// The schema version this build writes.

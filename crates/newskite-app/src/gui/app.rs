@@ -648,6 +648,7 @@ impl NewskiteApp {
             }
             ServiceEvent::ShutdownCanceled => self.data.shutdown_secs = None,
             ServiceEvent::PostProgress(p) => self.data.status.post = Some(p),
+            ServiceEvent::JobFinished { .. } => *reload_jobs = true,
         }
     }
 
@@ -1583,6 +1584,7 @@ mod tests {
             created_at: id,
             error: None,
             password: None,
+            stats: Default::default(),
         }
     }
 

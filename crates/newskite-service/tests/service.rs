@@ -742,6 +742,24 @@ async fn missing_article_is_repaired_by_par2_and_files_can_be_deleted() {
     let events = drain(&mut rx);
     assert!(events.iter().any(|e| matches!(e, ServiceEvent::PostProgress(p) if p.stage == newskite_service::PostStage::Repair)));
     assert_eq!(svc.status().post, None);
+    assert!(events.iter().any(|e| matches!(e, ServiceEvent::JobFinished { ok: true, job_id, .. } if *job_id == job.id)));
+
+    // The outcome and the job's own log are kept with the job.
+    let st = &done.stats;
+    assert!(st.started_at.is_some() && st.finished_at.is_some());
+    assert_eq!((st.articles_total, st.articles_missing), (6, 1));
+    let o = st.outcome.as_ref().unwrap();
+    assert!(o.repaired(), "{o:?}");
+    assert_eq!(o.articles_repaired, 1);
+    assert_eq!(o.failure, None);
+    assert!(o.par2_summary.as_deref().unwrap().contains("1 missing"), "{o:?}");
+    let log = svc.job_log(job.id);
+    assert!(log.iter().any(|l| l.level == "warn" && l.text.contains("trying a PAR2 repair")), "{log:#?}");
+    assert!(svc.logs().iter().filter(|l| l.job_id == Some(job.id)).count() > 3);
+    let health = svc.server_health();
+    assert_eq!(health.len(), 1);
+    assert_eq!(health[0].missing, 1);
+    assert!(health[0].articles >= 5);
 
     // Delete files: the folder goes, the job leaves the list.
     let deleted = svc.delete_job_files(job.id).unwrap();

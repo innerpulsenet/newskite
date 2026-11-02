@@ -124,11 +124,12 @@ async fn starting_the_queue_cancels_the_countdown() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn log_ring_keeps_the_newest_fifty_newest_first() {
+async fn log_ring_keeps_the_newest_lines_newest_first_and_writes_the_file() {
     let tmp = TempDir::new().unwrap();
     let svc = Service::open(ServiceOptions::new(tmp.path().join("db")), tokio::runtime::Handle::current()).unwrap();
     let mut rx = svc.subscribe();
-    for i in 0..60 {
+    let n = LOG_CAPACITY + 10;
+    for i in 0..n {
         svc.log(if i % 2 == 0 { LogLevel::Info } else { LogLevel::Warn }, format!("line {i}"));
     }
     svc.log(LogLevel::Error, "boom");
@@ -136,9 +137,11 @@ async fn log_ring_keeps_the_newest_fifty_newest_first() {
     assert_eq!(logs.len(), LOG_CAPACITY);
     assert_eq!(logs[0].text, "boom");
     assert_eq!(logs[0].level, LogLevel::Error);
-    assert_eq!(logs[1].text, "line 59");
-    assert_eq!(logs[49].text, "line 11");
+    assert_eq!(logs[1].text, format!("line {}", n - 1));
+    assert_eq!(logs[LOG_CAPACITY - 1].text, format!("line {}", n - LOG_CAPACITY + 1));
     assert!(logs.windows(2).all(|w| w[0].ts >= w[1].ts));
+    let file = std::fs::read_to_string(svc.log_file_path()).unwrap();
+    assert!(file.lines().last().unwrap().ends_with("error boom"), "{}", file.lines().last().unwrap());
     let events = drain(&mut rx);
     assert!(events.contains(&ServiceEvent::JobLog("line 0".into())));
     assert!(events.contains(&ServiceEvent::Error("boom".into())));

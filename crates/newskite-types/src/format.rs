@@ -48,6 +48,23 @@ pub fn duration_secs(secs: u64) -> String {
     if h > 0 { format!("{h}:{m:02}:{s:02}") } else { format!("{m}:{s:02}") }
 }
 
+/// `2026-11-01 14:03:07Z` for unix seconds (UTC; no time-zone database needed).
+pub fn timestamp_utc(ts: i64) -> String {
+    let days = ts.div_euclid(86_400);
+    let secs = ts.rem_euclid(86_400);
+    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02}Z", secs / 3600, (secs % 3600) / 60, secs % 60)
+}
+
 /// Compact human duration: `45s`, `8m 12s`, `2h 05m`, `3d 4h`.
 pub fn duration_short(secs: u64) -> String {
     let (d, h, m, s) = (secs / 86400, (secs % 86400) / 3600, (secs % 3600) / 60, secs % 60);
@@ -90,6 +107,8 @@ mod tests {
         assert_eq!(ago(0, 3 * 3600 + 5), "3 h ago");
         assert_eq!(ago(0, 90_000), "yesterday");
         assert_eq!(ago(0, 5 * 86_400), "5 days ago");
+        assert_eq!(timestamp_utc(0), "1970-01-01 00:00:00Z");
+        assert_eq!(timestamp_utc(1_793_545_387), "2026-11-01 15:03:07Z");
     }
 
     #[test]

@@ -1162,6 +1162,7 @@ mod tests {
             created_at: created,
             error: None,
             password: None,
+            stats: Default::default(),
         }
     }
 

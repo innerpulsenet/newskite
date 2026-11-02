@@ -100,7 +100,13 @@ pub use files::Deleted;
 pub use shutdown::shutdown_command;
 
 /// Number of lines kept in the in-memory log ring.
-pub const LOG_CAPACITY: usize = 50;
+pub const LOG_CAPACITY: usize = 500;
+
+/// The log file is rotated (to `newskite.log.1`) once it grows past this size.
+pub const LOG_FILE_MAX: u64 = 4 << 20;
+
+/// Name of the log file in the data directory.
+pub const LOG_FILE_NAME: &str = "newskite.log";
 
 /// Capacity of the event broadcast channel; slow receivers lag (and skip) rather than
 /// block the service.
@@ -156,6 +162,17 @@ pub enum ServiceEvent {
     Error(String),
     /// Post-processing progress of the active job (also in [`Status::post`]).
     PostProgress(PostProgress),
+    /// A job reached `done` (`ok`) or `failed`; `detail` is a short summary or the reason.
+    JobFinished {
+        /// The job.
+        job_id: i64,
+        /// Its name.
+        name: String,
+        /// Done rather than failed.
+        ok: bool,
+        /// "repaired and complete", or the failure reason.
+        detail: String,
+    },
 }
 
 /// Where post-processing of a job is.
@@ -208,6 +225,8 @@ pub struct LogLine {
     pub level: LogLevel,
     /// Human text (never contains passwords).
     pub text: String,
+    /// The job the line is about, if any.
+    pub job_id: Option<i64>,
 }
 
 /// Snapshot of the queue state for status displays.
@@ -325,6 +344,8 @@ pub(crate) struct Inner {
     pub(crate) events: broadcast::Sender<ServiceEvent>,
     pub(crate) state: Mutex<RunState>,
     logs: Mutex<VecDeque<LogLine>>,
+    /// Open handle of the log file (lazily opened, dropped on rotation).
+    log_file: Mutex<Option<std::fs::File>>,
     /// Shared counters handed to every engine run; the sampler diffs `bytes_down`.
     pub(crate) progress: Arc<Progress>,
     /// NNTP connections kept between the jobs of one run; closed when the run ends.
@@ -374,7 +395,21 @@ impl Inner {
     }
 
     pub(crate) fn log(&self, level: LogLevel, text: impl Into<String>) {
-        let text = text.into();
+        self.log_line(None, level, text.into());
+    }
+
+    /// A line about one job: also kept in that job's own log.
+    pub(crate) fn log_job(&self, job_id: i64, level: LogLevel, text: impl Into<String>) {
+        self.log_line(Some(job_id), level, text.into());
+    }
+
+    fn log_line(&self, job_id: Option<i64>, level: LogLevel, text: String) {
+        let ts = now_secs();
+        if let Some(id) = job_id {
+            // A removed job has no log any more; that is fine.
+            let _ = self.store.append_job_log(id, ts, level.as_str(), &text);
+        }
+        self.write_log_file(ts, level, job_id, &text);
         match level {
             LogLevel::Info => tracing::info!(target: "newskite_service", "{text}"),
             LogLevel::Warn => tracing::warn!(target: "newskite_service", "{text}"),
@@ -382,13 +417,31 @@ impl Inner {
         }
         {
             let mut logs = lock(&self.logs);
-            logs.push_front(LogLine { ts: now_secs(), level, text: text.clone() });
+            logs.push_front(LogLine { ts, level, text: text.clone(), job_id });
             logs.truncate(LOG_CAPACITY);
         }
         if level == LogLevel::Error {
             self.emit(ServiceEvent::Error(text.clone()));
         }
         self.emit(ServiceEvent::JobLog(text));
+    }
+
+    /// Appends to `<data_dir>/newskite.log`, rotating it past [`LOG_FILE_MAX`]. Failures
+    /// are ignored (the file is a convenience, the in-app log is the record).
+    fn write_log_file(&self, ts: i64, level: LogLevel, job_id: Option<i64>, text: &str) {
+        use std::io::Write;
+        let mut guard = lock(&self.log_file);
+        let path = self.opts.data_dir.join(LOG_FILE_NAME);
+        if guard.is_none() {
+            *guard = std::fs::OpenOptions::new().create(true).append(true).open(&path).ok();
+        }
+        let Some(f) = guard.as_mut() else { return };
+        let job = job_id.map(|j| format!(" job={j}")).unwrap_or_default();
+        let _ = writeln!(f, "{} {:5}{job} {text}", format::timestamp_utc(ts), level.as_str());
+        if f.metadata().map(|m| m.len() > LOG_FILE_MAX).unwrap_or(false) {
+            *guard = None;
+            let _ = std::fs::rename(&path, self.opts.data_dir.join(format!("{LOG_FILE_NAME}.1")));
+        }
     }
 
     /// Effective settings for runs, imports and timers: the runtime override when one is
@@ -567,6 +620,7 @@ impl Service {
             events,
             state: Mutex::new(RunState::default()),
             logs: Mutex::new(VecDeque::with_capacity(LOG_CAPACITY)),
+            log_file: Mutex::new(None),
             progress: Arc::new(Progress::new()),
             pool: Arc::new(ConnectionPool::new()),
             shutdown: CancellationToken::new(),
@@ -1004,11 +1058,12 @@ impl Service {
                 return Err(ServiceError::Duplicate(other.name));
             }
             self.inner.store.set_job_state(id, JobState::Queued, None).map_err(|e| store_err(id, e))?;
+            let _ = self.inner.store.clear_job_outcome(id);
             Ok(job)
         })();
         match result {
             Ok(job) => {
-                self.inner.log(LogLevel::Info, format!("requeued {}", job.name));
+                self.inner.log_job(job.id, LogLevel::Info, format!("requeued {}", job.name));
                 self.inner.emit(ServiceEvent::JobsChanged);
                 Ok(())
             }
@@ -1164,6 +1219,22 @@ impl Service {
             self.inner.log(LogLevel::Error, format!("could not read throughput history: {e}"));
             Vec::new()
         })
+    }
+
+    /// A job's own log (kept across restarts, newest [`newskite_store::JOB_LOG_KEEP`]
+    /// lines), oldest first.
+    pub fn job_log(&self, job_id: i64) -> Vec<newskite_store::JobLogLine> {
+        self.inner.store.job_log(job_id).unwrap_or_default()
+    }
+
+    /// Health of every news server used since the service started.
+    pub fn server_health(&self) -> Vec<newskite_types::ServerHealth> {
+        self.inner.progress.server_health()
+    }
+
+    /// Path of the log file in the data directory.
+    pub fn log_file_path(&self) -> PathBuf {
+        self.inner.opts.data_dir.join(LOG_FILE_NAME)
     }
 
     /// The newest [`LOG_CAPACITY`] log lines, newest first.
