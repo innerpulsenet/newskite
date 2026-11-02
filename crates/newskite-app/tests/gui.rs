@@ -1354,6 +1354,36 @@ fn open_nzb_field_accepts_a_pasted_file_uri() {
 }
 
 #[test]
+fn a_later_launch_queues_its_nzbs_here() {
+    use newskite_app::launch::LaunchItem;
+    let fx = Fixture::new(|_, _| {});
+    let mut h = fx.harness(true, SIZE);
+    h.run_steps(2);
+    h.state_mut().as_mut().expect("app").push_action(Action::SetTab(Tab::History));
+    h.run_steps(2);
+    let good = write_nzb(fx.dir.path(), "handed.nzb", VALID_NZB);
+    let tx = app(&h).sender();
+    tx.send(UiMsg::Launched(vec![
+        LaunchItem::Nzb(good),
+        LaunchItem::Unsupported { arg: "nzblnk:?t=x".into(), reason: "not configured".into() },
+    ]))
+    .expect("send");
+    run_until(&mut h, |h| app(h).data.jobs.len() == 1);
+    let a = app(&h);
+    assert_eq!(a.view.tab, Tab::Queue, "the new job shows in the queue");
+    assert_eq!(a.view.queue.selected, Some(a.data.jobs[0].id));
+    // What could not be queued is logged, as with drops.
+    assert!(a.data.logs.iter().any(|l| l.text == "cannot open nzblnk:?t=x: not configured"));
+    assert!(a.view.open_nzb.error.is_none());
+
+    // When nothing else came, it is said under the header too.
+    tx.send(UiMsg::Launched(vec![LaunchItem::Unsupported { arg: "https://x/y".into(), reason: "web links".into() }]))
+        .expect("send");
+    h.run_steps(2);
+    assert_eq!(app(&h).view.open_nzb.error.as_deref(), Some("cannot open https://x/y: web links"));
+}
+
+#[test]
 fn toasts_and_server_health_render() {
     let fx = Fixture::new(seed_populated);
     let mut h = fx.harness(true, SIZE);

@@ -105,6 +105,9 @@ pub enum UiMsg {
     DialogFailed(String),
     /// The NZB picker could not be shown (why); the typed-path field opens instead.
     NzbPickerFailed(String),
+    /// What a later `newskite` launch handed over (`handoff`): its NZBs are imported and
+    /// the window comes forward (an empty list only raises it).
+    Launched(Vec<crate::launch::LaunchItem>),
     /// Result of a server "Test".
     TestResult {
         /// Row the test belongs to.
@@ -723,6 +726,28 @@ impl NewskiteApp {
                     self.view.open_nzb.visible = true;
                     self.view.open_nzb.focus = true;
                     self.view.open_nzb.error = Some(format!("{why}. Type or paste the NZB's path instead."));
+                }
+                UiMsg::Launched(items) => {
+                    // As with drops: what could not be opened is logged, and said under the
+                    // header too when nothing else was handed over.
+                    let any_nzb = items.iter().any(|i| matches!(i, crate::launch::LaunchItem::Nzb(_)));
+                    for item in items {
+                        match item {
+                            crate::launch::LaunchItem::Nzb(p) => self.actions.push(Action::AddNzb(p)),
+                            crate::launch::LaunchItem::Unsupported { arg, reason } => {
+                                let why = format!("cannot open {arg}: {reason}");
+                                self.service.log(LogLevel::Warn, why.clone());
+                                if !any_nzb {
+                                    self.view.open_nzb.visible = true;
+                                    self.view.open_nzb.error = Some(why);
+                                }
+                                reload_logs = true;
+                            }
+                        }
+                    }
+                    // The user just asked for this window.
+                    self.ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    self.ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
                 UiMsg::TestResult { row_id, result } => {
                     if let Some(d) = self.view.settings.as_mut() {
