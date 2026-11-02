@@ -1,12 +1,10 @@
-//! Bottom docks: Throughput, Details and Log.
+//! The throughput graph and the message log.
 //!
-//! Each dock is a card under a mono eyebrow. **Throughput** is a narrow card that keeps the
-//! live trace and the 24 h history on separate bands so two time axes never share one plot,
-//! under the speed and what is left to download. **Details** shows only while a job is
-//! selected and the inspector column has no room: the job's facts and per-file progress.
-//! **Log** takes the rest of the width: fixed level and time columns so long lines wrap
-//! under their own text, a level filter, and long message-id lists folded into a summary
-//! that opens in place. The server readings live in the server strip above the status bar.
+//! The **throughput graph** opens from the status bar's sparkline: the speed and what is
+//! left, the live trace of the last minutes and, under it, the 24 h history on a band of
+//! its own, so two time axes never share one plot. The **log** is the Log view: fixed
+//! level and time columns so long lines wrap under their own text, a level filter, and
+//! long message-id lists folded into a summary that opens in place.
 //!
 //! A new log line is marked by a tint and an accent bar painted *behind* its text, so the
 //! text keeps full contrast from the first frame; the tint eases out over a few seconds, or
@@ -24,20 +22,11 @@ use super::app::{Action, Data, HISTORY_SECS, LIVE_WINDOW_SECS};
 use super::fonts;
 use super::queue::eta_secs;
 use super::theme::Palette;
-use super::articles;
 use super::motion;
-use super::widgets::{
-    card, icon_button, paint_icon, section_title, segment_track, segmented, spaced, state_badge,
-    Icon,
-};
+use super::widgets::{paint_icon, segmented, Icon};
 
-/// Width at which the three docks sit side by side (below: one scrolling column).
-pub const THREE_COLUMN_MIN: f32 = 900.0;
 /// Cells of the stored history strip (24 h / 48 = 30 min each).
 const HISTORY_POINTS: usize = 48;
-/// Vertical room a dock card takes beyond its content height: the 12 px inner margin on
-/// both sides and the hairline.
-const CARD_CHROME: f32 = 26.0;
 /// Period of the live marker's pulse and the slot shimmer, seconds (the mark's busy beat).
 const PULSE_PERIOD: f64 = 1.2;
 /// Frame interval while something in the docks moves.
@@ -54,35 +43,6 @@ const LEVEL_COL_W: f32 = 14.0;
 const TIME_COL_W: f32 = 58.0;
 /// Seconds a new message stays marked.
 const MESSAGE_NEW_SECS: f64 = 6.0;
-/// Width of the Articles card in the row, as a share of the window and its bounds.
-const ARTICLES_SHARE: f32 = 0.28;
-const ARTICLES_MIN_W: f32 = 260.0;
-const ARTICLES_MAX_W: f32 = 420.0;
-/// Width of the Details card in the row (only while a job is selected), share and bounds.
-const DETAILS_SHARE: f32 = 0.3;
-const DETAILS_MIN_W: f32 = 300.0;
-const DETAILS_MAX_W: f32 = 440.0;
-/// Gap between dock cards.
-const DOCK_GAP: f32 = 8.0;
-
-/// Dock arrangement for a given window width.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DockLayout {
-    /// Three side by side.
-    Row,
-    /// One column (scrolls).
-    Stack,
-}
-
-/// Picks the arrangement for `width` (logical pixels).
-pub fn layout_for(width: f32) -> DockLayout {
-    if width >= THREE_COLUMN_MIN {
-        DockLayout::Row
-    } else {
-        DockLayout::Stack
-    }
-}
-
 /// Which log lines the Log dock shows.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum LogFilter {
@@ -232,36 +192,6 @@ pub fn time_points(
     pts
 }
 
-#[derive(Clone, Copy)]
-enum Dock {
-    Articles,
-    Details,
-    Log,
-}
-
-impl Dock {
-    /// The docks to show, left to right (top to bottom in the stack, where the log leads).
-    fn shown(details: bool, stack: bool) -> Vec<Dock> {
-        match (details, stack) {
-            (true, false) => vec![Dock::Articles, Dock::Details, Dock::Log],
-            (false, false) => vec![Dock::Articles, Dock::Log],
-            (true, true) => vec![Dock::Log, Dock::Details, Dock::Articles],
-            (false, true) => vec![Dock::Log, Dock::Articles],
-        }
-    }
-}
-
-/// Widths of the row's cards for a row `width` px wide: Articles, Details (0 when not
-/// shown) and Log, which takes what is left. Gaps between cards are subtracted first.
-pub fn row_widths(width: f32, details: bool) -> (f32, f32, f32) {
-    let width = if width.is_finite() { width.max(0.0) } else { 0.0 };
-    let gaps = DOCK_GAP * if details { 2.0 } else { 1.0 };
-    let t = (width * ARTICLES_SHARE).clamp(ARTICLES_MIN_W, ARTICLES_MAX_W);
-    let d = if details { (width * DETAILS_SHARE).clamp(DETAILS_MIN_W, DETAILS_MAX_W) } else { 0.0 };
-    let log = (width - gaps - t - d).max(0.0);
-    (t, d, log)
-}
-
 /// What moves this frame: the clock phase of the busy beat (0…1) and whether anything
 /// animates at all (bytes are moving and motion is not reduced).
 #[derive(Clone, Copy)]
@@ -333,127 +263,7 @@ pub fn slot_shimmer(i: usize, n: usize, phase: f32) -> f32 {
     0.72 + 0.28 * (0.5 + 0.5 * wave)
 }
 
-/// Everything a dock needs to draw.
-struct Ctx<'a> {
-    pal: &'a Palette,
-    data: &'a Data,
-    selected: Option<&'a Job>,
-    motion: Motion,
-}
-
-fn dock(
-    ui: &mut Ui,
-    c: &Ctx<'_>,
-    which: Dock,
-    height: f32,
-    state: &mut DockState,
-    actions: &mut Vec<Action>,
-) {
-    let pal = c.pal;
-    card(pal).show(ui, |ui| {
-        // An exact height: every card of a row lines up, and content that does not fit
-        // scrolls inside its card instead of pushing the next row down.
-        ui.set_min_height(height);
-        ui.set_max_height(height.max(60.0));
-        ui.set_width(ui.available_width());
-        ui.horizontal(|ui| {
-            ui.set_min_height(18.0);
-            let title = match which {
-                Dock::Articles => "Articles",
-                Dock::Details => "Details",
-                Dock::Log => "Log",
-            };
-            section_title(ui, pal, title);
-            ui.with_layout(
-                egui::Layout::right_to_left(egui::Align::Center),
-                |ui| match which {
-                    Dock::Log => log_filter_chips(ui, pal, &mut state.log_filter),
-                    Dock::Details if c.selected.is_some() => {
-                        if icon_button(ui, pal, Icon::Close, pal.muted, "Clear the selection (Esc)")
-                            .clicked()
-                        {
-                            actions.push(Action::Select(None));
-                        }
-                    }
-                    _ => {}
-                },
-            );
-        });
-        ui.add_space(6.0);
-        match which {
-            Dock::Articles => articles_dock(ui, pal, c.data, c.motion.animate),
-            Dock::Log => messages(ui, pal, c.data, state.log_filter, c.motion.animate, actions),
-            Dock::Details => {
-                if let Some(job) = c.selected {
-                    egui::ScrollArea::vertical()
-                        .id_salt("dock-details")
-                        .auto_shrink([false, false])
-                        .max_height(ui.available_height().max(20.0))
-                        .show(ui, |ui| details(ui, pal, c.data, job, actions));
-                }
-            }
-        }
-    });
-}
-
-/// Draws the docks in the arrangement that fits the available width.
-pub fn show(
-    ui: &mut Ui,
-    pal: &Palette,
-    data: &Data,
-    selected: Option<i64>,
-    state: &mut DockState,
-    reduced_motion: bool,
-    actions: &mut Vec<Action>,
-) {
-    let motion = Motion::new(ui, data, reduced_motion);
-    if motion.moving {
-        ui.ctx().request_repaint_after(MOTION_FRAME);
-    }
-    let c = Ctx {
-        pal,
-        data,
-        selected: selected.and_then(|id| data.jobs.iter().find(|j| j.id == id)),
-        motion,
-    };
-    let width = ui.ctx().content_rect().width();
-    let with_details = c.selected.is_some();
-    match layout_for(width) {
-        DockLayout::Row => {
-            let h = (ui.available_height() - CARD_CHROME).max(80.0);
-            let (tw, dw, lw) = row_widths(ui.available_width(), with_details);
-            ui.horizontal_top(|ui| {
-                ui.spacing_mut().item_spacing.x = DOCK_GAP;
-                for which in Dock::shown(with_details, false) {
-                    let w = match which {
-                        Dock::Articles => tw,
-                        Dock::Details => dw,
-                        Dock::Log => lw,
-                    };
-                    // Top-down inside each card (the row itself is horizontal); the card's
-                    // frame adds its margins and hairline outside the content.
-                    let layout = egui::Layout::top_down(egui::Align::Min);
-                    ui.allocate_ui_with_layout(Vec2::new(w, h + CARD_CHROME), layout, |ui| {
-                        ui.set_width(w);
-                        dock(ui, &c, which, h, state, actions);
-                    });
-                }
-            });
-        }
-        DockLayout::Stack => {
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    for which in Dock::shown(with_details, true) {
-                        let h = if matches!(which, Dock::Log) { 220.0 } else { 150.0 };
-                        dock(ui, &c, which, h, state, actions);
-                    }
-                });
-        }
-    }
-}
-
-fn log_filter_chips(ui: &mut Ui, pal: &Palette, filter: &mut LogFilter) {
+pub(crate) fn log_filter_chips(ui: &mut Ui, pal: &Palette, filter: &mut LogFilter) {
     let options: Vec<(LogFilter, &str)> = LogFilter::ALL.iter().map(|f| (*f, f.label())).collect();
     if let Some(f) = segmented(ui, pal, Id::new("log-filter"), &options, *filter) {
         *filter = f;
@@ -467,24 +277,6 @@ fn sample_age(secs: i64) -> String {
         s if s < 60 => format!("{s} s ago"),
         s => format!("{} min {} s ago", s / 60, s % 60),
     }
-}
-
-/// A small mono eyebrow with a figure at the right end of the same line.
-fn eyebrow_row(ui: &mut Ui, pal: &Palette, label: &str, right: &str, right_color: Color32) {
-    ui.horizontal(|ui| {
-        let job = spaced(&label.to_uppercase(), fonts::mono_id(9.5), pal.faint, 1.0);
-        ui.add(egui::Label::new(job).selectable(false));
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.add(
-                egui::Label::new(
-                    RichText::new(right)
-                        .font(fonts::mono_id(11.0))
-                        .color(right_color),
-                )
-                .selectable(false),
-            );
-        });
-    });
 }
 
 pub fn now_secs() -> i64 {
@@ -510,59 +302,6 @@ fn gradient_fill(points: &[Pos2], bottom: f32, top: Color32, clear: Color32) -> 
         mesh.add_triangle(i, i + 2, i + 3);
     }
     Shape::mesh(mesh)
-}
-
-/// What the Articles dock shows when there is no job to show.
-pub const NO_ARTICLES: &str = "Nothing downloading. Select a job to see its articles.";
-
-/// The Articles dock: the article grid of the job downloading now, else of the selected
-/// job, with its name, counts and the key.
-fn articles_dock(ui: &mut Ui, pal: &Palette, data: &Data, animate: bool) {
-    let Some(job) = data.activity_job.and_then(|id| data.jobs.iter().find(|j| j.id == id)) else {
-        ui.add_space(12.0);
-        ui.vertical_centered(|ui| ui.label(RichText::new(NO_ARTICLES).color(pal.muted)));
-        return;
-    };
-    ui.spacing_mut().item_spacing.y = 5.0;
-    let map = data.article_maps.get(&job.id);
-    // The name, with the counts at the right end of the same line, or under it when the
-    // card is too narrow for both.
-    let counts = map.map(|m| articles::summary(&m.counts())).unwrap_or_default();
-    let fig_w = ui.painter().layout_no_wrap(counts.clone(), fonts::mono_id(11.0), pal.muted).size().x;
-    let name = |ui: &mut Ui| {
-        ui.add(egui::Label::new(RichText::new(&job.name).font(fonts::semibold_id(12.5)).color(pal.text)).truncate());
-    };
-    let name_w = ui.available_width() - fig_w - 12.0;
-    if name_w >= 120.0 {
-        ui.horizontal(|ui| {
-            ui.allocate_ui_with_layout(Vec2::new(name_w, 18.0), egui::Layout::left_to_right(egui::Align::Center), name);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(RichText::new(&counts).font(fonts::mono_id(11.0)).color(pal.muted));
-            });
-        });
-    } else {
-        name(ui);
-        if !counts.is_empty() {
-            ui.add(egui::Label::new(RichText::new(&counts).font(fonts::mono_id(11.0)).color(pal.muted)).truncate());
-        }
-    }
-    let Some(map) = map else {
-        ui.label(
-            RichText::new("No article map yet: it is recorded while this job downloads.")
-                .small()
-                .color(pal.muted),
-        );
-        return;
-    };
-    // The grid takes the rows it needs, at most what the card has left above the key.
-    let w = ui.available_width();
-    let room = Vec2::new(w, (ui.available_height() - 40.0).max(12.0));
-    let per = articles::per_cell(map, room);
-    let legend_h = articles::legend_height(ui, pal, per, w);
-    let max_h = (ui.available_height() - legend_h - 6.0).max(12.0);
-    let size = Vec2::new(w, articles::fit_height(map.len(), w, max_h));
-    articles::grid(ui, pal, Id::new(("articles-dock", job.id)), map, size, !animate);
-    articles::legend(ui, pal, articles::per_cell(map, size));
 }
 
 /// The throughput readout and graph: speed and what is left, the live plot of the last
@@ -919,7 +658,7 @@ pub fn new_mark(age: f64, animate: bool) -> f32 {
 /// wraps under itself, never under the clock). Long message-id lists fold behind a
 /// disclosure; the newest failure of a job that can be retried on a backup carries that
 /// button. A line that arrived after the dock's first frame is marked behind its text.
-fn messages(ui: &mut Ui, pal: &Palette, data: &Data, filter: LogFilter, animate: bool, actions: &mut Vec<Action>) {
+pub(crate) fn messages(ui: &mut Ui, pal: &Palette, data: &Data, filter: LogFilter, animate: bool, actions: &mut Vec<Action>) {
     let logs = &data.logs;
     if logs.is_empty() {
         ui.label(RichText::new("No messages yet").color(pal.muted));
@@ -1123,170 +862,6 @@ fn message_text(
     }
 }
 
-/// The selected job: its facts and per-file progress.
-fn details(ui: &mut Ui, pal: &Palette, data: &Data, job: &Job, actions: &mut Vec<Action>) {
-    // Nothing in here may widen the card (long paths and names truncate instead).
-    ui.set_max_width(ui.available_width());
-    ui.horizontal(|ui| {
-        state_badge(ui, pal, job.state);
-        ui.add(egui::Label::new(RichText::new(&job.name).strong().color(pal.text)).truncate())
-            .on_hover_text(&job.name);
-    });
-    ui.add_space(6.0);
-    let done = data.shown_done(job);
-    // Key/value rows; each value truncates to the card (full text on hover).
-    let fact = |ui: &mut Ui, key: &str, value: RichText, tip: Option<String>| {
-        ui.horizontal(|ui| {
-            let (r, _) = ui.allocate_exact_size(Vec2::new(64.0, 16.0), Sense::hover());
-            ui.painter().text(
-                r.left_center(),
-                egui::Align2::LEFT_CENTER,
-                key,
-                FontId::proportional(11.5),
-                pal.muted,
-            );
-            let resp = ui.add(egui::Label::new(value).truncate().sense(Sense::click()));
-            match tip {
-                Some(t) => resp.on_hover_text(t),
-                None => resp,
-            }
-        })
-        .inner
-    };
-    fact(
-        ui,
-        "Progress",
-        RichText::new(format!(
-            "{} of {} ({}%)",
-            format::bytes(done),
-            format::bytes(job.bytes_total),
-            format::percent(done, job.bytes_total)
-        ))
-        .font(fonts::mono_id(11.5))
-        .color(pal.text),
-        None,
-    );
-    if job.state == JobState::Downloading {
-        if let Some(eta) = eta_secs(job.bytes_total.saturating_sub(done), data.speed()) {
-            fact(
-                ui,
-                "Time left",
-                RichText::new(format!(
-                    "{} at {}",
-                    format::duration_secs(eta),
-                    format::speed(data.speed())
-                ))
-                .font(fonts::mono_id(11.5))
-                .color(pal.accent_fg),
-                None,
-            );
-        }
-    }
-    let folder = job.dest_dir.display().to_string();
-    let open = fact(
-        ui,
-        "Folder",
-        RichText::new(&folder).small().color(pal.accent_fg),
-        Some(format!("{folder}\nClick to open in the file manager")),
-    );
-    if open
-        .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .clicked()
-    {
-        actions.push(Action::OpenJobFolder(job.id));
-    }
-    let nzb = job
-        .source_path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    fact(
-        ui,
-        "NZB",
-        RichText::new(nzb).small().color(pal.text),
-        Some(job.source_path.display().to_string()),
-    );
-    if job.password.is_some() {
-        fact(
-            ui,
-            "Password",
-            RichText::new("set").small().color(pal.text),
-            None,
-        );
-    }
-    if let (JobState::Failed, Some(e)) = (job.state, &job.error) {
-        ui.add_space(4.0);
-        ui.add(egui::Label::new(RichText::new(e).small().color(pal.negative)).wrap());
-    }
-    ui.add_space(8.0);
-    let files = &data.selected_files;
-    let finished = files.iter().filter(|f| f.state == "done").count();
-    eyebrow_row(
-        ui,
-        pal,
-        "Files",
-        &if files.is_empty() {
-            String::new()
-        } else {
-            format!("{finished} of {} done", files.len())
-        },
-        pal.muted,
-    );
-    ui.add_space(4.0);
-    if files.is_empty() {
-        let text = match job.state {
-            JobState::Queued | JobState::Paused => {
-                "Per-file progress appears once the download starts."
-            }
-            _ => "No per-file progress was recorded.",
-        };
-        ui.label(RichText::new(text).small().color(pal.muted));
-        return;
-    }
-    for f in files {
-        let color = match f.state.as_str() {
-            "done" => pal.positive,
-            "failed" => pal.negative,
-            _ => pal.accent,
-        };
-        ui.horizontal(|ui| {
-            let right = format!(
-                "{} / {}",
-                format::bytes(f.bytes_done),
-                format::bytes(f.bytes_total)
-            );
-            let name_w = (ui.available_width() - 128.0).max(40.0);
-            ui.scope(|ui| {
-                ui.set_width(name_w);
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(&f.name)
-                            .font(fonts::mono_id(11.0))
-                            .color(pal.text),
-                    )
-                    .truncate(),
-                )
-                .on_hover_text(format!("{} · {}", f.name, f.state));
-            });
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(
-                    RichText::new(right)
-                        .font(fonts::mono_id(10.5))
-                        .color(pal.muted),
-                );
-            });
-        });
-        segment_track(
-            ui,
-            pal,
-            format::fraction(f.bytes_done, f.bytes_total),
-            color,
-            ui.available_width(),
-        );
-        ui.add_space(5.0);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1413,14 +988,6 @@ mod tests {
     }
 
     #[test]
-    fn dock_layout_breakpoints() {
-        assert_eq!(layout_for(1280.0), DockLayout::Row);
-        assert_eq!(layout_for(960.0), DockLayout::Row);
-        assert_eq!(layout_for(900.0), DockLayout::Row);
-        assert_eq!(layout_for(899.0), DockLayout::Stack);
-    }
-
-    #[test]
     fn history_cells_scale_to_the_busiest() {
         assert_eq!(heat_alpha(0.0, 10.0), None, "idle stays a well");
         assert_eq!(heat_alpha(5.0, 0.0), None);
@@ -1458,18 +1025,6 @@ mod tests {
         // Reduced motion: still at full strength until it goes.
         assert_eq!(new_mark(5.9, false), 1.0);
         assert_eq!(new_mark(6.1, false), 0.0);
-    }
-
-    #[test]
-    fn the_log_takes_the_rest_of_the_row() {
-        let (t, d, l) = row_widths(1600.0, false);
-        assert_eq!(d, 0.0);
-        assert!(l > 2.0 * t, "{t} {l}");
-        assert_eq!(t + l + DOCK_GAP, 1600.0);
-        let (t, d, l) = row_widths(944.0, true);
-        assert!(t >= ARTICLES_MIN_W && d >= DETAILS_MIN_W && l > 0.0);
-        assert_eq!(t + d + l + 2.0 * DOCK_GAP, 944.0);
-        assert_eq!(row_widths(f32::NAN, true).2, 0.0);
     }
 
     #[test]
