@@ -150,8 +150,11 @@ pub fn tool_button(
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
-/// A small square icon button (sidebar `+`, row `×`, etc.). `color` is the resting
-/// tint; hover brightens it to the text color.
+/// Side of an icon button: at least the 24 px minimum target, with a 16 px glyph.
+pub const ICON_BUTTON: f32 = 26.0;
+
+/// A small square icon button (row `×`, dock close, etc.). `color` is the resting tint;
+/// hover brightens it to the text color.
 pub fn icon_button(
     ui: &mut Ui,
     pal: &Palette,
@@ -159,7 +162,28 @@ pub fn icon_button(
     color: Color32,
     tooltip: &str,
 ) -> Response {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(22.0), Sense::click());
+    icon_button_enabled(ui, pal, icon, color, tooltip, true)
+}
+
+/// [`icon_button`] that can be disabled: then it is faded, has no hover wash or hand
+/// cursor, ignores clicks and its tooltip says why.
+pub fn icon_button_enabled(
+    ui: &mut Ui,
+    pal: &Palette,
+    icon: Icon,
+    color: Color32,
+    tooltip: &str,
+    enabled: bool,
+) -> Response {
+    if !enabled {
+        let (rect, resp) = ui.allocate_exact_size(Vec2::splat(ICON_BUTTON), Sense::hover());
+        if ui.is_rect_visible(rect) {
+            paint_icon(ui.painter(), rect.shrink(5.0), icon, Palette::fade(color, 0.4));
+        }
+        resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, false, tooltip));
+        return resp.on_hover_text(tooltip);
+    }
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(ICON_BUTTON), Sense::click());
     if ui.is_rect_visible(rect) {
         let hover = ui.ctx().animate_bool(resp.id.with("hover"), resp.hovered());
         if resp.is_pointer_button_down_on() {
@@ -173,10 +197,10 @@ pub fn icon_button(
             focus_ring(ui, pal, rect, 6);
         }
         let fg = color.lerp_to_gamma(pal.text, hover);
-        paint_icon(ui.painter(), rect.shrink(3.0), icon, fg);
+        paint_icon(ui.painter(), rect.shrink(5.0), icon, fg);
     }
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, tooltip));
-    resp.on_hover_text(tooltip)
+    resp.on_hover_text(tooltip).on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 /// Kinds of kit button.
@@ -188,6 +212,8 @@ pub enum ButtonKind {
     Outline,
     /// Bare: dismiss, back, less.
     Text,
+    /// The outline in the error color: the "yes" of a destructive confirmation.
+    Danger,
 }
 
 /// The kit's button: uppercase Instrument Sans 600 at 12 px with 0.06em tracking, an
@@ -202,18 +228,41 @@ pub fn kit_button(
     text: &str,
     enabled: bool,
 ) -> Response {
+    kit_button_sized(ui, pal, kind, icon, text, enabled, false)
+}
+
+/// [`kit_button`] at 24 px with 11 px type, for inline confirmations and field-side
+/// actions inside table rows and forms.
+pub fn compact_button(ui: &mut Ui, pal: &Palette, kind: ButtonKind, text: &str, enabled: bool) -> Response {
+    kit_button_sized(ui, pal, kind, None, text, enabled, true)
+}
+
+fn kit_button_sized(
+    ui: &mut Ui,
+    pal: &Palette,
+    kind: ButtonKind,
+    icon: Option<Icon>,
+    text: &str,
+    enabled: bool,
+    compact: bool,
+) -> Response {
     let kind = if kind == ButtonKind::Primary && !enabled {
         ButtonKind::Outline
     } else {
         kind
     };
-    let font = fonts::semibold_id(12.0);
+    let font = fonts::semibold_id(if compact { 11.0 } else { 12.0 });
     let probe = ui
         .painter()
         .layout_job(spaced(&text.to_uppercase(), font.clone(), pal.text, 0.72));
     let icon_w = if icon.is_some() { 16.0 + 7.0 } else { 0.0 };
-    let pad = if kind == ButtonKind::Text { 6.0 } else { 14.0 };
-    let size = Vec2::new(probe.size().x + icon_w + 2.0 * pad, 30.0);
+    let pad = match (kind, compact) {
+        (ButtonKind::Text, true) => 5.0,
+        (ButtonKind::Text, false) => 6.0,
+        (_, true) => 9.0,
+        (_, false) => 14.0,
+    };
+    let size = Vec2::new(probe.size().x + icon_w + 2.0 * pad, if compact { 24.0 } else { 30.0 });
     let sense = if enabled {
         Sense::click()
     } else {
@@ -232,6 +281,17 @@ pub fn kit_button(
                     pal.action
                 };
                 (f, Stroke::new(1.0, f), pal.action_text)
+            }
+            ButtonKind::Danger => {
+                let fill = if pressed {
+                    pal.negative_soft
+                } else if hovered {
+                    Palette::fade(pal.negative, 0.12)
+                } else {
+                    pal.transparent
+                };
+                let fg = if enabled { pal.negative } else { Palette::fade(pal.negative, 0.45) };
+                (fill, Stroke::new(1.0, Palette::fade(pal.negative, if hovered { 0.9 } else { 0.6 })), fg)
             }
             ButtonKind::Outline => {
                 let fill = if pressed { pal.sunken } else { pal.transparent };
@@ -335,7 +395,7 @@ impl Status {
             Status::Ok => pal.positive,
             Status::Warn => pal.warning,
             Status::Err => pal.negative,
-            Status::Idle => pal.faint,
+            Status::Idle => pal.muted,
             Status::Live => pal.accent_fg,
         }
     }

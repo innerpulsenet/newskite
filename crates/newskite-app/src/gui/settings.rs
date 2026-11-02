@@ -12,8 +12,8 @@ use super::appearance::Appearance;
 use super::fonts;
 use super::theme::Palette;
 use super::widgets::{
-    card, dialog_frame, error_line, icon_button, kit_button, notice, section_title, toggle,
-    ButtonKind, Icon, Status,
+    card, compact_button, dialog_frame, error_line, icon_button, kit_button, notice,
+    section_title, toggle, ButtonKind, Icon, Status,
 };
 use crate::launch::expand_tilde;
 
@@ -512,8 +512,7 @@ fn connection_section(
                 };
                 ui.label(RichText::new(title).strong().color(pal.text));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui
-                        .button("Remove")
+                    if compact_button(ui, pal, ButtonKind::Outline, "Remove", true)
                         .on_hover_text("Remove this server")
                         .clicked()
                     {
@@ -521,11 +520,7 @@ fn connection_section(
                     }
                     let running = draft.tests.get(&row_id) == Some(&TestState::Running);
                     let can_test = !srv.host.trim().is_empty() && !running;
-                    if ui
-                        .add_enabled(
-                            can_test,
-                            egui::Button::new(if running { "Testing…" } else { "Test" }),
-                        )
+                    if compact_button(ui, pal, ButtonKind::Outline, if running { "Testing…" } else { "Test" }, can_test)
                         .on_hover_text("Connect, authenticate and send DATE; shows the raw replies")
                         .clicked()
                     {
@@ -615,7 +610,7 @@ fn connection_section(
             draft.remove_server(i);
         }
         ui.add_space(4.0);
-        if ui.button("Add server").clicked() {
+        if kit_button(ui, pal, ButtonKind::Outline, Some(Icon::Plus), "Add server", true).clicked() {
             draft.add_server();
         }
         ui.label(
@@ -630,13 +625,16 @@ fn connection_section(
 
 fn folder_row(
     ui: &mut Ui,
-    label: &str,
+    pal: &Palette,
     text: &mut String,
-    hint: &str,
     target: FolderTarget,
     dialog_open: bool,
     actions: &mut Vec<Action>,
 ) {
+    let (label, hint) = match target {
+        FolderTarget::Download => ("Download folder", "~/Downloads/Newskite"),
+        FolderTarget::Watch => ("Watch folder", "(none)"),
+    };
     ui.label(label);
     ui.horizontal(|ui| {
         ui.add(
@@ -644,10 +642,7 @@ fn folder_row(
                 .hint_text(hint)
                 .desired_width(ui.available_width() - 90.0),
         );
-        if ui
-            .add_enabled(!dialog_open, egui::Button::new("Browse…"))
-            .clicked()
-        {
+        if compact_button(ui, pal, ButtonKind::Outline, "Browse…", !dialog_open).clicked() {
             actions.push(Action::BrowseFolder(target));
         }
     });
@@ -668,18 +663,16 @@ fn downloads_section(
             .show(ui, |ui| {
                 folder_row(
                     ui,
-                    "Download folder",
+                    pal,
                     &mut draft.download_dir,
-                    "~/Downloads/Newskite",
                     FolderTarget::Download,
                     dialog_open,
                     actions,
                 );
                 folder_row(
                     ui,
-                    "Watch folder",
+                    pal,
                     &mut draft.watch_folder,
-                    "(none)",
                     FolderTarget::Watch,
                     dialog_open,
                     actions,

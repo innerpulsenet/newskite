@@ -1608,7 +1608,14 @@ fn shutdown_banner(ui: &mut egui::Ui, pal: &Palette, secs: u32, actions: &mut Ve
                 };
                 ui.label(egui::RichText::new(text).color(pal.text).strong());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Cancel shutdown").clicked() {
+                    let cancel = super::widgets::compact_button(
+                        ui,
+                        pal,
+                        super::widgets::ButtonKind::Outline,
+                        "Cancel shutdown",
+                        true,
+                    );
+                    if cancel.clicked() {
                         actions.push(Action::CancelShutdown);
                     }
                 });

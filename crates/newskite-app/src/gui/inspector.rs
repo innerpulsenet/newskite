@@ -654,25 +654,28 @@ fn files(ui: &mut Ui, pal: &Palette, data: &Data) {
             "downloading" => (pal.accent, "downloading"),
             other => (pal.muted, other),
         };
-        ui.horizontal(|ui| {
-            ui.add(
-                egui::Label::new(RichText::new(&f.name).font(fonts::mono_id(11.0)).color(pal.text))
-                    .truncate(),
-            )
-            .on_hover_text(format!("{} · {status}", f.name));
-        });
-        ui.horizontal(|ui| {
-            let w = (ui.available_width() - 120.0).max(60.0);
-            segment_track(ui, pal, format::fraction(f.bytes_done, f.bytes_total), color, w);
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.label(
-                    RichText::new(format!("{} / {}", format::bytes(f.bytes_done), format::bytes(f.bytes_total)))
-                        .font(fonts::mono_id(10.5))
-                        .color(pal.muted),
-                );
+        // One file: its name with the figures on the same line, its track right under.
+        ui.scope(|ui| {
+            ui.spacing_mut().interact_size.y = 16.0;
+            ui.spacing_mut().item_spacing.y = 5.0;
+            let figures = format!("{} / {}", format::bytes(f.bytes_done), format::bytes(f.bytes_total));
+            ui.horizontal(|ui| {
+                let fig = ui.painter().layout_no_wrap(figures.clone(), fonts::mono_id(10.5), pal.muted);
+                let name_w = (ui.available_width() - fig.size().x - 12.0).max(40.0);
+                ui.allocate_ui_with_layout(Vec2::new(name_w, 16.0), Layout::left_to_right(Align::Center), |ui| {
+                    ui.add(
+                        egui::Label::new(RichText::new(&f.name).font(fonts::mono_id(11.0)).color(pal.text))
+                            .truncate(),
+                    )
+                    .on_hover_text(format!("{} · {status}", f.name));
+                });
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(RichText::new(figures).font(fonts::mono_id(10.5)).color(pal.muted));
+                });
             });
+            segment_track(ui, pal, format::fraction(f.bytes_done, f.bytes_total), color, ui.available_width());
         });
-        ui.add_space(4.0);
+        ui.add_space(12.0);
     }
 }
 
