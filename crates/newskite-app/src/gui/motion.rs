@@ -16,6 +16,14 @@ use eframe::egui::{self, Id};
 /// Frame interval while something moves (40 fps).
 pub const FRAME: Duration = Duration::from_millis(25);
 
+/// Frame interval of slow ambient drifts (about 12 fps): they move a few pixels per
+/// second, so a lower rate looks the same and keeps an idle window cheap.
+pub const AMBIENT_FRAME: Duration = Duration::from_millis(80);
+
+/// Length of the interface's small transitions (hover washes, toggles, the sliding
+/// inspector and segmented controls), in seconds.
+pub const UI_SECS: f32 = 0.16;
+
 /// The product's shared beat: a phase (0…1) over `period` seconds that every live
 /// element follows, so the masthead, the graph marker, the slot row, the live chip and
 /// the queue sweep breathe together. `moving` is false when nothing should move (not
@@ -36,6 +44,16 @@ impl Beat {
     pub fn new(ctx: &egui::Context, active: bool, reduced_motion: bool, period: f64) -> Self {
         let now = ctx.input(|i| i.time);
         Self::at(now, active, reduced_motion, period).tick(ctx)
+    }
+
+    /// [`Beat::new`] for a slow ambient drift, ticking at [`AMBIENT_FRAME`].
+    pub fn ambient(ctx: &egui::Context, reduced_motion: bool, period: f64) -> Self {
+        let now = ctx.input(|i| i.time);
+        let beat = Self::at(now, true, reduced_motion, period);
+        if beat.moving {
+            ctx.request_repaint_after(AMBIENT_FRAME);
+        }
+        beat
     }
 
     /// The beat at a given time (pure; for tests).
@@ -89,6 +107,62 @@ pub fn fade_reset(ctx: &egui::Context, id: Id) {
     ctx.data_mut(|d| {
         d.remove_temp::<bool>(id);
     });
+}
+
+/// Cubic ease-out (fast start, gentle landing) of `t` in 0…1.
+pub fn ease_out(t: f32) -> f32 {
+    let t = if t.is_finite() { t.clamp(0.0, 1.0) } else { 1.0 };
+    1.0 - (1.0 - t).powi(3)
+}
+
+/// One running [`ease_to`]: where it started, where it goes and when it began.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Glide {
+    from: f32,
+    to: f32,
+    start: f64,
+}
+
+impl Glide {
+    fn value(&self, now: f64, secs: f32) -> f32 {
+        let t = if secs > 0.0 { ((now - self.start) / f64::from(secs)) as f32 } else { 1.0 };
+        self.from + (self.to - self.from) * ease_out(t)
+    }
+}
+
+/// `target`, reached by an eased glide over `secs` whenever it changes (the first value
+/// is shown at once). A new target mid-glide starts from where the value is now, so
+/// frequent updates (progress, speed) read as one continuous motion. Under reduced
+/// motion it is always `target`. Non-finite targets pass through untouched.
+pub fn ease_to(ctx: &egui::Context, id: Id, target: f32, secs: f32, reduced_motion: bool) -> f32 {
+    if !target.is_finite() {
+        return target;
+    }
+    let now = ctx.input(|i| i.time);
+    let prev = ctx.data(|d| d.get_temp::<Glide>(id));
+    let glide = match prev {
+        _ if reduced_motion => Glide { from: target, to: target, start: now },
+        None => Glide { from: target, to: target, start: now },
+        Some(g) if (g.to - target).abs() > f32::EPSILON * target.abs().max(1.0) => {
+            Glide { from: g.value(now, secs), to: target, start: now }
+        }
+        Some(g) => g,
+    };
+    if prev != Some(glide) {
+        ctx.data_mut(|d| d.insert_temp(id, glide));
+    }
+    if now - glide.start < f64::from(secs) && glide.from != glide.to {
+        ctx.request_repaint_after(FRAME);
+        glide.value(now, secs)
+    } else {
+        glide.to
+    }
+}
+
+/// 0 → 1 as `on` turns true and back as it turns false, over `secs` (hover and
+/// selection washes). Under reduced motion it jumps.
+pub fn presence(ctx: &egui::Context, id: Id, on: bool, secs: f32, reduced_motion: bool) -> f32 {
+    ctx.animate_bool_with_time(id, on, if reduced_motion { 0.0 } else { secs })
 }
 
 /// Environment variable that overrides the desktop setting.
@@ -176,6 +250,28 @@ mod tests {
             let b = Beat::at(i as f64 * 0.07, true, false, 1.0);
             assert!((0.0..=1.0).contains(&b.breath()));
         }
+    }
+
+    #[test]
+    fn easing_lands_and_glides_continuously() {
+        assert_eq!(ease_out(0.0), 0.0);
+        assert_eq!(ease_out(1.0), 1.0);
+        assert_eq!(ease_out(f32::NAN), 1.0);
+        assert!(ease_out(0.5) > 0.5, "ease-out is ahead of linear");
+        let g = Glide { from: 0.0, to: 10.0, start: 1.0 };
+        assert_eq!(g.value(1.0, 0.5), 0.0);
+        assert_eq!(g.value(1.5, 0.5), 10.0);
+        assert_eq!(g.value(9.0, 0.5), 10.0);
+        let mid = g.value(1.25, 0.5);
+        assert!(mid > 5.0 && mid < 10.0, "{mid}");
+
+        let ctx = egui::Context::default();
+        let id = Id::new("glide-test");
+        let _ = ctx.run(Default::default(), |ctx| {
+            assert_eq!(ease_to(ctx, id, 3.0, 0.3, false), 3.0, "first value shows at once");
+            assert_eq!(ease_to(ctx, id, 7.0, 0.3, true), 7.0, "reduced motion snaps");
+            assert!(ease_to(ctx, id, f32::NAN, 0.3, false).is_nan());
+        });
     }
 
     #[test]

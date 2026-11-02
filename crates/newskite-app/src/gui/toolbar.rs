@@ -131,9 +131,9 @@ pub fn show(
     actions: &mut Vec<Action>,
 ) {
     let labels = ui.ctx().content_rect().width() >= LABEL_MIN_WIDTH;
-    let row_h = if labels { 50.0 } else { 36.0 };
+    let row_h = if labels { 44.0 } else { 36.0 };
     ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 2.0;
+        ui.spacing_mut().item_spacing.x = 4.0;
         if masthead(ui, pal, data, view, row_h).clicked() {
             actions.push(Action::OpenAbout);
         }
@@ -173,8 +173,9 @@ pub fn show(
             }
         }
         let (action, icon, label, tip, enabled) = queue_control(data);
+        // The control that moves the queue leads the row.
         let state = if enabled {
-            ToolState::Normal
+            ToolState::Accent
         } else {
             ToolState::Unavailable
         };

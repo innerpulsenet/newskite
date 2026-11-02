@@ -9,8 +9,12 @@ use newskite_types::{ServerConfig, Settings};
 
 use super::app::Action;
 use super::appearance::Appearance;
+use super::fonts;
 use super::theme::Palette;
-use super::widgets::{card, error_line, kit_button, notice, section_title, ButtonKind, Status};
+use super::widgets::{
+    card, dialog_frame, error_line, icon_button, kit_button, notice, section_title, toggle,
+    ButtonKind, Icon, Status,
+};
 use crate::launch::expand_tilde;
 
 /// Server row ids are unique for the whole process, not per sheet: a server "Test" can
@@ -229,93 +233,256 @@ pub fn show(
     reduced_motion: bool,
     actions: &mut Vec<Action>,
 ) {
-    let max_h = (ctx.content_rect().height() - 210.0).max(220.0);
-    let width = (ctx.content_rect().width() - 80.0).clamp(560.0, 820.0);
-    let t = super::motion::fade_in(ctx, fade_id(), 0.16, reduced_motion);
-    egui::Modal::new(Id::new("settings-modal"))
-        .backdrop_color(Palette::fade(pal.shadow, t))
+    let max_h = (ctx.content_rect().height() - 230.0).max(220.0);
+    let width = (ctx.content_rect().width() - 80.0).clamp(600.0, 900.0);
+    let t = super::motion::fade_in(ctx, fade_id(), 0.2, reduced_motion);
+    let eased = super::motion::ease_out(t);
+    let id = Id::new("settings-modal");
+    egui::Modal::new(id)
+        // The sheet rises a little as it fades in.
+        .area(egui::Modal::default_area(id).anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, (1.0 - eased) * 18.0)))
+        .frame(dialog_frame(pal))
+        .backdrop_color(Palette::fade(pal.backdrop, t))
         .show(ctx, |ui| {
             ui.set_opacity(t);
             ui.set_width(width);
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("Settings").heading().strong().color(pal.text));
+            ui.spacing_mut().item_spacing.y = 0.0;
+            egui::Frame::new().inner_margin(egui::Margin { left: 22, right: 14, top: 16, bottom: 14 }).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new("Settings").font(fonts::semibold_id(18.0)).color(pal.text));
+                        ui.add_space(2.0);
+                        ui.label(RichText::new("Servers, folders, speed and what happens after a download").small().color(pal.muted));
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                        if icon_button(ui, pal, Icon::Close, pal.muted, "Close without saving (Esc)").clicked() {
+                            actions.push(Action::CloseSettings);
+                        }
+                    });
+                });
             });
-            ui.add_space(6.0);
-            if let Some(e) = &draft.load_error {
-                notice(
-                    ui,
-                    pal,
-                    Status::Warn,
-                    "The stored settings could not be read.",
-                    &format!(
-                        "Defaults are shown below; saving replaces the stored settings and keeps \
-                         the unreadable document in the database as a backup. ({e})"
-                    ),
-                );
-                ui.add_space(8.0);
-            }
-            egui::ScrollArea::vertical()
-                .max_height(max_h)
-                .min_scrolled_height(max_h)
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    connection_section(ui, pal, draft, actions);
-                    ui.add_space(8.0);
-                    downloads_section(ui, pal, draft, dialog_open, actions);
-                    ui.add_space(8.0);
-                    performance_section(ui, pal, &mut draft.settings);
-                    ui.add_space(8.0);
-                    postprocess_section(ui, pal, &mut draft.settings);
-                    ui.add_space(8.0);
-                    automation_section(ui, pal, &mut draft.settings);
-                    ui.add_space(8.0);
-                    appearance_section(ui, pal, &mut draft.appearance);
+            hairline(ui, pal);
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+                section_nav(ui, pal, max_h);
+                let r = ui.available_rect_before_wrap();
+                ui.painter().vline(r.left(), r.top()..=(r.top() + max_h), egui::Stroke::new(1.0, pal.border));
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
+                    sheet_body(ui, pal, draft, dialog_open, max_h, actions);
                 });
-
-            let errors = validate(&draft.edited());
-            let result = draft.result();
-            ui.add_space(8.0);
-            for e in &errors {
-                error_line(ui, pal, e);
-            }
-            if let Some(e) = &draft.save_error {
-                error_line(ui, pal, &format!("Saving failed: {e}"));
-            }
-            ui.separator();
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(
-                        "Passwords are stored unencrypted in the local settings database.",
-                    )
-                    .small()
-                    .color(pal.muted),
-                );
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    // The sheet's one filled call to action.
-                    let save = kit_button(
-                        ui,
-                        pal,
-                        ButtonKind::Primary,
-                        None,
-                        "Save",
-                        errors.is_empty(),
-                    );
-                    if save.clicked() && errors.is_empty() {
-                        // The app applies the sheet's appearance only once the save
-                        // succeeds, so a failed save changes nothing.
-                        actions.push(Action::SaveSettings(Box::new(result)));
-                    }
-                    if kit_button(ui, pal, ButtonKind::Outline, None, "Cancel", true).clicked() {
-                        actions.push(Action::CloseSettings);
-                    }
-                });
+            });
+            hairline(ui, pal);
+            egui::Frame::new().inner_margin(egui::Margin { left: 22, right: 16, top: 12, bottom: 14 }).show(ui, |ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
+                footer(ui, pal, draft, actions);
             });
         });
 }
 
+/// A full-width hairline between the sheet's header, body and footer.
+fn hairline(ui: &mut Ui, pal: &Palette) {
+    let (r, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
+    ui.painter().hline(r.x_range(), r.center().y, egui::Stroke::new(1.0, pal.border));
+}
+
+/// The sheet's sections, in order (titles double as the navigation entries).
+const SECTIONS: [(&str, Icon); 6] = [
+    ("Connection", Icon::Transfers),
+    ("Downloads", Icon::Folder),
+    ("Performance", Icon::Gear),
+    ("Post-processing", Icon::Retry),
+    ("Automation", Icon::Play),
+    ("Appearance", Icon::Info),
+];
+
+/// Temp-data keys: the section the reader is in (scroll spy), a pending jump, and where
+/// each section's title landed this frame.
+fn nav_active_id() -> Id {
+    Id::new("settings-nav-active")
+}
+fn nav_jump_id() -> Id {
+    Id::new("settings-nav-jump")
+}
+fn section_top_id(title: &str) -> Id {
+    Id::new(("settings-section-top", title))
+}
+
+/// The navigation rail: one entry per section; the one being read is marked, and a
+/// click scrolls its section to the top.
+fn section_nav(ui: &mut Ui, pal: &Palette, height: f32) {
+    let active = ui.ctx().data(|d| d.get_temp::<usize>(nav_active_id())).unwrap_or(0);
+    let (rail, _) = ui.allocate_exact_size(egui::vec2(184.0, height), egui::Sense::hover());
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rail.shrink2(egui::vec2(10.0, 12.0))).layout(Layout::top_down(Align::Min)));
+    let ui = &mut child;
+    ui.spacing_mut().item_spacing.y = 2.0;
+    // The marker sits under the entries; its shape is filled in once they are placed.
+    let marker = ui.painter().add(egui::Shape::Noop);
+    let mut slots = Vec::with_capacity(SECTIONS.len());
+    for (i, (title, icon)) in SECTIONS.iter().enumerate() {
+        let (r, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 32.0), egui::Sense::click());
+        slots.push(r);
+        let hover = ui.ctx().animate_bool(resp.id.with("hover"), resp.hovered() && i != active);
+        if hover > 0.0 {
+            ui.painter().rect_filled(r, egui::CornerRadius::same(7), Palette::fade(pal.hover, hover));
+        }
+        let on = i == active;
+        let fg = if on { pal.text } else { pal.muted.lerp_to_gamma(pal.text, hover) };
+        super::widgets::paint_icon(
+            ui.painter(),
+            egui::Rect::from_center_size(egui::pos2(r.left() + 20.0, r.center().y), egui::vec2(16.0, 16.0)),
+            *icon,
+            if on { pal.accent_fg } else { fg },
+        );
+        let font = if on { fonts::semibold_id(13.0) } else { egui::FontId::proportional(13.0) };
+        ui.painter().text(egui::pos2(r.left() + 38.0, r.center().y), egui::Align2::LEFT_CENTER, *title, font, fg);
+        if resp.has_focus() {
+            super::widgets::focus_ring(ui, pal, r, 7);
+        }
+        resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, on, format!("Go to {title}")));
+        if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+            ui.ctx().data_mut(|d| {
+                d.insert_temp(nav_jump_id(), i);
+                d.insert_temp(nav_active_id(), i);
+            });
+        }
+    }
+    // The marker glides to the active entry.
+    if let Some(slot) = slots.get(active) {
+        let secs = ui.style().animation_time;
+        let top = ui.ctx().animate_value_with_time(Id::new("settings-nav-marker"), slot.top(), secs);
+        let pill = egui::Rect::from_min_size(egui::pos2(slot.left(), top), slot.size());
+        let rail = egui::Rect::from_center_size(egui::pos2(pill.left() + 2.0, pill.center().y), egui::vec2(3.0, 16.0));
+        ui.painter().set(
+            marker,
+            egui::Shape::Vec(vec![
+                egui::Shape::rect_filled(pill, egui::CornerRadius::same(7), pal.accent_soft),
+                egui::Shape::rect_filled(rail, egui::CornerRadius::same(2), pal.accent),
+            ]),
+        );
+    }
+}
+
+/// The scrolling sections; afterwards the scroll spy picks the section being read.
+fn sheet_body(
+    ui: &mut Ui,
+    pal: &Palette,
+    draft: &mut SettingsDraft,
+    dialog_open: bool,
+    max_h: f32,
+    actions: &mut Vec<Action>,
+) {
+    if let Some(e) = &draft.load_error {
+        egui::Frame::new().inner_margin(egui::Margin { left: 20, right: 18, top: 14, bottom: 0 }).show(ui, |ui| {
+            notice(
+                ui,
+                pal,
+                Status::Warn,
+                "The stored settings could not be read.",
+                &format!(
+                    "Defaults are shown below; saving replaces the stored settings and keeps \
+                     the unreadable document in the database as a backup. ({e})"
+                ),
+            );
+        });
+    }
+    let out = egui::ScrollArea::vertical()
+        .id_salt("settings-body")
+        .max_height(max_h)
+        .min_scrolled_height(max_h)
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            egui::Frame::new().inner_margin(egui::Margin { left: 20, right: 18, top: 14, bottom: 18 }).show(ui, |ui| {
+                connection_section(ui, pal, draft, actions);
+                ui.add_space(14.0);
+                downloads_section(ui, pal, draft, dialog_open, actions);
+                ui.add_space(14.0);
+                performance_section(ui, pal, &mut draft.settings);
+                ui.add_space(14.0);
+                postprocess_section(ui, pal, &mut draft.settings);
+                ui.add_space(14.0);
+                automation_section(ui, pal, &mut draft.settings);
+                ui.add_space(14.0);
+                appearance_section(ui, pal, &mut draft.appearance);
+            });
+        });
+    // Scroll spy: the last section whose title has passed the top of the view (the
+    // last one once the end is reached).
+    let view = out.inner_rect;
+    let at_end = out.state.offset.y + view.height() >= out.content_size.y - 2.0 && out.state.offset.y > 0.0;
+    let ctx = ui.ctx().clone();
+    let jumping = ctx.data(|d| d.get_temp::<usize>(nav_jump_id())).is_some();
+    if !jumping {
+        let active = if at_end {
+            SECTIONS.len() - 1
+        } else {
+            SECTIONS
+                .iter()
+                .enumerate()
+                .filter(|(_, (title, _))| {
+                    ctx.data(|d| d.get_temp::<f32>(section_top_id(title))).is_some_and(|y| y <= view.top() + 40.0)
+                })
+                .map(|(i, _)| i)
+                .next_back()
+                .unwrap_or(0)
+        };
+        ctx.data_mut(|d| d.insert_temp(nav_active_id(), active));
+    }
+}
+
+/// Validation messages, the storage note and Cancel / Save.
+fn footer(ui: &mut Ui, pal: &Palette, draft: &mut SettingsDraft, actions: &mut Vec<Action>) {
+    let errors = validate(&draft.edited());
+    let result = draft.result();
+    ui.add_space(8.0);
+    for e in &errors {
+        error_line(ui, pal, e);
+    }
+    if let Some(e) = &draft.save_error {
+        error_line(ui, pal, &format!("Saving failed: {e}"));
+    }
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(
+                "Passwords are stored unencrypted in the local settings database.",
+            )
+            .small()
+            .color(pal.muted),
+        );
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            // The sheet's one filled call to action.
+            let save = kit_button(
+                ui,
+                pal,
+                ButtonKind::Primary,
+                None,
+                "Save",
+                errors.is_empty(),
+            );
+            if save.clicked() && errors.is_empty() {
+                // The app applies the sheet's appearance only once the save
+                // succeeds, so a failed save changes nothing.
+                actions.push(Action::SaveSettings(Box::new(result)));
+            }
+            if kit_button(ui, pal, ButtonKind::Outline, None, "Cancel", true).clicked() {
+                actions.push(Action::CloseSettings);
+            }
+        });
+    });
+}
+
 fn section(ui: &mut Ui, pal: &Palette, title: &str, body: impl FnOnce(&mut Ui)) {
+    // A pending jump from the navigation rail lands here.
+    let index = SECTIONS.iter().position(|(t, _)| *t == title);
+    let jump = ui.ctx().data(|d| d.get_temp::<usize>(nav_jump_id()));
+    if index.is_some() && jump == index {
+        ui.scroll_to_cursor(Some(Align::TOP));
+        ui.ctx().data_mut(|d| d.remove_temp::<usize>(nav_jump_id()));
+    }
+    let top = ui.cursor().top();
+    ui.ctx().data_mut(|d| d.insert_temp(section_top_id(title), top));
     section_title(ui, pal, title);
-    ui.add_space(2.0);
+    ui.add_space(4.0);
     card(pal).show(ui, |ui| {
         ui.set_width(ui.available_width());
         body(ui);
@@ -367,7 +534,7 @@ fn connection_section(
                         cfg.host = cfg.host.trim().to_owned();
                         actions.push(Action::TestServer(row_id, Box::new(cfg)));
                     }
-                    ui.checkbox(&mut srv.enabled, "Enabled");
+                    toggle(ui, pal, &mut srv.enabled, "Enabled");
                 });
             });
             egui::Grid::new(("server-grid", row_id))
@@ -382,7 +549,7 @@ fn connection_section(
                     ui.label("Port");
                     ui.horizontal(|ui| {
                         ui.add(DragValue::new(&mut srv.port).range(1..=65535));
-                        if ui.checkbox(&mut srv.tls, "TLS").changed() {
+                        if toggle(ui, pal, &mut srv.tls, "TLS").changed() {
                             // Follow the usual port when it is still the default of the other mode.
                             if srv.tls && srv.port == 119 {
                                 srv.port = 563;
@@ -519,7 +686,7 @@ fn downloads_section(
                 );
                 let s = &mut draft.settings;
                 ui.label("");
-                ui.checkbox(&mut s.watch_enabled, "Watch folder enabled");
+                toggle(ui, pal, &mut s.watch_enabled, "Watch folder enabled");
                 ui.end_row();
                 ui.label("Scan interval");
                 ui.horizontal(|ui| {
@@ -536,10 +703,7 @@ fn downloads_section(
                 });
                 ui.end_row();
                 ui.label("");
-                ui.checkbox(
-                    &mut s.watch_auto_start,
-                    "Start the queue after a watch-folder import",
-                );
+                toggle(ui, pal, &mut s.watch_auto_start, "Start the queue after a watch-folder import");
                 ui.end_row();
             });
     });
@@ -576,19 +740,23 @@ fn performance_section(ui: &mut Ui, pal: &Palette, s: &mut Settings) {
 fn postprocess_section(ui: &mut Ui, pal: &Palette, s: &mut Settings) {
     section(ui, pal, "Post-processing", |ui| {
         let p = &mut s.postprocess;
-        ui.checkbox(&mut p.enabled, "Post-process finished jobs");
+        toggle(ui, pal, &mut p.enabled, "Post-process finished jobs");
         ui.add_enabled_ui(p.enabled, |ui| {
-            ui.checkbox(&mut p.repair, "Verify and repair with PAR2");
-            ui.checkbox(&mut p.extract, "Extract archives (7z, rar, zip)");
-            ui.checkbox(&mut p.cleanup, "Delete archives after a successful extraction");
-            ui.checkbox(
-                &mut p.remove_leftovers,
-                "Remove leftover files (.par2, repair backups, .sfv, .nfo) once verified",
-            )
+            ui.indent("postprocess-steps", |ui| {
+                toggle(ui, pal, &mut p.repair, "Verify and repair with PAR2");
+                toggle(ui, pal, &mut p.extract, "Extract archives (7z, rar, zip)");
+                toggle(ui, pal, &mut p.cleanup, "Delete archives after a successful extraction");
+                toggle(
+                    ui,
+                    pal,
+                    &mut p.remove_leftovers,
+                    "Remove leftover files (.par2, repair backups, .sfv, .nfo) once verified",
+                )
             .on_hover_text(
                 "Runs when PAR2 verified or repaired the download and nothing failed to extract. \
                  Other files (samples, subtitles) are kept.",
-            );
+                );
+            });
         });
         ui.label(
             RichText::new(
@@ -602,7 +770,7 @@ fn postprocess_section(ui: &mut Ui, pal: &Palette, s: &mut Settings) {
 
 fn automation_section(ui: &mut Ui, pal: &Palette, s: &mut Settings) {
     section(ui, pal, "Automation", |ui| {
-        ui.checkbox(&mut s.auto_shutdown, "Shut down when queue finishes");
+        toggle(ui, pal, &mut s.auto_shutdown, "Shut down when queue finishes");
         ui.add_enabled_ui(s.auto_shutdown, |ui| {
             ui.horizontal(|ui| {
                 ui.label("Countdown");
@@ -624,13 +792,14 @@ fn automation_section(ui: &mut Ui, pal: &Palette, s: &mut Settings) {
 fn appearance_section(ui: &mut Ui, pal: &Palette, appearance: &mut Appearance) {
     section(ui, pal, "Appearance", |ui| {
         ui.horizontal(|ui| {
-            ui.label("Theme");
-            ui.add_space(8.0);
+            ui.spacing_mut().item_spacing.x = 12.0;
             for a in Appearance::ALL {
-                ui.radio_value(appearance, a, a.label());
-                ui.add_space(10.0);
+                if theme_swatch(ui, pal, a, *appearance == a).clicked() {
+                    *appearance = a;
+                }
             }
         });
+        ui.add_space(4.0);
         ui.label(
             RichText::new(
                 "Follow desktop uses your desktop color scheme and follows its changes. \
@@ -640,6 +809,72 @@ fn appearance_section(ui: &mut Ui, pal: &Palette, appearance: &mut Appearance) {
             .color(pal.muted),
         );
     });
+}
+
+/// A theme choice as a card: a miniature window in that theme's colors (the desktop
+/// option shows ink and paper side by side, since it follows whichever the desktop
+/// uses) above its name; the chosen card is ringed in the accent.
+fn theme_swatch(ui: &mut Ui, pal: &Palette, choice: Appearance, selected: bool) -> egui::Response {
+    let size = egui::vec2(148.0, 112.0);
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let hover = ui.ctx().animate_bool(resp.id.with("hover"), resp.hovered());
+        let on = ui.ctx().animate_bool(resp.id.with("on"), selected);
+        let painter = ui.painter();
+        let preview = egui::Rect::from_min_size(rect.min, egui::vec2(size.x, 82.0));
+        let ink = Palette::from_theme(&super::brand_tokens::ink());
+        let paper = Palette::from_theme(&super::brand_tokens::paper());
+        match choice {
+            Appearance::Ink => mini_window(painter, &ink, preview),
+            Appearance::Paper => mini_window(painter, &paper, preview),
+            Appearance::FollowDesktop => {
+                let (l, r) = preview.split_left_right_at_fraction(0.5);
+                mini_window(&painter.with_clip_rect(l), &paper, preview);
+                mini_window(&painter.with_clip_rect(r), &ink, preview);
+            }
+        }
+        let ring = pal.border_strong.lerp_to_gamma(pal.accent, on);
+        painter.rect_stroke(
+            preview,
+            egui::CornerRadius::same(10),
+            egui::Stroke::new(1.0 + 1.5 * on.max(hover * 0.4), ring),
+            egui::StrokeKind::Outside,
+        );
+        let font = if selected { fonts::semibold_id(12.5) } else { egui::FontId::proportional(12.5) };
+        painter.text(
+            egui::pos2(rect.center().x, preview.bottom() + 15.0),
+            egui::Align2::CENTER_CENTER,
+            choice.label(),
+            font,
+            if selected { pal.text } else { pal.muted },
+        );
+        if resp.has_focus() {
+            super::widgets::focus_ring(ui, pal, preview, 10);
+        }
+    }
+    let label = choice.label();
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::RadioButton, true, selected, label));
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// A tiny window in `p`'s colors: toolbar, two rows with text and a segment track.
+fn mini_window(painter: &egui::Painter, p: &Palette, r: egui::Rect) {
+    use egui::{pos2, vec2, CornerRadius, Rect};
+    painter.rect_filled(r, CornerRadius::same(10), p.surface);
+    let bar = Rect::from_min_size(r.min, vec2(r.width(), 18.0));
+    painter.rect_filled(bar, CornerRadius { nw: 10, ne: 10, sw: 0, se: 0 }, p.raised);
+    for (i, h) in [6.0f32, 10.0, 8.0].iter().enumerate() {
+        let x = r.left() + 10.0 + i as f32 * 3.0;
+        painter.rect_filled(Rect::from_center_size(pos2(x, bar.center().y), vec2(1.6, *h)), CornerRadius::ZERO, p.mark);
+    }
+    painter.rect_filled(Rect::from_min_size(pos2(r.right() - 34.0, bar.top() + 5.0), vec2(24.0, 8.0)), CornerRadius::same(4), p.accent_soft);
+    for row in 0..2 {
+        let y = bar.bottom() + 12.0 + row as f32 * 26.0;
+        painter.rect_filled(Rect::from_min_size(pos2(r.left() + 10.0, y), vec2(54.0, 5.0)), CornerRadius::same(2), p.text);
+        painter.rect_filled(Rect::from_min_size(pos2(r.left() + 10.0, y + 9.0), vec2(36.0, 4.0)), CornerRadius::same(2), p.muted);
+        let track = Rect::from_min_size(pos2(r.left() + 74.0, y + 3.0), vec2(r.width() - 86.0, 4.0));
+        super::widgets::paint_segments(painter, p, track, if row == 0 { 0.62 } else { 0.25 }, p.accent, None);
+    }
 }
 
 #[cfg(test)]

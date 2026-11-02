@@ -33,8 +33,11 @@ pub fn show(
     reduced_motion: bool,
     actions: &mut Vec<Action>,
 ) {
-    let t = motion::fade_in(ctx, fade_id(), 0.16, reduced_motion);
-    egui::Modal::new(Id::new("about-modal"))
+    let t = motion::fade_in(ctx, fade_id(), 0.2, reduced_motion);
+    let id = Id::new("about-modal");
+    egui::Modal::new(id)
+        .area(egui::Modal::default_area(id).anchor(egui::Align2::CENTER_CENTER, Vec2::new(0.0, (1.0 - motion::ease_out(t)) * 18.0)))
+        .frame(super::widgets::dialog_frame(pal).inner_margin(egui::Margin::same(24)))
         .backdrop_color(Palette::fade(pal.backdrop, t))
         .show(ctx, |ui| {
             ui.set_opacity(t);

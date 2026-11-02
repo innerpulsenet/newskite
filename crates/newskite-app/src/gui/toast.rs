@@ -18,6 +18,9 @@ pub const FAILED_SECS: f64 = 15.0;
 /// Toasts on screen at once.
 pub const MAX_SHOWN: usize = 3;
 const WIDTH: f32 = 320.0;
+/// Seconds a toast takes to slide in, and to fade out at the end of its life.
+const ENTER_SECS: f64 = 0.22;
+const EXIT_SECS: f64 = 0.3;
 
 /// One announcement.
 #[derive(Clone, Debug, PartialEq)]
@@ -51,26 +54,43 @@ pub fn prune(toasts: &mut Vec<Toast>, now: f64) {
 
 /// Draws the toasts above the status bar; `bottom` is the y they stack up from.
 pub fn show(ctx: &egui::Context, pal: &Palette, toasts: &mut Vec<Toast>, bottom: f32, reduced: bool, actions: &mut Vec<Action>) {
-    let now = ctx.input(|i| i.time);
+    let (now, dt) = ctx.input(|i| (i.time, f64::from(i.stable_dt).min(0.1)));
     for t in toasts.iter_mut() {
         t.shown_at.get_or_insert(now);
+        // A toast under the pointer waits: its clock stops while it is being read.
+        if ctx.data(|d| d.get_temp::<bool>(hover_id(t.id))).unwrap_or(false) {
+            if let Some(s) = t.shown_at.as_mut() {
+                *s += dt;
+            }
+        }
     }
     prune(toasts, now);
     if toasts.is_empty() {
         return;
     }
-    // Wake up for the next expiry (and for the slide-in while one is new).
-    let next = toasts.iter().filter_map(|t| t.shown_at.map(|s| s + t.life() - now)).fold(f64::MAX, f64::min);
-    ctx.request_repaint_after(std::time::Duration::from_secs_f64(next.clamp(0.05, 60.0)));
+    if reduced {
+        // Wake up for the next expiry only.
+        let next = toasts.iter().filter_map(|t| t.shown_at.map(|s| s + t.life() - now)).fold(f64::MAX, f64::min);
+        ctx.request_repaint_after(std::time::Duration::from_secs_f64(next.clamp(0.05, 60.0)));
+    } else {
+        // The countdown line moves continuously.
+        ctx.request_repaint_after(std::time::Duration::from_millis(33));
+    }
     let right = ctx.content_rect().right() - 12.0;
     let mut y = bottom - 12.0;
     for t in toasts.iter().rev() {
-        let age = now - t.shown_at.unwrap_or(now);
-        let enter = if reduced { 1.0 } else { (age / 0.18).clamp(0.0, 1.0) as f32 };
-        if enter < 1.0 {
-            ctx.request_repaint();
-        }
-        let slide = (1.0 - enter) * 24.0;
+        let shown_at = t.shown_at.unwrap_or(now);
+        let age = now - shown_at;
+        let left = (shown_at + t.life() - now).max(0.0);
+        let (enter, exit) = if reduced {
+            (1.0, 1.0)
+        } else {
+            (
+                super::motion::ease_out((age / ENTER_SECS).clamp(0.0, 1.0) as f32),
+                (left / EXIT_SECS).clamp(0.0, 1.0) as f32,
+            )
+        };
+        let slide = (1.0 - enter) * 28.0 + (1.0 - exit) * 16.0;
         let color = if t.ok { pal.positive } else { pal.negative };
         let area = egui::Area::new(egui::Id::new(("toast", t.id)))
             .order(egui::Order::Foreground)
@@ -78,12 +98,12 @@ pub fn show(ctx: &egui::Context, pal: &Palette, toasts: &mut Vec<Toast>, bottom:
             .fixed_pos(Pos2::new(right + slide, y))
             .interactable(true);
         let resp = area.show(ctx, |ui| {
-            ui.set_opacity(enter);
+            ui.set_opacity(enter.min(exit));
             egui::Frame::new()
                 .fill(pal.raised)
                 .stroke(Stroke::new(1.0, pal.border_strong))
-                .corner_radius(CornerRadius::same(6))
-                .shadow(egui::Shadow { offset: [0, 4], blur: 16, spread: 0, color: pal.shadow })
+                .corner_radius(CornerRadius::same(10))
+                .shadow(egui::Shadow { offset: [0, 10], blur: 28, spread: 0, color: pal.shadow })
                 .inner_margin(egui::Margin { left: 14, right: 8, top: 10, bottom: 10 })
                 .show(ui, |ui| {
                     ui.set_width(WIDTH);
@@ -122,13 +142,32 @@ pub fn show(ctx: &egui::Context, pal: &Palette, toasts: &mut Vec<Toast>, bottom:
                 .response
         });
         let rect = resp.response.rect;
+        let hovered = ctx.rect_contains_pointer(resp.response.layer_id, rect);
+        ctx.data_mut(|d| d.insert_temp(hover_id(t.id), hovered));
+        let painter = ctx.layer_painter(resp.response.layer_id);
+        let fade = enter.min(exit);
         // The status rule down the left edge, like a notice.
-        ctx.layer_painter(resp.response.layer_id).line_segment(
-            [Pos2::new(rect.left() + 1.0, rect.top() + 4.0), Pos2::new(rect.left() + 1.0, rect.bottom() - 4.0)],
-            Stroke::new(2.0, color),
+        painter.line_segment(
+            [Pos2::new(rect.left() + 1.0, rect.top() + 6.0), Pos2::new(rect.left() + 1.0, rect.bottom() - 6.0)],
+            Stroke::new(2.0, Palette::fade(color, fade)),
         );
-        y = rect.top() - 8.0;
+        if !reduced {
+            // Time left, as a hairline shrinking along the bottom edge.
+            let f = (left / t.life()).clamp(0.0, 1.0) as f32;
+            let x0 = rect.left() + 10.0;
+            let x1 = x0 + (rect.width() - 20.0) * f;
+            painter.line_segment(
+                [Pos2::new(x0, rect.bottom() - 2.5), Pos2::new(x1, rect.bottom() - 2.5)],
+                Stroke::new(1.5, Palette::fade(color, 0.55 * fade)),
+            );
+        }
+        y = rect.top() - 10.0;
     }
+}
+
+/// Temp-data key: whether the pointer was over toast `id` last frame.
+fn hover_id(id: u64) -> egui::Id {
+    egui::Id::new(("toast-hover", id))
 }
 
 #[cfg(test)]

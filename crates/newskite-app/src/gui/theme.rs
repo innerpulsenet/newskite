@@ -211,8 +211,8 @@ pub fn visuals(t: &Tokens, dark: bool) -> Visuals {
     } else {
         Visuals::light()
     };
-    // The kit's one radius is 4 px; cards and dialogs take twice that.
-    let radius = CornerRadius::same(4);
+    // Controls take a 6 px radius; cards 10 px and sheets 14 px (see `widgets`).
+    let radius = CornerRadius::same(6);
 
     v.dark_mode = dark;
     v.override_text_color = None;
@@ -228,13 +228,18 @@ pub fn visuals(t: &Tokens, dark: bool) -> Visuals {
     v.panel_fill = p.surface;
     v.window_fill = p.raised;
     v.window_stroke = Stroke::new(1.0, p.border);
-    v.window_corner_radius = CornerRadius::same(8);
-    v.menu_corner_radius = CornerRadius::same(6);
-    // Dialogs: surface 1 and a hairline, no shadow (the backdrop separates them).
-    v.window_shadow = Shadow::NONE;
+    v.window_corner_radius = CornerRadius::same(12);
+    v.menu_corner_radius = CornerRadius::same(8);
+    v.window_shadow = Shadow {
+        offset: [0, 14],
+        blur: 40,
+        spread: 0,
+        color: p.shadow,
+    };
+    // Menus and tooltips float on a soft, short shadow.
     v.popup_shadow = Shadow {
-        offset: [0, 4],
-        blur: 12,
+        offset: [0, 6],
+        blur: 18,
         spread: 0,
         color: p.shadow,
     };
@@ -322,8 +327,9 @@ pub fn apply(ctx: &egui::Context, theme: &Theme) -> Palette {
 /// headings in its 600 weight, JetBrains Mono for monospace; nothing below 11 px.
 fn tune_style(style: &mut egui::Style) {
     style.spacing.item_spacing = egui::vec2(8.0, 6.0);
-    style.spacing.button_padding = egui::vec2(10.0, 4.0);
-    style.spacing.interact_size.y = 24.0;
+    style.spacing.button_padding = egui::vec2(12.0, 5.0);
+    style.spacing.interact_size.y = 26.0;
+    style.spacing.menu_margin = egui::Margin::same(6);
     style.spacing.window_margin = egui::Margin::same(16);
     style.text_styles = [
         (TextStyle::Heading, fonts::semibold_id(17.0)),

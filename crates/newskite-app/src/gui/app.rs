@@ -24,6 +24,9 @@ use super::{about, disk, docks, fonts, icons, motion, queue, settings, statusbar
 
 /// How often the job list is re-read while a job is downloading (outline §7).
 pub const JOBS_REFRESH: Duration = Duration::from_millis(1500);
+/// Shortest gap between event-driven job reloads: a burst of finished files (each one
+/// an event) reads the store once per gap instead of once per frame.
+const JOBS_RELOAD_MIN: Duration = Duration::from_millis(150);
 /// Live throughput series length (seconds).
 pub const LIVE_WINDOW_SECS: usize = 600;
 /// Stored history shown in the graph (seconds).
@@ -259,13 +262,9 @@ impl Data {
     /// Pending jobs in queue order (jobs missing from the stored order go last, by id).
     pub fn queue(&self) -> Vec<&Job> {
         let mut v: Vec<&Job> = self.jobs.iter().filter(|j| j.state.is_pending()).collect();
-        let rank = |id: i64| {
-            self.queue_order
-                .iter()
-                .position(|&o| o == id)
-                .unwrap_or(usize::MAX)
-        };
-        v.sort_by_key(|j| (rank(j.id), j.id));
+        // One rank lookup per job, not a scan of the order per comparison.
+        let rank: HashMap<i64, usize> = self.queue_order.iter().enumerate().map(|(i, &id)| (id, i)).collect();
+        v.sort_by_cached_key(|j| (rank.get(&j.id).copied().unwrap_or(usize::MAX), j.id));
         v
     }
 
@@ -321,6 +320,8 @@ pub struct ViewState {
     pub queue: queue::QueueState,
     /// Inspector (selected job) state.
     pub inspector: super::inspector::InspectorState,
+    /// The job the inspector last showed, so it can slide away with its content.
+    pub inspector_job: Option<Job>,
     /// Settings modal (open when `Some`).
     pub settings: Option<SettingsDraft>,
     /// A native dialog is open (prevents stacking dialogs).
@@ -387,6 +388,8 @@ pub struct NewskiteApp {
     pub view: ViewState,
     actions: Vec<Action>,
     last_jobs_reload: Instant,
+    /// Events asked for a job reload that was deferred (see [`JOBS_RELOAD_MIN`]).
+    jobs_dirty: bool,
     notifications: bool,
     /// Jobs already finished when last notified (so only new completions notify).
     finished_seen: HashSet<i64>,
@@ -465,6 +468,7 @@ impl NewskiteApp {
                 strip: Default::default(),
                 queue: queue::QueueState::default(),
                 inspector: Default::default(),
+                inspector_job: None,
                 settings: None,
                 dialog_open: false,
                 about_open: false,
@@ -475,6 +479,7 @@ impl NewskiteApp {
             },
             actions: Vec::new(),
             last_jobs_reload: Instant::now(),
+            jobs_dirty: false,
             notifications: config.notifications,
             finished_seen: HashSet::new(),
             last_notice: None,
@@ -665,8 +670,15 @@ impl NewskiteApp {
                 }
             }
         }
-        if reload_jobs {
-            self.reload_jobs();
+        if reload_jobs || self.jobs_dirty {
+            let since = self.last_jobs_reload.elapsed();
+            if since >= JOBS_RELOAD_MIN {
+                self.reload_jobs();
+                self.jobs_dirty = false;
+            } else {
+                self.jobs_dirty = true;
+                self.ctx.request_repaint_after(JOBS_RELOAD_MIN - since);
+            }
         }
         if reload_logs {
             self.data.logs = self.service.logs();
@@ -1335,8 +1347,14 @@ impl NewskiteApp {
         let pal = self.palette;
         let width = ctx.content_rect().width();
         self.view.reduced_motion = self.reduced_motion;
+        // egui's own transitions (hover washes, sliding panels, toggles) follow the
+        // reduced-motion preference too.
+        let anim = if self.reduced_motion { 0.0 } else { motion::UI_SECS };
+        if ctx.style().animation_time != anim {
+            ctx.all_styles_mut(|s| s.animation_time = anim);
+        }
 
-        egui::TopBottomPanel::top("toolbar")
+        let toolbar = egui::TopBottomPanel::top("toolbar")
             .frame(
                 egui::Frame::new()
                     .fill(pal.raised)
@@ -1346,6 +1364,15 @@ impl NewskiteApp {
             .show(ctx, |ui| {
                 toolbar::show(ui, &pal, &self.data, &mut self.view, &mut actions)
             });
+        // The toolbar casts a short shadow over whatever scrolls beneath it.
+        let edge = toolbar.response.rect;
+        super::widgets::shade_below(
+            &ctx.layer_painter(egui::LayerId::new(egui::Order::Middle, egui::Id::new("toolbar-shade"))),
+            &pal,
+            edge.x_range(),
+            edge.bottom(),
+            7.0,
+        );
 
         egui::TopBottomPanel::bottom("statusbar")
             .exact_height(28.0)
@@ -1376,8 +1403,16 @@ impl NewskiteApp {
         // the selected job's details instead.
         let side = width >= super::inspector::SIDE_PANEL_MIN_WINDOW;
         let selected_job = self.view.queue.selected.and_then(|id| self.data.jobs.iter().find(|j| j.id == id)).cloned();
-        if let (true, Some(job)) = (side, &selected_job) {
-            egui::SidePanel::right("inspector")
+        let inspecting = side && selected_job.is_some();
+        if inspecting {
+            self.view.inspector_job = selected_job.clone();
+        } else if !side {
+            self.view.inspector_job = None;
+        }
+        // It slides in when a job is selected and out (still showing that job) when the
+        // selection is cleared.
+        if let Some(job) = self.view.inspector_job.clone() {
+            let shown = egui::SidePanel::right("inspector")
                 .resizable(true)
                 .default_width(super::inspector::PANEL_DEFAULT_W)
                 .min_width(super::inspector::PANEL_MIN_W)
@@ -1388,17 +1423,20 @@ impl NewskiteApp {
                         .inner_margin(egui::Margin::symmetric(16, 14))
                         .stroke(egui::Stroke::new(1.0, pal.border)),
                 )
-                .show(ctx, |ui| {
+                .show_animated(ctx, inspecting, |ui| {
                     super::inspector::show(
                         ui,
                         &pal,
                         &self.data,
-                        job,
+                        &job,
                         &mut self.view.inspector,
                         self.reduced_motion,
                         &mut actions,
                     )
                 });
+            if shown.is_none() && !inspecting {
+                self.view.inspector_job = None;
+            }
         }
 
         // One panel id per arrangement so each keeps its own (user-resizable) height. The
@@ -1484,9 +1522,12 @@ impl NewskiteApp {
 fn drop_overlay(ctx: &egui::Context, pal: &Palette, reduced: bool) {
     let hovered: Vec<Option<PathBuf>> =
         ctx.input(|i| i.raw.hovered_files.iter().map(|f| f.path.clone()).collect());
+    let fade_id = egui::Id::new("drop-overlay-fade");
     if hovered.is_empty() {
+        motion::fade_reset(ctx, fade_id);
         return;
     }
+    let t = motion::fade_in(ctx, fade_id, 0.16, reduced);
     // Some sources only say a drag is in progress, not which files.
     let known: Vec<PathBuf> = hovered.iter().flatten().cloned().collect();
     let (nzbs, _) = expand_drop(&known);
@@ -1503,22 +1544,30 @@ fn drop_overlay(ctx: &egui::Context, pal: &Palette, reduced: bool) {
         .fixed_pos(rect.min)
         .interactable(false)
         .show(ctx, |ui| {
+            ui.set_opacity(t);
             ui.painter()
-                .rect_filled(rect, 0.0, Palette::fade(pal.surface, 0.82));
-            let card = egui::Rect::from_center_size(rect.center(), egui::vec2(420.0, 170.0));
-            ui.painter().rect(
-                card,
-                egui::CornerRadius::same(10),
-                pal.raised,
+                .rect_filled(rect, 0.0, Palette::fade(pal.surface, 0.84));
+            let lift = (1.0 - motion::ease_out(t)) * 12.0;
+            let card = egui::Rect::from_center_size(rect.center() + egui::vec2(0.0, lift), egui::vec2(440.0, 184.0));
+            let beat = motion::Beat::new(ctx, true, reduced, brand::PERIOD_AMBIENT * 2.0);
+            let radius = egui::CornerRadius::same(18);
+            ui.painter().add(egui::Shadow { offset: [0, 16], blur: 44, spread: 0, color: pal.shadow }.as_shape(card, radius));
+            ui.painter().rect_filled(card, radius, pal.raised);
+            ui.painter().rect_filled(card.shrink(6.0), egui::CornerRadius::same(13), Palette::fade(pal.accent_soft, 0.5));
+            // A dashed accent edge whose dashes drift around the card while it waits.
+            let drift = if beat.moving { beat.phase * 40.0 } else { 0.0 };
+            ui.painter().extend(egui::Shape::dashed_line_with_offset(
+                &super::queue::rounded_outline(card.shrink(6.0), 13.0),
                 egui::Stroke::new(2.0, pal.accent),
-                egui::StrokeKind::Inside,
-            );
+                &[10.0],
+                &[7.0],
+                drift,
+            ));
             let mut child = ui.new_child(
                 egui::UiBuilder::new()
-                    .max_rect(card.shrink(24.0))
+                    .max_rect(card.shrink(28.0))
                     .layout(egui::Layout::top_down(egui::Align::Center)),
             );
-            let beat = motion::Beat::new(ctx, true, reduced, brand::PERIOD_AMBIENT * 2.0);
             super::widgets::article_grid_lit(
                 &mut child,
                 pal,
