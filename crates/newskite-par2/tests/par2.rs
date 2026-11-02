@@ -212,6 +212,95 @@ fn unsafe_names_are_refused() {
     assert!(!outside.exists());
 }
 
+/// A damaged copy of another size (not a candidate for the whole file) still gives its
+/// good slices at aligned offsets (not the last one: junk follows it where PAR2 pads with
+/// zeros), and slices matching nothing are ignored.
+#[test]
+fn stray_slices_in_other_files_are_found() {
+    let f = fixture(&[("big.bin", 40_000)]);
+    create(&f.dir, &["big.bin"], 4096, 2, &f.dir.join("set")).unwrap();
+    let mut d = std::fs::read(f.dir.join("big.bin")).unwrap();
+    d[5000] ^= 0xff;
+    d.extend_from_slice(&[7u8; 5000]);
+    std::fs::write(f.dir.join("other.bin"), &d).unwrap();
+    std::fs::write(f.dir.join("noise.bin"), data(30_000, 99)).unwrap();
+    std::fs::remove_file(f.dir.join("big.bin")).unwrap();
+    let (sets, _) = load(&par2_files(&f.dir));
+    let mut notes = Vec::new();
+    let ver = verify(&sets[0], &f.dir, &others(&f.dir), &mut |e| {
+        if let Event::Note(n) = e {
+            notes.push(n)
+        }
+    });
+    assert_eq!(ver.files[0].status, FileStatus::Missing { found: 8, total: 10 });
+    assert_eq!(notes, ["found 8 good slice(s) in other.bin"]);
+    repair(&sets[0], &ver, &RepairOptions::default(), &mut |_| {}).unwrap();
+    assert_restored(&f);
+}
+
+/// Slices big enough that each pass is split over several threads, odd file lengths
+/// (short last slices), and a memory limit that makes passes shorter than a slice.
+#[test]
+fn threads_split_slices_and_passes() {
+    for opts in [RepairOptions { threads: 3, memory_limit: 21 * 40_000 }, RepairOptions { threads: 7, ..Default::default() }] {
+        let f = fixture(&[("a.bin", 350_001), ("b.bin", 123_457), ("c.bin", 99_999)]);
+        create(&f.dir, &["a.bin", "b.bin", "c.bin"], 100_000, 6, &f.dir.join("set")).unwrap();
+        let mut a = std::fs::read(f.dir.join("a.bin")).unwrap();
+        a[150_000] ^= 1;
+        a[350_000] ^= 1;
+        std::fs::write(f.dir.join("a.bin"), &a).unwrap();
+        std::fs::remove_file(f.dir.join("b.bin")).unwrap();
+        let out = run(&f, &opts).unwrap();
+        assert_eq!(out.slices_rebuilt, 4, "{opts:?}");
+        assert_restored(&f);
+    }
+}
+
+/// A file with more slices than one read covers is checked in several runs (several
+/// threads); damage in each run is found and repaired.
+#[test]
+fn large_file_is_checked_in_runs() {
+    let f = fixture(&[("big.bin", 9 * 1024 * 1024 + 3)]);
+    create(&f.dir, &["big.bin"], 64 * 1024, 3, &f.dir.join("set")).unwrap();
+    let (sets, _) = load(&par2_files(&f.dir));
+    let ver = verify(&sets[0], &f.dir, &others(&f.dir), &mut |_| {});
+    assert!(ver.is_intact());
+    let mut d = std::fs::read(f.dir.join("big.bin")).unwrap();
+    d[5] ^= 1;
+    d[130 * 65536 + 7] ^= 1;
+    let last = d.len() - 1;
+    d[last] ^= 1;
+    std::fs::write(f.dir.join("big.bin"), &d).unwrap();
+    let ver = verify(&sets[0], &f.dir, &others(&f.dir), &mut |_| {});
+    assert_eq!(ver.files[0].status, FileStatus::Damaged { found: 145 - 3, total: 145 });
+    repair(&sets[0], &ver, &RepairOptions::default(), &mut |_| {}).unwrap();
+    assert_restored(&f);
+}
+
+/// Two files with the same content under obfuscated names each get their own copy.
+#[test]
+fn identical_obfuscated_files_get_distinct_copies() {
+    let f = fixture(&[("x.bin", 9_000)]);
+    std::fs::copy(f.dir.join("x.bin"), f.dir.join("y.bin")).unwrap();
+    create(&f.dir, &["x.bin", "y.bin"], 2048, 2, &f.dir.join("set")).unwrap();
+    std::fs::rename(f.dir.join("x.bin"), f.dir.join("q1")).unwrap();
+    std::fs::rename(f.dir.join("y.bin"), f.dir.join("q2")).unwrap();
+    let (sets, _) = load(&par2_files(&f.dir));
+    let ver = verify(&sets[0], &f.dir, &others(&f.dir), &mut |_| {});
+    let picked: Vec<_> = ver
+        .files
+        .iter()
+        .map(|r| match &r.status {
+            FileStatus::Misnamed(p) => p.file_name().unwrap().to_owned(),
+            s => panic!("{}: {s:?}", r.name),
+        })
+        .collect();
+    assert_ne!(picked[0], picked[1]);
+    repair(&sets[0], &ver, &RepairOptions::default(), &mut |_| {}).unwrap();
+    assert_eq!(std::fs::read(f.dir.join("x.bin")).unwrap(), std::fs::read(f.dir.join("y.bin")).unwrap());
+    assert_eq!(std::fs::read(f.dir.join("x.bin")).unwrap(), f.originals[0].1);
+}
+
 fn par2cmd() -> Option<PathBuf> {
     let p = PathBuf::from("/usr/bin/par2");
     p.exists().then_some(p).or_else(|| {
