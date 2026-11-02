@@ -45,8 +45,9 @@ pub enum ToolState {
     Active,
     /// Visible for layout parity but not implemented yet; clicking is harmless.
     Unavailable,
-    /// The toolbar's lead control (the queue's Start / Pause / Resume): a violet-tinted
-    /// slot, so the one thing that moves the queue reads first.
+    /// The header's queue control (Start / Pause / Resume): an accent outline, icon and
+    /// label with no resting fill, so it reads first among the tools while the view's one
+    /// filled button stays the ember one.
     Accent,
 }
 
@@ -90,12 +91,10 @@ pub fn tool_button(
         let radius = CornerRadius::same(8);
         match state {
             ToolState::Accent => {
-                let fill = if pressed {
-                    pal.accent_soft.lerp_to_gamma(pal.accent, 0.3)
-                } else {
-                    pal.accent_soft.lerp_to_gamma(pal.accent, 0.14 * hover)
-                };
-                painter.rect(rect, radius, fill, Stroke::new(1.0, Palette::fade(pal.accent, 0.35)), StrokeKind::Inside);
+                // The accent wash only under the pointer: at rest the slot is outlined, not
+                // filled.
+                let fill = if pressed { pal.accent_soft } else { Palette::fade(pal.accent_soft, hover) };
+                painter.rect(rect, radius, fill, Stroke::new(1.0, Palette::fade(pal.accent, 0.5)), StrokeKind::Inside);
             }
             _ if pressed => {
                 painter.rect_filled(rect, radius, pal.sunken);

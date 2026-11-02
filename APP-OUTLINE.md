@@ -212,7 +212,7 @@ Rules:
 | Disk meter | Free space on the download folder's disk and how full it is; opens the folder |
 | Header | The view's title and a one-line summary; filter by name; All / Active / Held |
 | Start / Pause / Resume | The whole queue; label and icon follow the state; Start is disabled with nothing queued |
-| **Add NZB** | Reveals an inline path field (Browse…, Add); on success: queue reload, Queue view, the new job selected |
+| **Add NZB** | Opens the file picker (several NZBs at once; Ctrl+O too); when no picker can be shown, an inline path field (Browse…, Add) opens with the reason. On success: queue reload, Queue view, the new job selected. Left out on an empty queue, whose own button stands alone |
 
 ### 6.2 Queue
 - Summary line: job count, bytes to go, time left at the measured speed, held count; a
@@ -244,7 +244,8 @@ their folders.
 Header: the state in words, open folder, close; a progress ring, the name and the folder.
 Tabs:
 - **Overview** — for a failed job a problem card first (failure kind, the full selectable
-  reason, what to do, Retry / Set password / Servers / Copy error). Then the **lifecycle**:
+  reason, what to do; for password and extraction failures an archive password field with
+  Show/Hide, which Retry or Enter saves before retrying; Retry / Servers / Copy error). Then the **lifecycle**:
   Added → Download → Verify → Repair → Extract → Clean up → Done/Failed, each step marked
   done, live (with its fraction and detail), needs-a-look, failed, skipped or waiting, with
   its duration. Then the **article map** (one cell per article, several per cell for big

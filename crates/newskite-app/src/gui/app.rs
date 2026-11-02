@@ -103,6 +103,8 @@ pub enum UiMsg {
     DialogClosed,
     /// The picker could not be shown (why).
     DialogFailed(String),
+    /// The NZB picker could not be shown (why); the typed-path field opens instead.
+    NzbPickerFailed(String),
     /// Result of a server "Test".
     TestResult {
         /// Row the test belongs to.
@@ -714,6 +716,14 @@ impl NewskiteApp {
                     self.service.log(LogLevel::Error, why);
                     self.data.logs = self.service.logs();
                 }
+                UiMsg::NzbPickerFailed(why) => {
+                    self.view.dialog_open = false;
+                    self.service.log(LogLevel::Error, why.clone());
+                    self.data.logs = self.service.logs();
+                    self.view.open_nzb.visible = true;
+                    self.view.open_nzb.focus = true;
+                    self.view.open_nzb.error = Some(format!("{why}. Type or paste the NZB's path instead."));
+                }
                 UiMsg::TestResult { row_id, result } => {
                     if let Some(d) = self.view.settings.as_mut() {
                         d.set_test_result(row_id, result);
@@ -1109,7 +1119,7 @@ impl NewskiteApp {
             let msg = match picked {
                 Ok(Some(files)) if !files.is_empty() => UiMsg::NzbPicked(files),
                 Ok(_) => UiMsg::DialogClosed,
-                Err(e) => UiMsg::DialogFailed(format!("cannot show the file picker: {e}")),
+                Err(e) => UiMsg::NzbPickerFailed(format!("cannot show the file picker: {e}")),
             };
             let _ = tx.send(msg);
             ctx.request_repaint();
@@ -1333,7 +1343,7 @@ impl NewskiteApp {
             )
         });
         if o {
-            self.actions.push(Action::ShowOpenNzb);
+            self.actions.push(Action::BrowseNzb);
         }
         if p {
             self.actions.push(Action::OpenSettings);
@@ -1460,8 +1470,9 @@ impl NewskiteApp {
                 statusbar::show(ui, &pal, &self.data, self.reduced_motion, &mut actions)
             });
 
-        // The server readings: one quiet line above the status bar.
-        egui::TopBottomPanel::bottom("serverstrip")
+        // The server readings: one quiet line above the status bar. Toasts stack from its
+        // top edge, so they never cover its actions.
+        let strip_top = egui::TopBottomPanel::bottom("serverstrip")
             .exact_height(super::serverstrip::STRIP_H)
             .frame(
                 egui::Frame::new()
@@ -1471,7 +1482,10 @@ impl NewskiteApp {
             )
             .show(ctx, |ui| {
                 super::serverstrip::show(ui, &pal, &self.data, &mut self.view.strip, &mut actions)
-            });
+            })
+            .response
+            .rect
+            .top();
 
         // The detail pane slides in beside the list when a job is selected, and out (still
         // showing that job) when the selection is cleared.
@@ -1539,8 +1553,7 @@ impl NewskiteApp {
         } else {
             motion::fade_reset(ctx, about::fade_id());
         }
-        let toast_bottom = ctx.content_rect().bottom() - 28.0;
-        super::toast::show(ctx, &pal, &mut self.data.toasts, toast_bottom, reduced, &mut actions);
+        super::toast::show(ctx, &pal, &mut self.data.toasts, strip_top, reduced, &mut actions);
         drop_overlay(ctx, &pal, reduced);
 
         self.actions.extend(actions);

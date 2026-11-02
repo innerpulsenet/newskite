@@ -537,8 +537,9 @@ bytes move, 2.4 s while a job is active without traffic; a started pass always f
 the About mark (64 px) draws in then beats every 4.5 s; under reduced motion both rest.
 Repaints for motion are requested only while a mark moves (25 ms frames; between passes a
 single wake-up for the next one). Ember appears only as the mark, focus rings and the one
-filled button per view (Queue › Start, Settings › Save; a disabled primary drops to the
-outline). Status is an outlined chip with the kit glyph and words (job states: queued idle,
+filled button per view (Queue › Add NZB, Settings › Save; a disabled primary drops to the
+outline); the queue control (Start / Pause / Resume) is an accent outline with no resting
+fill. Status is an outlined chip with the kit glyph and words (job states: queued idle,
 downloading live in the accent, done ok, failed err, paused warn). Progress is a segment track
 (≤ 40 near-square cells, each an equal slice of the job). NNTP Activity shows `Articles` (count
 of `SegmentDone` this session) and `Missing` (sum of `FileFailed.missing`). The window icon is
@@ -621,3 +622,16 @@ an article grid with one lit cell per NZB being dragged (`widgets::article_grid_
 segment-cell motif also carries the queue total (a track in the Queue summary row,
 `queue::queue_bytes`) and the 24 h history (48 thirty-minute cells, brightness from
 `docks::heat_alpha`, idle cells empty).
+
+Review fixes 2 (additive). Add NZB (header and empty queue) and Ctrl+O open the NZB file
+picker (`Action::BrowseNzb`, several files at once); the typed-path field (`ShowOpenNzb`)
+is the fallback when the picker cannot be shown (`UiMsg::NzbPickerFailed(why)`: the field
+opens with the reason, which is also logged). On an empty queue the header's Add NZB is
+left out, so the empty state's button is the one call to action. A failed job whose failure
+is a password or extraction one gets an archive password field in the detail pane's problem
+card (`InspectorState::{password, show_password}`, Show/Hide); Retry, or Enter in the
+field, saves a typed password (`SetJobPassword`) before `RetryJob`. The row's password
+editor (row menu) takes a 320 px controls box and drops the row's figure while it is open.
+Toasts stack from the top of the server strip. On the sidebar rail an entry's slot is a
+36 px square and its count is a pill over the icon's top-right corner, cut out of it by a
+ring in the color behind (counts above 99 read `99+`; the accessible label has the number).

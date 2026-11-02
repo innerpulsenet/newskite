@@ -55,6 +55,8 @@ impl ListFilter {
 
 /// Width kept for a row's controls (six icon buttons, or an inline confirmation).
 const CONTROLS_W: f32 = 178.0;
+/// Width of the controls box while an archive password is typed in the row.
+const PASSWORD_EDIT_W: f32 = 320.0;
 /// A row's padding.
 const ROW_PAD: Margin = Margin { left: 18, right: 12, top: 12, bottom: 12 };
 /// Seconds the just-imported job's name stays in the accent before settling.
@@ -140,24 +142,22 @@ fn header(ui: &mut Ui, pal: &Palette, data: &Data, view: &mut ViewState, actions
 /// One header action, drawn into the header row.
 type HeaderItem<'a> = Box<dyn FnOnce(&mut Ui, &mut ViewState, &mut Vec<Action>) + 'a>;
 
-/// The header's actions, right to left: Add NZB, the queue control, the filter and the
-/// name search (on the Log view: its level filter).
+/// The header's actions, right to left: Add NZB (left to the empty queue's own call to
+/// action when that shows), the queue control, the filter and the name search (on the
+/// Log view: its level filter).
 fn header_actions(ui: &mut Ui, pal: &Palette, data: &Data, view: &mut ViewState, actions: &mut Vec<Action>) {
     ui.spacing_mut().item_spacing.x = 8.0;
     let rtl = ui.layout().prefer_right_to_left();
     let mut items: Vec<HeaderItem<'_>> = Vec::new();
-    items.push(Box::new(|ui, view, actions| {
-        let r = kit_button(ui, pal, ButtonKind::Primary, Some(Icon::Plus), "Add NZB", true)
-            .on_hover_text("Import an NZB file (Ctrl+O), or drop .nzb files onto the window");
-        if r.clicked() {
-            if view.open_nzb.visible {
-                view.open_nzb.visible = false;
-                view.open_nzb.error = None;
-            } else {
-                actions.push(Action::ShowOpenNzb);
+    if !(view.tab == Tab::Queue && data.queue().is_empty()) {
+        items.push(Box::new(|ui, view, actions| {
+            let r = kit_button(ui, pal, ButtonKind::Primary, Some(Icon::Plus), "Add NZB", !view.dialog_open)
+                .on_hover_text("Choose NZB files (Ctrl+O), or drop .nzb files onto the window");
+            if r.clicked() {
+                actions.push(Action::BrowseNzb);
             }
-        }
-    }));
+        }));
+    }
     items.push(Box::new(|ui, _view, actions| {
         let (action, icon, label, tip, enabled) = queue_control(data);
         let state = if enabled { ToolState::Accent } else { ToolState::Unavailable };
@@ -494,13 +494,20 @@ fn first_line(
             None => figures.push((format::bytes(job.bytes_total), None)),
         },
     }
+    // While an archive password is typed in the row, its editor takes the figure's room.
+    let controls_w = if view.queue.password_edit.as_ref().is_some_and(|(id, _)| *id == job.id) {
+        figures.clear();
+        PASSWORD_EDIT_W
+    } else {
+        CONTROLS_W
+    };
     let mono = fonts::mono_id(12.0);
     let word_font = fonts::semibold_id(13.0);
     let measure = |t: &str, f: &egui::FontId| ui.painter().layout_no_wrap(t.to_owned(), f.clone(), pal.text).size().x;
     let mid_w = measure(&word, &word_font)
         + figures.iter().map(|(t, _)| measure(t, &mono) + 12.0).sum::<f32>()
         + 16.0;
-    let name_w = (w - CONTROLS_W - mid_w - 8.0).max(90.0);
+    let name_w = (w - controls_w - mid_w - 8.0).max(90.0);
     ui.horizontal(|ui| {
         ui.set_min_height(24.0);
         ui.spacing_mut().item_spacing.x = 0.0;
@@ -535,11 +542,11 @@ fn first_line(
             }
         }
         // The controls sit at the right end, in a box of their own.
-        let room = ui.available_width() - CONTROLS_W;
+        let room = ui.available_width() - controls_w;
         if room > 0.0 {
             ui.add_space(room);
         }
-        ui.allocate_ui_with_layout(Vec2::new(CONTROLS_W.min(ui.available_width()), 24.0), Layout::left_to_right(Align::Center), |ui| {
+        ui.allocate_ui_with_layout(Vec2::new(controls_w.min(ui.available_width()), 24.0), Layout::left_to_right(Align::Center), |ui| {
             // Laid out left to right after a spacer, so the buttons end flush right (an
             // inline confirmation takes the whole box).
             let buttons = match kind {
