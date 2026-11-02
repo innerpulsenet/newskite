@@ -94,8 +94,9 @@ use tokio::sync::{broadcast, watch};
 use tokio_util::sync::CancellationToken;
 
 pub use newskite_store::{
-    Bookmark, Job, JobFile, JobState, NewBookmark, Store, StoreError, ThroughputSample, Totals,
+    Bookmark, Job, JobFile, JobLogLine, JobState, JobStats, NewBookmark, Store, StoreError, ThroughputSample, Totals,
 };
+pub use newskite_types::{FailureKind, JobOutcome, ServerHealth, StepRecord, StepState};
 pub use files::Deleted;
 pub use shutdown::shutdown_command;
 

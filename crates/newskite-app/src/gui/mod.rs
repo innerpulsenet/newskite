@@ -15,11 +15,13 @@ pub mod docks;
 pub mod events;
 pub mod fonts;
 pub mod icons;
+pub mod inspector;
 pub mod motion;
 pub mod queue;
 pub mod settings;
 pub mod statusbar;
 pub mod theme;
+pub mod toast;
 pub mod toolbar;
 pub mod widgets;
 
