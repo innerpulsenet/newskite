@@ -195,6 +195,44 @@ fn seed_populated(store: &Store, dir: &Path) {
             Some("3 missing articles: part1@x, part7@x, part9@x"),
         )
         .expect("state");
+    // What happened to the finished ones (as the service records it).
+    use newskite_types::{FailureKind, JobOutcome, StepRecord, StepState};
+    let rec = |state, detail: &str, ms| Some(StepRecord { state, detail: detail.into(), ms });
+    store.mark_job_started(a.id, t0 + 5, 13_460).expect("start");
+    store.add_job_download_ms(a.id, 27_000).expect("ms");
+    store
+        .set_job_outcome(
+            a.id,
+            t0 + 40,
+            6_400,
+            4,
+            &JobOutcome {
+                verify: rec(StepState::Ok, "1 file: 1 damaged; 4 of 878 slices missing, 44 recovery slices available (verify 1.9 s)", 1_900),
+                repair: rec(StepState::Repaired, "rebuilt 4 slices", 2_300),
+                extract: rec(StepState::Skipped, "skipped (no archives found)", 20),
+                cleanup: rec(StepState::Ok, "removed 9 files", 30),
+                par2_summary: Some("1 file: 1 damaged; 4 of 878 slices missing, 44 recovery slices available; rebuilt 4 slices (verify 1.9 s, repair 2.3 s)".into()),
+                slices_rebuilt: 4,
+                articles_repaired: 4,
+                files_removed: 9,
+                ..Default::default()
+            },
+        )
+        .expect("outcome");
+    store.append_job_log(a.id, t0 + 5, "info", "started Debian.12.Netinst.amd64").expect("log");
+    store.append_job_log(a.id, t0 + 32, "warn", "debian-12.iso: 4 missing article(s): <a@x>, <b@x>, <c@x>, ...").expect("log");
+    store.append_job_log(a.id, t0 + 40, "info", "completed Debian.12.Netinst.amd64: PAR2 repaired 4 missing articles").expect("log");
+    store.mark_job_started(c.id, t0 + 130, 2_496).expect("start");
+    store.add_job_download_ms(c.id, 12_000).expect("ms");
+    store
+        .set_job_outcome(
+            c.id,
+            t0 + 150,
+            0,
+            3,
+            &JobOutcome { failure: Some(FailureKind::MissingArticles), ..Default::default() },
+        )
+        .expect("outcome");
     let d = mk("Public.Domain.Archive", 96 * 1024 * 1024, t0 + 180);
     store
         .set_job_progress(d.id, 20 * 1024 * 1024)
@@ -606,6 +644,28 @@ fn history_lists_finished_jobs_and_clears_them() {
     assert_no_bad_numbers(&h);
     snapshot(&mut h, "history-dark");
 
+    // The inspector tells the story of each finished job.
+    h.get_by_label("Debian.12.Netinst.amd64").click();
+    h.run_steps(3);
+    h.get_by_label("Complete · PAR2 repaired the damage");
+    h.get_by_label("rebuilt 4 slices");
+    h.get_by_label("4 of 13460 articles missing · handed to PAR2 · avg 24.4 MB/s");
+    assert_no_bad_numbers(&h);
+    snapshot(&mut h, "inspector-done-dark");
+    h.get_by_label("Log 3").click();
+    h.run_steps(2);
+    h.get_by_label("completed Debian.12.Netinst.amd64: PAR2 repaired 4 missing articles");
+    h.get_by_label("Linux.Audio.Samples.Pack").click();
+    h.run_steps(3);
+    assert_eq!(app(&h).view.inspector.tab, newskite_app::gui::inspector::InspectorTab::Overview);
+    assert_eq!(h.get_all_by_label("Missing articles").count(), 2, "problem title and result step");
+    h.get_by_label(newskite_types::FailureKind::MissingArticles.hint());
+    h.get_by_label("Copy error");
+    assert_no_bad_numbers(&h);
+    snapshot(&mut h, "inspector-failed-dark");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+
     h.get_by_label("Clear history").click();
     h.run_steps(2);
     h.get_by_label("Remove 2 jobs from the list? Files stay on disk.");
@@ -629,11 +689,11 @@ fn selecting_a_job_shows_its_details_and_files() {
         .find(|j| j.name == "Open.Movie.Project.2160p")
         .map(|j| j.id);
     assert_eq!(app(&h).view.queue.selected, movie);
-    h.get_by_label("DETAILS");
-    h.get_by_label("open.movie.part01.rar");
-    h.get_by_label("open.movie.part02.rar");
-    h.get_by_label("2 of 3 done");
-    // The folder: the row's subline and the Details link.
+    // A wide window shows the inspector as a side panel; the dock keeps the server.
+    h.get_by_label("LIFECYCLE");
+    h.get_by_label("SERVER");
+    h.get_by_label("Waiting in the queue");
+    // The folder: the row's subline and the inspector's link.
     assert_eq!(
         h.get_all_by_label("/home/reader/Downloads/Newskite/Open.Movie.Project.2160p")
             .count(),
@@ -641,6 +701,12 @@ fn selecting_a_job_shows_its_details_and_files() {
     );
     assert_no_bad_numbers(&h);
     snapshot(&mut h, "details-dark");
+    h.get_by_label("Files 3").click();
+    h.run_steps(3);
+    h.get_by_label("open.movie.part01.rar");
+    h.get_by_label("open.movie.part02.rar");
+    h.get_by_label("2 of 3 done");
+    snapshot(&mut h, "inspector-files-dark");
     // Esc clears the selection; the dock shows the server again.
     h.key_press(egui::Key::Escape);
     h.run_steps(3);
@@ -1158,4 +1224,42 @@ fn open_nzb_field_accepts_a_pasted_file_uri() {
     h.get_by_label("Add").click();
     run_until(&mut h, |h| app(h).data.jobs.len() == 1);
     assert!(app(&h).view.open_nzb.error.is_none());
+}
+
+#[test]
+fn toasts_and_server_health_render() {
+    let fx = Fixture::new(seed_populated);
+    let mut h = fx.harness(true, SIZE);
+    h.run_steps(2);
+    let failed = app(&h).data.jobs.iter().find(|j| j.name == "Linux.Audio.Samples.Pack").map(|j| j.id).unwrap();
+    {
+        let a = h.state_mut().as_mut().expect("app");
+        a.data.toasts.push(newskite_app::gui::toast::Toast {
+            id: 1,
+            job_id: failed,
+            name: "Linux.Audio.Samples.Pack".into(),
+            ok: false,
+            detail: "3 missing articles: part1@x, part7@x, part9@x".into(),
+            shown_at: None,
+        });
+        a.data.servers = vec![newskite_types::ServerHealth {
+            address: "news.example.net:563".into(),
+            articles: 12_840,
+            bytes: 9_000_000_000,
+            missing: 3,
+            errors: 0,
+            unusable: None,
+            last_error: None,
+        }];
+    }
+    h.run_steps(30);
+    h.get_by_label("Download failed");
+    h.get_by_label("12840 art · 3 missing");
+    assert_no_bad_numbers(&h);
+    snapshot(&mut h, "toast-health-dark");
+    // Clicking the toast opens the job in the History tab.
+    h.get_by_label("Show").click();
+    h.run_steps(3);
+    assert_eq!(app(&h).view.tab, Tab::History);
+    assert_eq!(app(&h).view.queue.selected, Some(failed));
 }

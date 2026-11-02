@@ -760,7 +760,7 @@ fn job_stats_outcome_and_log_round_trip() {
     assert_eq!(got.started_at, Some(100), "first start is kept");
     assert_eq!((got.finished_at, got.download_ms, got.post_ms), (Some(300), 2000, 750));
     assert_eq!((got.articles_total, got.articles_missing), (40, 3));
-    assert_eq!(got.outcome, Some(outcome));
+    assert_eq!(got.outcome.as_deref(), Some(&outcome));
     assert_eq!(got.avg_speed(4000), Some(2000));
     s.clear_job_outcome(j.id).unwrap();
     let got = s.get_job(j.id).unwrap().unwrap().stats;

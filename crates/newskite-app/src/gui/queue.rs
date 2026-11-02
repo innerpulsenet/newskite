@@ -53,7 +53,11 @@ const NAME_MIN: f32 = 150.0;
 const PROGRESS_MIN: f32 = 110.0;
 const PROGRESS_MAX: f32 = 240.0;
 /// History table: actions column.
-const HISTORY_ACTIONS_W: f32 = 160.0;
+const HISTORY_ACTIONS_W: f32 = 140.0;
+/// History table: result chip plus its qualifier.
+const RESULT_W: f32 = 120.0;
+/// History table: finish time.
+const FINISHED_W: f32 = 92.0;
 /// Width of the name filter field.
 const FILTER_W: f32 = 220.0;
 
@@ -571,6 +575,12 @@ fn queue_table(
     let reduced = view.reduced_motion;
     let order = &data.queue_order;
     let last = order.len().saturating_sub(1);
+    // An exact Name width: a remainder column keeps the width it had before the
+    // inspector opened beside the table.
+    let gap = ui.spacing().item_spacing.x;
+    let name_w = (ui.available_width() - (POS_W + STATE_W + SIZE_W + progress_w + CONTROLS_W + 5.0 * gap)).max(NAME_MIN);
+    // A tinted selection keeps the row's colored sublines (errors, live speed) readable.
+    ui.visuals_mut().selection.bg_fill = pal.accent_soft;
     TableBuilder::new(ui)
         .id_salt("queue-table")
         .striped(true)
@@ -578,7 +588,7 @@ fn queue_table(
         .sense(Sense::click())
         .cell_layout(Layout::left_to_right(Align::Center))
         .column(Column::exact(POS_W))
-        .column(Column::remainder().at_least(NAME_MIN).clip(true))
+        .column(Column::exact(name_w).clip(true))
         .column(Column::exact(STATE_W))
         .column(Column::exact(SIZE_W))
         .column(Column::exact(progress_w))
@@ -735,18 +745,24 @@ fn history_tab(
         ui.ctx().request_repaint_after(super::motion::FRAME);
     }
     let reduced = view.reduced_motion;
+    let gap = ui.spacing().item_spacing.x;
+    let name_w = (ui.available_width() - (RESULT_W + SIZE_W + FINISHED_W + HISTORY_ACTIONS_W + 4.0 * gap)).max(NAME_MIN);
+    let now_unix = now_unix();
+    // A tinted selection keeps the row's colored sublines (errors, live speed) readable.
+    ui.visuals_mut().selection.bg_fill = pal.accent_soft;
     TableBuilder::new(ui)
         .id_salt("history-table")
         .striped(true)
         .resizable(false)
         .sense(Sense::click())
         .cell_layout(Layout::left_to_right(Align::Center))
-        .column(Column::remainder().at_least(NAME_MIN).clip(true))
-        .column(Column::exact(STATE_W))
+        .column(Column::exact(name_w).clip(true))
+        .column(Column::exact(RESULT_W))
         .column(Column::exact(SIZE_W))
+        .column(Column::exact(FINISHED_W))
         .column(Column::exact(HISTORY_ACTIONS_W))
         .header(24.0, |mut h| {
-            header_labels(&mut h, pal, &["Name", "Result", "Size", ""])
+            header_labels(&mut h, pal, &["Name", "Result", "Size", "Finished", ""])
         })
         .body(|mut body| {
             for job in jobs {
@@ -761,10 +777,16 @@ fn history_tab(
                         name_cell(ui, pal, job, None, flash, None);
                     });
                     row.col(|ui| {
-                        let r = state_badge(ui, pal, job.state);
-                        if let Some(e) = &job.error {
-                            r.on_hover_text(e);
-                        }
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 2.0;
+                            let r = state_badge(ui, pal, job.state);
+                            if let Some(e) = &job.error {
+                                r.on_hover_text(e);
+                            }
+                            if let Some((q, color)) = result_qualifier(pal, job) {
+                                ui.label(RichText::new(q).font(fonts::mono_id(10.5)).color(color));
+                            }
+                        });
                     });
                     row.col(|ui| {
                         ui.label(
@@ -772,6 +794,16 @@ fn history_tab(
                                 .font(fonts::mono_id(12.0))
                                 .color(pal.text),
                         );
+                    });
+                    row.col(|ui| match job.stats.finished_at {
+                        Some(t) => {
+                            ui.label(RichText::new(format::ago(t, now_unix)).small().color(pal.muted))
+                                .on_hover_text(format::timestamp_utc(t));
+                        }
+                        None => {
+                            ui.label(RichText::new("—").small().color(pal.faint))
+                                .on_hover_text("Finished before finish times were recorded");
+                        }
                     });
                     row.col(|ui| history_actions(ui, pal, job, &mut view.queue, actions));
                     let resp = row.response();
@@ -821,10 +853,12 @@ fn name_cell(
         )
         .on_hover_text(job.source_path.display().to_string());
         // While downloading at a measured speed the subline is the live figure (the
-        // destination stays on hover); a failed job's subline is its error.
+        // destination stays on hover); a failed job's subline is its error; a finished
+        // one's is how long it took and how fast it went.
         let (sub, color) = match (&job.error, job.state, live) {
             (Some(e), JobState::Failed, _) => (e.clone(), pal.negative),
             (_, _, Some(l)) => (l, pal.accent_fg),
+            (_, JobState::Done, _) if job.stats.download_ms >= 1000 => (finished_subline(job), pal.muted),
             _ => (job.dest_dir.display().to_string(), pal.muted),
         };
         ui.add(
@@ -833,6 +867,42 @@ fn name_cell(
                 .selectable(false),
         );
     });
+}
+
+/// `"8m 12s · 25.3 MB/s · extracted"` for a finished job (measured figures only).
+pub fn finished_subline(job: &Job) -> String {
+    let st = &job.stats;
+    let total_ms = st.download_ms + st.post_ms;
+    let mut parts = vec![format::duration_short(total_ms / 1000)];
+    if let Some(s) = st.avg_speed(job.bytes_done) {
+        parts.push(format::speed(s));
+    }
+    if let Some(o) = &st.outcome {
+        if o.extracted_to.is_some() {
+            parts.push("extracted".into());
+        }
+    }
+    parts.join("  ·  ")
+}
+
+/// The word under a history row's chip: what made the result what it is.
+fn result_qualifier(pal: &Palette, job: &Job) -> Option<(String, egui::Color32)> {
+    let o = job.stats.outcome.as_ref()?;
+    match job.state {
+        JobState::Failed => o.failure.map(|k| (k.label().to_string(), pal.negative)),
+        _ if o.repaired() => Some(("repaired".into(), pal.warning)),
+        _ if o.extracted_to.is_some() => Some(("extracted".into(), pal.muted)),
+        _ if o.verify.as_ref().is_some_and(|v| v.state == newskite_service::StepState::Ok) => {
+            Some(("verified".into(), pal.muted))
+        }
+        _ => None,
+    }
+}
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
 }
 
 fn progress_cell(ui: &mut Ui, pal: &Palette, data: &Data, job: &Job, width: f32, busy: Beat) {

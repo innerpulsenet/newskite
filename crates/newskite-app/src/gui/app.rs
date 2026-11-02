@@ -140,6 +140,16 @@ pub enum Action {
     ClearHistoryAndFiles,
     /// Remove a finished job and delete its download folder.
     DeleteJobFiles(i64),
+    /// Open a folder (or a file's folder) in the file manager.
+    OpenPath(PathBuf),
+    /// Open the application log file.
+    OpenLogFile,
+    /// Start editing a job's archive password (the row's inline editor).
+    EditPassword(i64),
+    /// Dismiss a toast.
+    DismissToast(u64),
+    /// Select a job and switch to the tab that lists it.
+    ShowJob(i64),
     /// Open a job's download folder in the file manager.
     OpenJobFolder(i64),
     /// Select a job (its details show in the Details dock) or clear the selection.
@@ -191,6 +201,12 @@ pub struct Data {
     pub queue_order: Vec<i64>,
     /// File rows of the selected job.
     pub selected_files: Vec<JobFile>,
+    /// The selected job's own log, oldest first.
+    pub selected_log: Vec<newskite_service::JobLogLine>,
+    /// Health of every server used this session.
+    pub servers: Vec<newskite_service::ServerHealth>,
+    /// Finish announcements, oldest first.
+    pub toasts: Vec<super::toast::Toast>,
     /// Free bytes on the download folder's filesystem, when it can be read.
     pub disk_free: Option<u64>,
     /// Log lines, newest first.
@@ -247,10 +263,11 @@ impl Data {
         v
     }
 
-    /// Finished jobs (done and failed), newest first.
+    /// Finished jobs (done and failed), most recently finished first (jobs finished
+    /// before finish times were recorded go by id).
     pub fn history(&self) -> Vec<&Job> {
         let mut v: Vec<&Job> = self.jobs.iter().filter(|j| !j.state.is_pending()).collect();
-        v.sort_by(|a, b| b.id.cmp(&a.id));
+        v.sort_by(|a, b| (b.stats.finished_at, b.id).cmp(&(a.stats.finished_at, a.id)));
         v
     }
 
@@ -294,6 +311,8 @@ pub struct ViewState {
     pub docks: docks::DockState,
     /// Queue tab state.
     pub queue: queue::QueueState,
+    /// Inspector (selected job) state.
+    pub inspector: super::inspector::InspectorState,
     /// Settings modal (open when `Some`).
     pub settings: Option<SettingsDraft>,
     /// A native dialog is open (prevents stacking dialogs).
@@ -366,6 +385,8 @@ pub struct NewskiteApp {
     /// The body of the last completion notification (also kept when notifications are
     /// off, so the behavior can be checked).
     pub last_notice: Option<String>,
+    /// Id of the newest toast.
+    toast_seq: u64,
     /// Frequent events folded by the forwarder thread (see [`super::events`]).
     pending: SharedPending,
     last_history_reload: Instant,
@@ -434,6 +455,7 @@ impl NewskiteApp {
                 open_nzb: OpenNzbState::default(),
                 docks: docks::DockState::default(),
                 queue: queue::QueueState::default(),
+                inspector: Default::default(),
                 settings: None,
                 dialog_open: false,
                 about_open: false,
@@ -447,6 +469,7 @@ impl NewskiteApp {
             notifications: config.notifications,
             finished_seen: HashSet::new(),
             last_notice: None,
+            toast_seq: 0,
             pending,
             last_history_reload: Instant::now(),
         };
@@ -513,6 +536,11 @@ impl NewskiteApp {
             Some(id) => self.service.job_files(id),
             None => Vec::new(),
         };
+        self.data.selected_log = match self.view.queue.selected {
+            Some(id) => self.service.job_log(id),
+            None => Vec::new(),
+        };
+        self.data.servers = self.service.server_health();
         let downloading: HashSet<i64> = self
             .data
             .jobs
@@ -648,7 +676,18 @@ impl NewskiteApp {
             }
             ServiceEvent::ShutdownCanceled => self.data.shutdown_secs = None,
             ServiceEvent::PostProgress(p) => self.data.status.post = Some(p),
-            ServiceEvent::JobFinished { .. } => *reload_jobs = true,
+            ServiceEvent::JobFinished { job_id, name, ok, detail } => {
+                self.toast_seq += 1;
+                self.data.toasts.push(super::toast::Toast {
+                    id: self.toast_seq,
+                    job_id,
+                    name,
+                    ok,
+                    detail,
+                    shown_at: None,
+                });
+                *reload_jobs = true;
+            }
         }
     }
 
@@ -755,6 +794,25 @@ impl NewskiteApp {
                 self.data.logs = self.service.logs();
             }
             Action::OpenJobFolder(id) => self.open_job_folder(id),
+            Action::OpenPath(p) => self.open_path(&p),
+            Action::OpenLogFile => {
+                let p = self.service.log_file_path();
+                self.open_path(&p);
+            }
+            Action::EditPassword(id) => {
+                self.view.queue.password_edit = Some((id, String::new()));
+                // The inline editor lives in the job's row.
+                if let Some(j) = self.data.jobs.iter().find(|j| j.id == id) {
+                    self.view.tab = if j.state.is_pending() { Tab::Queue } else { Tab::History };
+                }
+            }
+            Action::DismissToast(id) => self.data.toasts.retain(|t| t.id != id),
+            Action::ShowJob(id) => {
+                if let Some(j) = self.data.jobs.iter().find(|j| j.id == id) {
+                    self.view.tab = if j.state.is_pending() { Tab::Queue } else { Tab::History };
+                }
+                self.apply(Action::Select(Some(id)));
+            }
             Action::Select(id) => {
                 if self.view.queue.selected != id {
                     self.view.queue.selected = id;
@@ -762,6 +820,12 @@ impl NewskiteApp {
                         Some(id) => self.service.job_files(id),
                         None => Vec::new(),
                     };
+                    self.data.selected_log = match id {
+                        Some(id) => self.service.job_log(id),
+                        None => Vec::new(),
+                    };
+                    // A failed job opens on its problem, others on the overview.
+                    self.view.inspector.tab = super::inspector::InspectorTab::Overview;
                 }
             }
             Action::ScanWatch => {
@@ -969,6 +1033,13 @@ impl NewskiteApp {
                 LogLevel::Error,
                 format!("cannot open {} in the file manager: {e}", target.display()),
             );
+            self.data.logs = self.service.logs();
+        }
+    }
+
+    fn open_path(&mut self, p: &std::path::Path) {
+        if let Err(e) = open::that_detached(p) {
+            self.service.log(LogLevel::Error, format!("cannot open {}: {e}", p.display()));
             self.data.logs = self.service.logs();
         }
     }
@@ -1245,6 +1316,35 @@ impl NewskiteApp {
                 statusbar::show(ui, &pal, &self.data, self.reduced_motion, &mut actions)
             });
 
+        // The inspector is a full-height column on wide windows; the docks then keep the
+        // server card instead of the compact details.
+        let side = width >= super::inspector::SIDE_PANEL_MIN_WINDOW;
+        let selected_job = self.view.queue.selected.and_then(|id| self.data.jobs.iter().find(|j| j.id == id)).cloned();
+        if let (true, Some(job)) = (side, &selected_job) {
+            egui::SidePanel::right("inspector")
+                .resizable(true)
+                .default_width(super::inspector::PANEL_DEFAULT_W)
+                .min_width(super::inspector::PANEL_MIN_W)
+                .max_width((width * 0.45).max(super::inspector::PANEL_MIN_W))
+                .frame(
+                    egui::Frame::new()
+                        .fill(pal.raised)
+                        .inner_margin(egui::Margin::symmetric(16, 14))
+                        .stroke(egui::Stroke::new(1.0, pal.border)),
+                )
+                .show(ctx, |ui| {
+                    super::inspector::show(
+                        ui,
+                        &pal,
+                        &self.data,
+                        job,
+                        &mut self.view.inspector,
+                        self.reduced_motion,
+                        &mut actions,
+                    )
+                });
+        }
+
         // One panel id per arrangement so each keeps its own (user-resizable) height. The
         // 2×2 grid starts at a share of the window height, so a 600 px window still leaves
         // the queue a few rows.
@@ -1267,7 +1367,7 @@ impl NewskiteApp {
                     ui,
                     &pal,
                     &self.data,
-                    self.view.queue.selected,
+                    if side { None } else { self.view.queue.selected },
                     &mut self.view.docks,
                     self.reduced_motion,
                     &mut actions,
@@ -1305,6 +1405,8 @@ impl NewskiteApp {
         } else {
             motion::fade_reset(ctx, about::fade_id());
         }
+        let toast_bottom = ctx.content_rect().bottom() - 28.0;
+        super::toast::show(ctx, &pal, &mut self.data.toasts, toast_bottom, reduced, &mut actions);
         drop_overlay(ctx, &pal, reduced);
 
         self.actions.extend(actions);
@@ -1536,11 +1638,30 @@ fn completion_notice(jobs: &[Job], seen: &HashSet<i64>) -> Option<String> {
     }
     let done = new.iter().filter(|j| j.state == JobState::Done).count();
     let failed = new.len() - done;
-    Some(match (done, failed) {
+    let counts = match (done, failed) {
         (d, 0) => format!("{d} download{} finished", if d == 1 { "" } else { "s" }),
         (0, f) => format!("{f} download{} failed", if f == 1 { "" } else { "s" }),
         (d, f) => format!("{d} finished, {f} failed"),
-    })
+    };
+    // Failed ones first: they are the ones to act on.
+    let mut named: Vec<&Job> = new.clone();
+    named.sort_by_key(|j| (j.state != JobState::Failed, j.id));
+    let mut names: Vec<String> = named.iter().take(3).map(|j| j.name.clone()).collect();
+    if new.len() > 3 {
+        names.push(format!("and {} more", new.len() - 3));
+    }
+    Some(format!("{counts}: {}", names.join(", ")))
+}
+
+/// Title of a completion notification: it says whether anything needs attention (read
+/// from the counts before the names, so a job called "failed" cannot fool it).
+#[cfg_attr(not(all(unix, not(target_os = "macos"))), allow(dead_code))]
+fn notice_title(body: &str) -> &'static str {
+    if body.split(':').next().unwrap_or("").contains("failed") {
+        "Newskite: downloads need attention"
+    } else {
+        "Newskite: downloads complete"
+    }
 }
 
 /// Shows a desktop notification (Linux/BSD); a no-op elsewhere. Runs on its own thread
@@ -1553,7 +1674,7 @@ fn desktop_notify(body: String) {
             .spawn(move || {
                 if let Err(e) = notify_rust::Notification::new()
                     .appname(newskite_types::APP_NAME)
-                    .summary("Newskite queue finished")
+                    .summary(notice_title(&body))
                     .body(&body)
                     .icon(newskite_types::APP_ID)
                     .show()
@@ -1595,7 +1716,7 @@ mod tests {
         let jobs = vec![job(1, JobState::Failed)];
         assert_eq!(
             completion_notice(&jobs, &seen).as_deref(),
-            Some("1 download failed")
+            Some("1 download failed: j1")
         );
         seen.insert(1);
         assert_eq!(completion_notice(&jobs, &seen), None);
@@ -1607,7 +1728,7 @@ mod tests {
         let jobs = vec![job(1, JobState::Done)];
         assert_eq!(
             completion_notice(&jobs, &seen).as_deref(),
-            Some("1 download finished")
+            Some("1 download finished: j1")
         );
     }
 
@@ -1656,7 +1777,14 @@ mod tests {
         let seen = HashSet::from([1]);
         assert_eq!(
             completion_notice(&jobs, &seen).as_deref(),
-            Some("1 finished, 1 failed")
+            Some("1 finished, 1 failed: j3, j2")
+        );
+        assert_eq!(notice_title("1 finished, 1 failed: j3, j2"), "Newskite: downloads need attention");
+        assert_eq!(notice_title("2 downloads finished: a, b"), "Newskite: downloads complete");
+        let many: Vec<Job> = (1..=5).map(|i| job(i, JobState::Done)).collect();
+        assert_eq!(
+            completion_notice(&many, &HashSet::new()).as_deref(),
+            Some("5 downloads finished: j1, j2, j3, and 2 more")
         );
     }
 }

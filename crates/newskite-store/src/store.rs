@@ -119,7 +119,7 @@ fn job_from_row(row: &Row<'_>) -> rusqlite::Result<Job> {
             articles_total: from_db(row.get(14)?),
             articles_missing: from_db(row.get(15)?),
             // An outcome written by another build that no longer parses is dropped.
-            outcome: row.get::<_, Option<String>>(16)?.and_then(|s| serde_json::from_str(&s).ok()),
+            outcome: row.get::<_, Option<String>>(16)?.and_then(|s| serde_json::from_str(&s).ok()).map(Box::new),
         },
     })
 }

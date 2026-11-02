@@ -118,8 +118,8 @@ pub struct JobStats {
     pub articles_total: u64,
     /// Articles no server had in the last run.
     pub articles_missing: u64,
-    /// What happened when it last finished.
-    pub outcome: Option<newskite_types::JobOutcome>,
+    /// What happened when it last finished (boxed: most jobs in a list are pending).
+    pub outcome: Option<Box<newskite_types::JobOutcome>>,
 }
 
 impl JobStats {

@@ -190,7 +190,26 @@ pub fn show(
             let breath = beat.moving.then(|| beat.breath());
             let r = status_chip_live(ui, pal, state.status(), &state.text(), breath);
             if let Pill::Error(e) = &state {
-                r.on_hover_text(e);
+                // The chip opens the job that failed most recently.
+                let failed = data
+                    .jobs
+                    .iter()
+                    .filter(|j| j.state == newskite_service::JobState::Failed)
+                    .max_by_key(|j| (j.stats.finished_at, j.id));
+                match failed {
+                    Some(job) => {
+                        let r = r
+                            .interact(eframe::egui::Sense::click())
+                            .on_hover_cursor(eframe::egui::CursorIcon::PointingHand)
+                            .on_hover_text(format!("{e}\nClick to show {}", job.name));
+                        if r.clicked() {
+                            actions.push(Action::ShowJob(job.id));
+                        }
+                    }
+                    None => {
+                        r.on_hover_text(e);
+                    }
+                }
             }
             if data.totals.jobs_pending > 0 {
                 ui.label(

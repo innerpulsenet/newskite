@@ -174,9 +174,9 @@ intent is a focused NZB downloader: everything on screen is about the queue.
 ├──────────────────────────────────────────────────────────────────────────────┤
 │ TABS: Queue (n) | History (n)                              [Filter by name]  │
 │ summary: 3 jobs · 4.2 GB to go · about 21 min at 3.4 MB/s · 1 held           │
-│ #  Name / folder or live speed   State   Size   Progress   ▶/⏸ ↑ ⋯ ×          │
-├──────────────────────────────────────────────────────────────────────────────┤
-│ Throughput             │ Details (selection) / Server  │ Log  [All|Warn|Err]  │
+│ #  Name / folder or live speed   State   Size   Progress   ▶/⏸ ↑ ⋯ ×  │ INSP- │
+├─────────────────────────────────────────────────────────────────────┤ ECTOR │
+│ Throughput             │ Server (+ health)        │ Log [All|Warn|Err]│(sel.) │
 ├──────────────────────────────────────────────────────────────────────────────┤
 │ STATUS BAR: 128 GB free · 2.2 GB downloaded           N in queue  [Online]   │
 └──────────────────────────────────────────────────────────────────────────────┘
@@ -184,6 +184,8 @@ intent is a focused NZB downloader: everything on screen is about the queue.
 
 Rules:
 - The window resizes gracefully down to ~960×600; docks stack in one column below 900 px.
+- From 1100 px wide, a selected job opens the **Inspector** as a full-height right column;
+  narrower windows show the selection in the Details dock instead.
 - Empty states everywhere (no server, no jobs, no history) must render as readable text, never
   `NaN`, `Infinity`, `undefined`, or a blank panel.
 - All colors from theme tokens; all numbers formatted (e.g. `1.4 MB`, `0 B/s`).
@@ -218,20 +220,41 @@ Rules:
 - Empty state: "The queue is empty. Add an NZB to begin." with an Add NZB button.
 
 ### 6.2b History tab
-Done and failed jobs, newest first: `Name`, `Result`, `Size`, actions (open folder, retry and
-archive password for failed jobs, remove). Double-click opens the folder. `Clear history`
-with inline confirmation removes the rows (files stay on disk).
+Done and failed jobs, most recently finished first: `Name` (subline: total time and average
+speed, or the error), `Result` (chip plus what decided it: repaired / extracted / verified,
+or the failure kind), `Size`, `Finished` (relative; exact UTC time on hover), actions (open
+folder, retry and archive password for failed jobs, delete files, remove). Double-click
+opens the folder. `Clear history` with inline confirmation removes the rows (files stay on
+disk) or, via `Delete files too…` and a second confirmation, deletes their folders.
+
+### 6.2c Inspector (selected job)
+Header (state chip, name, NZB, open folder, close). Tabs:
+- **Overview** — for a failed job a problem card first (failure kind, the full selectable
+  reason, what to do, Retry / Set password / Servers / Copy error). Then the **lifecycle**:
+  Added → Download → Verify → Repair → Extract → Clean up → Done/Failed, each step marked
+  done, live (with its fraction and detail), needs-a-look, failed, skipped or waiting, with
+  its duration. Then **numbers** (size, average speed, time downloading and
+  post-processing, articles, missing, slices rebuilt, files cleaned up; only measured
+  values) and **where** (folder, extraction folder, NZB).
+- **Files** — per-file tracks, incomplete files first.
+- **Log** — the job's own log (kept across restarts, newest 500 lines), Copy log, Open log
+  file.
+
+Toasts in the lower right announce each finished (6 s) or failed (15 s) job, with Show.
 
 ### 6.3 Bottom docks (three, equal width)
 1. **Throughput** — current speed (live dot while bytes move), bytes left and time left;
    a live plot of the last 10 min over a 24 h history strip (two time axes never share one
    plot). One stored sample must still draw a visible (flat) trace.
-2. **Details** — with a selected job: state, name, progress, time left, folder (click opens),
-   NZB, password set, the error, and per-file progress rows. With no selection: **Server** —
-   `host:port`, TLS/Plain chip, username, fail-over count, connection slots (`effective /
-   max`), and tiles for articles fetched and missing this session and the lifetime total.
-3. **Log** — last ~50 lines, newest first, level filter (All / Warnings / Errors); three
-   columns (level mark, clock, text) so long lines wrap under their own text.
+2. **Server** — `host:port`, TLS/Plain chip, username, fail-over count, per-server health
+   this session (ok / errors / login refused; articles, not-on-server, errors; last error on
+   hover), connection slots (`effective / max`), and tiles for articles fetched and missing
+   this session and the lifetime total. On narrow windows a selected job shows here as
+   **Details** instead.
+3. **Log** — last 500 lines, newest first, level filter (All / Warnings / Errors); three
+   columns (level mark, clock, text) so long lines wrap under their own text. A line about
+   a job opens it. Everything is also written to `newskite.log` in the data folder
+   (rotated at 4 MB).
 
 All dock motion stops under reduced motion.
 

@@ -352,7 +352,7 @@ fn dock(
         ui.add_space(6.0);
         match which {
             Dock::Throughput => graph(ui, pal, c.data, c.motion),
-            Dock::Log => messages(ui, pal, &c.data.logs, state.log_filter, c.motion.animate),
+            Dock::Log => messages(ui, pal, c.data, state.log_filter, c.motion.animate, actions),
             Dock::Details => {
                 egui::ScrollArea::vertical()
                     .id_salt("dock-details")
@@ -890,6 +890,10 @@ fn activity(ui: &mut Ui, pal: &Palette, data: &Data, motion: Motion, actions: &m
                     ui.add_space(4.0);
                     identity(ui);
                 });
+                if !data.servers.is_empty() {
+                    ui.add_space(4.0);
+                    server_health(ui, pal, data);
+                }
                 ui.add_space(6.0);
                 eyebrow_row(
                     ui,
@@ -907,7 +911,58 @@ fn activity(ui: &mut Ui, pal: &Palette, data: &Data, motion: Motion, actions: &m
     }
 }
 
-fn clock(ts: i64) -> String {
+/// One line per server used this session: a status glyph, the address and what it
+/// delivered; the last error on hover. Counts come from the engine, never estimates.
+fn server_health(ui: &mut Ui, pal: &Palette, data: &Data) {
+    let now = now_secs();
+    for h in &data.servers {
+        // Errors in the last five minutes make a server "struggling".
+        let recent = h.last_error.as_ref().is_some_and(|(t, _)| now - t < 300);
+        let (icon, color, state) = match (&h.unusable, recent) {
+            (Some(_), _) => (Icon::StatusErr, pal.negative, "login refused".to_string()),
+            (None, true) => (Icon::StatusWarn, pal.warning, "errors".to_string()),
+            (None, false) => (Icon::StatusOk, pal.positive, "ok".to_string()),
+        };
+        let resp = ui
+            .horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                let (r, _) = ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
+                paint_icon(ui.painter(), r, icon, color);
+                // With one server its address is right above; name it only among several.
+                let label = if data.servers.len() > 1 { h.address.clone() } else { format!("Health: {state}") };
+                ui.label(RichText::new(label).font(fonts::mono_id(11.5)).color(pal.text));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let mut parts = vec![format!("{} art", h.articles)];
+                    if h.missing > 0 {
+                        parts.push(format!("{} missing", h.missing));
+                    }
+                    if h.errors > 0 {
+                        parts.push(format!("{} err", h.errors));
+                    }
+                    let c = if h.errors > 0 || h.missing > 0 { pal.warning } else { pal.muted };
+                    ui.label(RichText::new(parts.join(" · ")).font(fonts::mono_id(10.5)).color(c));
+                });
+            })
+            .response;
+        let mut tip = format!(
+            "{}: {state}\n{} articles, {} received\n{} not on this server, {} errors",
+            h.address,
+            h.articles,
+            format::bytes(h.bytes),
+            h.missing,
+            h.errors
+        );
+        if let Some(why) = &h.unusable {
+            tip.push_str(&format!("\nRefused: {why}"));
+        }
+        if let Some((t, e)) = &h.last_error {
+            tip.push_str(&format!("\nLast error at {}: {e}", clock(*t)));
+        }
+        resp.on_hover_text(tip);
+    }
+}
+
+pub fn clock(ts: i64) -> String {
     use chrono::TimeZone;
     match chrono::Local.timestamp_opt(ts, 0) {
         chrono::LocalResult::Single(t) | chrono::LocalResult::Ambiguous(t, _) => {
@@ -928,7 +983,8 @@ fn level_color(pal: &Palette, level: LogLevel) -> Color32 {
 /// Messages, newest first, in three columns: a level mark, the clock, the text (which
 /// wraps under itself, never under the clock). A line seen for the first time after the
 /// dock's first frame carries an accent band that fades out.
-fn messages(ui: &mut Ui, pal: &Palette, logs: &[LogLine], filter: LogFilter, animate: bool) {
+fn messages(ui: &mut Ui, pal: &Palette, data: &Data, filter: LogFilter, animate: bool, actions: &mut Vec<Action>) {
+    let logs = &data.logs;
     if logs.is_empty() {
         ui.label(RichText::new("No messages yet").color(pal.muted));
         return;
@@ -1003,8 +1059,26 @@ fn messages(ui: &mut Ui, pal: &Palette, logs: &[LogLine], filter: LogFilter, ani
                             );
                         });
                     })
-                    .response
-                    .rect;
+                    .response;
+                // A line about a job opens that job.
+                if let Some(job) = line.job_id.and_then(|id| data.jobs.iter().find(|j| j.id == id)) {
+                    let click = ui
+                        .interact(row.rect, row.id.with("open"), Sense::click())
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .on_hover_text(format!("Show {}", job.name));
+                    if click.hovered() {
+                        ui.painter().rect_stroke(
+                            row.rect.expand(1.0),
+                            CornerRadius::same(3),
+                            Stroke::new(1.0, pal.border_strong),
+                            StrokeKind::Outside,
+                        );
+                    }
+                    if click.clicked() {
+                        actions.push(Action::ShowJob(job.id));
+                    }
+                }
+                let row = row.rect;
                 if fade > 0.0 {
                     ui.painter().rect_filled(
                         row.expand2(Vec2::new(2.0, 1.0)),

@@ -119,7 +119,7 @@ impl Drop for RunGuard {
 }
 
 enum Pick {
-    Job(Job, CancellationToken),
+    Job(Box<Job>, CancellationToken),
     End(End),
 }
 
@@ -167,7 +167,7 @@ async fn run_queue(inner: &Arc<Inner>, guard: &mut RunGuard) {
                         st.job_cancel = Some(token.clone());
                         st.removed_active = false;
                         st.stop_active = None;
-                        Pick::Job(job, token)
+                        Pick::Job(Box::new(job), token)
                     }
                 }
             };
@@ -184,7 +184,7 @@ async fn run_queue(inner: &Arc<Inner>, guard: &mut RunGuard) {
                 let id = job.id;
                 requeued.remove(&id);
                 attempted.insert(id);
-                let outcome = process_job(inner, job, servers, &settings, token).await;
+                let outcome = process_job(inner, *job, servers, &settings, token).await;
                 if outcome.interrupted {
                     requeued.insert(id);
                 } else {
