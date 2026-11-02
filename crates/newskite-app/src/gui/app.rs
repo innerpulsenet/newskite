@@ -154,6 +154,8 @@ pub enum Action {
     ClearHistoryAndFiles,
     /// Remove a finished job and delete its download folder.
     DeleteJobFiles(i64),
+    /// Set the speed limit in KiB/s (0 = unlimited): saved, and in force at once.
+    SetSpeedLimit(u64),
     /// Open a folder (or a file's folder) in the file manager.
     OpenPath(PathBuf),
     /// Show a file selected in its folder in the file manager (the folder alone when the
@@ -956,6 +958,11 @@ impl NewskiteApp {
                 self.data.logs = self.service.logs();
             }
             Action::OpenJobFolder(id) => self.open_job_folder(id),
+            Action::SetSpeedLimit(kbps) => {
+                let _ = self.service.set_speed_limit_kbps(kbps);
+                self.data.settings = self.service.settings();
+                self.data.logs = self.service.logs();
+            }
             Action::OpenPath(p) => self.open_path(&p),
             Action::RevealPath(p) => self.reveal_path(&p),
             Action::OpenLogFile => {

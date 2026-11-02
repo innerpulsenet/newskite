@@ -389,7 +389,7 @@ async fn speed_limit_is_respected() {
     let server = mock(articles_of([&src]), false).await;
     let dir = tempfile::tempdir().unwrap();
     let mut opts = options(4);
-    opts.speed_limit_bps = 256 * 1024;
+    opts.speed_limit = newskite_engine::SpeedLimit::new(256 * 1024);
     let started = Instant::now();
     let out = run(nzb_of(vec![src.nzb_file(None)]), dir.path(), vec![server_for(&server, false, 4)], opts).await;
     let elapsed = started.elapsed();

@@ -133,7 +133,7 @@ way as transcripts (password, and usernames of 3+ characters, shown as `***`).
 
 ## newskite-engine — job download
 ```rust
-pub struct EngineOptions { pub connections: usize, pub retries: u32, pub speed_limit_bps: u64 /*0=unlimited*/,
+pub struct EngineOptions { pub connections: usize, pub retries: u32, pub speed_limit: SpeedLimit /*live; 0=unlimited*/,
                            pub connect_timeout: Duration, pub skip_files: HashSet<String> /* filenames already complete */ }
 pub struct DownloadRequest { pub nzb: Nzb, pub dest_dir: PathBuf, pub servers: Vec<ServerConfig> /* usable, ordered */, pub options: EngineOptions }
 pub struct FileReport { pub name: String, pub path: PathBuf, pub bytes: u64, pub missing: Vec<String>, pub crc_errors: usize }
@@ -662,4 +662,17 @@ free-space reading only on the rail. `SettingsDraft::make_primary(i)` moves a se
 (and its row id) to the top; server cards are titled `Server N` with `primary` /
 `fail-over` beside it (the address is in the fields). The failover snapshots use a fixed
 local clock (`failover_t0`).
+
+Live speed limit (additive). `newskite_engine::SpeedLimit` (Clone shares one `AtomicU64` of
+bytes per second, 0 = unlimited; `new`, `get`, `set`; compared by value) replaces
+`EngineOptions::speed_limit_bps`. Every job's `RateLimiter` reads it on each step, so a
+change reaches running downloads within one wait (at most 250 ms); raising or lifting it
+releases a waiting worker at the new rate. The service keeps one (`Inner::speed_limit`)
+equal to the effective settings' limit: set at open, on `save_settings`, on
+`set_runtime_settings_override`, and at each job's start. New pub items:
+`Service::{speed_limit_bps, set_speed_limit_kbps}` (saves the setting; with unreadable
+settings it applies for the session only and returns the load error) and
+`Action::SetSpeedLimit(kbps)`. The status bar's activity reading opens a menu
+(`statusbar::SPEED_PRESETS`: Unlimited, 50, 25, 10, 5, 1 MB/s, the current custom value,
+"Other limit…" to Settings) and shows `limit …` in place of `peak …` while one is set.
 

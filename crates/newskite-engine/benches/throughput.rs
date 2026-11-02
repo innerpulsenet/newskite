@@ -84,7 +84,7 @@ fn main() {
             let options = EngineOptions {
                 connections,
                 retries: 1,
-                speed_limit_bps: 0,
+                speed_limit: newskite_engine::SpeedLimit::default(),
                 connect_timeout: Duration::from_secs(5),
                 skip_files: HashSet::new(),
             };

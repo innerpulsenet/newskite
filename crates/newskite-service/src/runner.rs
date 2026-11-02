@@ -375,10 +375,13 @@ async fn download_job(
         );
     }
 
+    // The shared limit follows the settings this job starts with; changes while it runs
+    // (Settings, the status bar) reach it through the same value.
+    inner.speed_limit.set(settings.speed_limit_bps());
     let options = EngineOptions {
         connections,
         retries: settings.retries,
-        speed_limit_bps: settings.speed_limit_bps(),
+        speed_limit: inner.speed_limit.clone(),
         connect_timeout: crate::CONNECT_TIMEOUT,
         skip_files,
     };

@@ -169,9 +169,39 @@ pub fn activity_reading(data: &Data) -> String {
     } else {
         "Idle".to_owned()
     };
-    match peak_speed(data) {
-        0 => head,
-        peak => format!("{head}  ·  peak {}", format::speed(peak)),
+    // A limit in force says so in place of the record second.
+    match (data.settings.speed_limit_bps(), peak_speed(data)) {
+        (0, 0) => head,
+        (0, peak) => format!("{head}  ·  peak {}", format::speed(peak)),
+        (limit, _) => format!("{head}  ·  limit {}", format::speed(limit)),
+    }
+}
+
+/// The speed limits offered from the status bar, in KiB/s (0 = unlimited).
+pub const SPEED_PRESETS: [u64; 6] = [0, 50 * 1024, 25 * 1024, 10 * 1024, 5 * 1024, 1024];
+
+/// The status bar's speed menu: the presets (the one in force checked), the current
+/// limit when it is none of them, and the way to Settings for another.
+fn speed_menu(ui: &mut Ui, pal: &Palette, data: &Data, actions: &mut Vec<Action>) {
+    ui.set_min_width(170.0);
+    ui.label(RichText::new("Speed limit").small().color(pal.muted));
+    let current = data.settings.speed_limit_kbps;
+    let label = |kbps: u64| if kbps == 0 { "Unlimited".to_owned() } else { format::speed(kbps.saturating_mul(1024)) };
+    for kbps in SPEED_PRESETS {
+        if ui.add(egui::Button::selectable(current == kbps, label(kbps))).clicked() {
+            if current != kbps {
+                actions.push(Action::SetSpeedLimit(kbps));
+            }
+            ui.close();
+        }
+    }
+    if !SPEED_PRESETS.contains(&current) {
+        let _ = ui.add(egui::Button::selectable(true, label(current)));
+    }
+    ui.separator();
+    if ui.button("Other limit…").clicked() {
+        actions.push(Action::OpenSettings);
+        ui.close();
     }
 }
 
@@ -373,7 +403,18 @@ pub fn show(
         let moving = st.running && data.speed() > 0;
         let (glyph, _) = ui.allocate_exact_size(Vec2::new(14.0, 12.0), Sense::hover());
         paint_pulse(ui.painter(), glyph, if moving { pal.accent_fg } else { pal.faint });
-        ui.label(RichText::new(reading).font(mono.clone()).color(if moving { pal.text } else { pal.muted }));
+        // The reading opens the speed limit menu; it applies to running downloads at once.
+        let limit = data.settings.speed_limit_bps();
+        let tip = if limit == 0 {
+            "No speed limit. Click to set one".to_owned()
+        } else {
+            format!("Downloads are limited to {}. Click to change", format::speed(limit))
+        };
+        let r = ui
+            .add(egui::Label::new(RichText::new(reading).font(mono.clone()).color(if moving { pal.text } else { pal.muted })).sense(Sense::click()).selectable(false))
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text(tip);
+        egui::Popup::menu(&r).show(|ui| speed_menu(ui, pal, data, actions));
         ui.add_space(6.0);
         sparkline(ui, pal, data, reduced_motion);
 
@@ -542,6 +583,10 @@ mod tests {
         assert!(activity_reading(&d).starts_with("Pausing  ·  "));
         d.status.running = false;
         assert!(activity_reading(&d).starts_with("Paused  ·  peak"));
+        // A limit in force replaces the record second.
+        d.settings.speed_limit_kbps = 25 * 1024;
+        assert_eq!(activity_reading(&d), "Paused  ·  limit 25.0 MB/s");
+        d.settings.speed_limit_kbps = 0;
 
         d.settings.servers[0].host = String::new();
         assert_eq!(servers_reading(&d), None);

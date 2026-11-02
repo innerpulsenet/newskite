@@ -55,7 +55,8 @@
 //!   server has failed authentication the job stops with [`EngineError::AuthFailed`].
 //! * **CRC mismatches** are counted per file ([`FileReport::crc_errors`]) but the data is
 //!   kept, since PAR2 may repair it.
-//! * **Speed limit**: a token bucket shared by all workers (bursts of one segment).
+//! * **Speed limit**: a token bucket shared by all workers (bursts of one segment), following
+//!   a [`SpeedLimit`] that can be changed while the job runs.
 //! * **Cancellation** stops all workers promptly and returns [`EngineError::Cancelled`];
 //!   partial `.nkpart` files are left in place.
 //! * **Resume**: `skip_files` lists output names completed by earlier runs. A file is skipped
@@ -106,6 +107,7 @@ use newskite_types::{EngineEvent, ServerConfig};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
+pub use limiter::SpeedLimit;
 pub use pool::{ConnectionPool, POOL_IDLE_MAX};
 
 /// Extension (without the dot) of in-progress output files: `<name>.nkpart`.
@@ -124,8 +126,9 @@ pub struct EngineOptions {
     pub connections: usize,
     /// Extra attempts per segment after a transient error.
     pub retries: u32,
-    /// Bytes per second across the whole job; 0 = unlimited.
-    pub speed_limit_bps: u64,
+    /// Bytes per second across the whole job (0 = unlimited), read as the job runs:
+    /// [`SpeedLimit::set`] on a clone changes it mid-download.
+    pub speed_limit: SpeedLimit,
     /// Bound for TCP connect + TLS + greeting + authentication.
     pub connect_timeout: Duration,
     /// Output file names already completed by an earlier run (resume), as reported in
@@ -138,7 +141,7 @@ impl Default for EngineOptions {
         Self {
             connections: 8,
             retries: 2,
-            speed_limit_bps: 0,
+            speed_limit: SpeedLimit::default(),
             connect_timeout: Duration::from_secs(30),
             skip_files: HashSet::new(),
         }

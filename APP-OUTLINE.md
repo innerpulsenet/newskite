@@ -129,7 +129,8 @@ Each feature lists: what it does, rules, and edge cases the implementation must 
   primary or a fail-over; a "Test" action that performs a real NNTP handshake and shows the raw reply
   (accepts a `DATE`-style command).
 - **Downloads**: download folder, watch folder, watch enabled.
-- **Performance**: max connections, speed limit (KiB/s, 0 = unlimited).
+- **Performance**: max connections, speed limit (KiB/s, 0 = unlimited; applies to running
+  downloads at once, and can also be set from the status bar).
 - **Automation**: auto-shutdown when the queue empties (with a visible countdown, cancellable).
 - Settings persist as JSON; the **first enabled server with a non-empty host** is used for runs.
 - Passwords are stored locally; document the storage (plain JSON is acceptable for a rewrite, but
@@ -282,7 +283,9 @@ Left: a state dot (Online, Downloading, Pausing, Paused, No server, or the error
 servers a run uses (`2 servers · 20 TLS`; hovering shows each server's health this
 session); with no server, a link to Settings; on an error, the cause (a click opens the
 failed job). Center: what the queue is doing (`Downloading · 18.4 MB/s`, `Paused`, `Idle`)
-and the fastest second on record (`peak …`) beside a sparkline of the last 10 min (or the
+and the fastest second on record (`peak …`), or the speed limit while one is set
+(`limit …`); a click opens the speed limit presets (Unlimited, 50/25/10/5/1 MB/s, other),
+which apply at once. Beside it a sparkline of the last 10 min (or the
 stored 24 h); hovering it shows the throughput graph: the live plot over the 24 h history
 strip (two time axes never share one plot; one stored sample still draws a visible, flat
 trace). Right: free space on the download folder's filesystem while the sidebar is a rail

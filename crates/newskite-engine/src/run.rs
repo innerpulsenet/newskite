@@ -182,7 +182,7 @@ struct Shared {
     skip_files: HashSet<String>,
     retries: u32,
     connect_timeout: Duration,
-    limiter: Option<RateLimiter>,
+    limiter: RateLimiter,
     events: UnboundedSender<EngineEvent>,
     progress: Arc<Progress>,
     /// Child of the caller's token; also fired on fatal errors.
@@ -451,7 +451,7 @@ pub(crate) async fn run(
         skip_files: options.skip_files,
         retries: options.retries,
         connect_timeout: options.connect_timeout,
-        limiter: RateLimiter::new(options.speed_limit_bps),
+        limiter: RateLimiter::new(options.speed_limit),
         events,
         progress,
         abort: cancel.child_token(),
@@ -761,10 +761,10 @@ async fn process_segment(shared: &Arc<Shared>, held: &mut Option<Held>, st: &mut
         match res {
             Ok(raw) => {
                 let received = raw.len() as u64;
-                if let Some(limiter) = &shared.limiter {
+                if shared.limiter.limited() {
                     tokio::select! {
                         _ = shared.abort.cancelled() => return Flow::Stop,
-                        _ = limiter.acquire(raw.len()) => {}
+                        _ = shared.limiter.acquire(raw.len()) => {}
                     }
                 }
                 let checked = {
@@ -1290,7 +1290,7 @@ mod tests {
             skip_files: HashSet::new(),
             retries: 0,
             connect_timeout: Duration::from_secs(1),
-            limiter: None,
+            limiter: RateLimiter::new(crate::SpeedLimit::default()),
             events: tx,
             progress: Arc::new(Progress::new()),
             abort: CancellationToken::new(),
@@ -1322,7 +1322,7 @@ mod tests {
             skip_files: HashSet::new(),
             retries: 0,
             connect_timeout: Duration::from_secs(1),
-            limiter: None,
+            limiter: RateLimiter::new(crate::SpeedLimit::default()),
             events: tx,
             progress: Arc::new(Progress::new()),
             abort: CancellationToken::new(),
@@ -1361,7 +1361,7 @@ mod tests {
             skip_files: HashSet::new(),
             retries: 0,
             connect_timeout: Duration::from_secs(1),
-            limiter: None,
+            limiter: RateLimiter::new(crate::SpeedLimit::default()),
             events: tx,
             progress: Arc::new(Progress::new()),
             abort: CancellationToken::new(),
