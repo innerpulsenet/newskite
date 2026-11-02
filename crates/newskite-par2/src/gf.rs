@@ -80,32 +80,294 @@ pub(crate) fn input_constants(count: usize) -> Vec<u16> {
     out
 }
 
-/// Products of one constant with every low and high byte, so a word multiplies with two
-/// lookups.
+/// Products of one constant `c` with every nibble of a word: `nib[i][x]` is the low byte
+/// of `c * (x << 4i)` and `nib[4 + i][x]` its high byte, for nibble position `i` in `0..4`.
+/// Each 16-entry table fits one SIMD shuffle register; the scalar path widens them to
+/// byte tables.
+#[repr(align(64))]
 pub(crate) struct MulTable {
-    lo: [u16; 256],
-    hi: [u16; 256],
+    nib: [[u8; 16]; 8],
 }
 
 impl MulTable {
     pub(crate) fn new(c: u16) -> Self {
+        // Multiplication by `c` is linear over GF(2): the product of a nibble is the XOR
+        // of the products of its set bits, so 16 doublings and one XOR per entry suffice.
+        let mut nib = [[0u8; 16]; 8];
+        let mut p = c as u32;
+        for i in 0..4 {
+            let mut bit = [0u16; 4];
+            for b in &mut bit {
+                *b = p as u16;
+                p <<= 1;
+                if p & 0x10000 != 0 {
+                    p ^= POLY;
+                }
+            }
+            let mut v = [0u16; 16];
+            for x in 1..16usize {
+                v[x] = v[x & (x - 1)] ^ bit[x.trailing_zeros() as usize];
+                nib[i][x] = v[x] as u8;
+                nib[4 + i][x] = (v[x] >> 8) as u8;
+            }
+        }
+        Self { nib }
+    }
+
+    /// `c * w` from the nibble tables (eight lookups).
+    #[inline]
+    fn word(&self, w: u16) -> u16 {
+        let w = w as usize;
+        let (n0, n1, n2, n3) = (w & 15, (w >> 4) & 15, (w >> 8) & 15, w >> 12);
+        let lo = self.nib[0][n0] ^ self.nib[1][n1] ^ self.nib[2][n2] ^ self.nib[3][n3];
+        let hi = self.nib[4][n0] ^ self.nib[5][n1] ^ self.nib[6][n2] ^ self.nib[7][n3];
+        u16::from_le_bytes([lo, hi])
+    }
+
+    /// Products with every low byte and every high byte of a word (two lookups per word).
+    fn bytes(&self) -> ([u16; 256], [u16; 256]) {
         let mut lo = [0u16; 256];
         let mut hi = [0u16; 256];
-        for b in 0..256u16 {
-            lo[b as usize] = mul(c, b);
-            hi[b as usize] = mul(c, b << 8);
+        for b in 0..256usize {
+            lo[b] = self.word(b as u16);
+            hi[b] = self.word((b as u16) << 8);
         }
-        Self { lo, hi }
+        (lo, hi)
     }
 }
 
-/// `dst ^= c * src` word by word (`t` is `c`'s table). Lengths must match and be even.
+/// A `mul_acc` implementation the running CPU supports. Only [`Kernel::best`] and
+/// [`Kernel::available`] create values, after checking the CPU features, which is what
+/// makes calling the SIMD paths sound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Kernel(KernelKind);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KernelKind {
+    Scalar,
+    #[cfg(target_arch = "x86_64")]
+    Ssse3,
+    #[cfg(target_arch = "x86_64")]
+    Avx2,
+}
+
+impl Kernel {
+    /// The fastest kernel for this CPU (detected once).
+    pub(crate) fn best() -> Kernel {
+        static BEST: OnceLock<Kernel> = OnceLock::new();
+        *BEST.get_or_init(|| *Kernel::available().last().expect("scalar is always available"))
+    }
+
+    /// Every kernel this CPU can run, slowest (the portable scalar one) first.
+    pub(crate) fn available() -> Vec<Kernel> {
+        #[allow(unused_mut)]
+        let mut out = vec![Kernel(KernelKind::Scalar)];
+        #[cfg(target_arch = "x86_64")]
+        {
+            if std::arch::is_x86_feature_detected!("ssse3") {
+                out.push(Kernel(KernelKind::Ssse3));
+            }
+            if std::arch::is_x86_feature_detected!("avx2") {
+                out.push(Kernel(KernelKind::Avx2));
+            }
+        }
+        out
+    }
+
+    /// Short name for benchmarks and logs.
+    #[allow(dead_code)]
+    pub(crate) fn name(self) -> &'static str {
+        match self.0 {
+            KernelKind::Scalar => "scalar",
+            #[cfg(target_arch = "x86_64")]
+            KernelKind::Ssse3 => "ssse3",
+            #[cfg(target_arch = "x86_64")]
+            KernelKind::Avx2 => "avx2",
+        }
+    }
+
+    /// Bytes per [`mul_acc`](Self::mul_acc) call that make its fixed cost negligible
+    /// while staying small enough for the first-level cache. The scalar path widens its
+    /// tables on every call, so it wants longer runs.
+    pub(crate) fn block(self) -> usize {
+        match self.0 {
+            KernelKind::Scalar => 32 << 10,
+            #[cfg(target_arch = "x86_64")]
+            KernelKind::Ssse3 | KernelKind::Avx2 => 4 << 10,
+        }
+    }
+
+    /// `dst ^= c * src` word by word (`t` is `c`'s table). Lengths must match and be even.
+    pub(crate) fn mul_acc(self, dst: &mut [u8], src: &[u8], t: &MulTable) {
+        assert_eq!(dst.len(), src.len(), "mul_acc needs equal lengths");
+        debug_assert!(dst.len().is_multiple_of(2), "mul_acc works on whole words");
+        match self.0 {
+            KernelKind::Scalar => mul_acc_scalar(dst, src, t),
+            // SAFETY: a `Kernel` with this kind exists only when `available` saw the CPU
+            // report SSSE3 (and AVX2 below).
+            #[cfg(target_arch = "x86_64")]
+            KernelKind::Ssse3 => unsafe { x86::mul_acc_ssse3(dst, src, t) },
+            #[cfg(target_arch = "x86_64")]
+            KernelKind::Avx2 => unsafe { x86::mul_acc_avx2(dst, src, t) },
+        }
+    }
+}
+
+/// `dst ^= c * src` word by word (`t` is `c`'s table) with the fastest kernel. Lengths
+/// must match and be even.
 pub(crate) fn mul_acc(dst: &mut [u8], src: &[u8], t: &MulTable) {
-    debug_assert_eq!(dst.len(), src.len());
-    for (d, s) in dst.chunks_exact_mut(2).zip(src.chunks_exact(2)) {
-        let p = t.lo[s[0] as usize] ^ t.hi[s[1] as usize];
+    Kernel::best().mul_acc(dst, src, t);
+}
+
+/// The portable path. Long runs widen the nibble tables to byte tables first (two
+/// lookups per word, four words per step); short ones (SIMD tails) use the nibble tables.
+fn mul_acc_scalar(dst: &mut [u8], src: &[u8], t: &MulTable) {
+    if dst.len() < 1024 {
+        for (d, s) in dst.chunks_exact_mut(2).zip(src.chunks_exact(2)) {
+            let p = t.word(u16::from_le_bytes([s[0], s[1]]));
+            d[0] ^= p as u8;
+            d[1] ^= (p >> 8) as u8;
+        }
+        return;
+    }
+    let (lo, hi) = t.bytes();
+    let mut d8 = dst.chunks_exact_mut(8);
+    let mut s8 = src.chunks_exact(8);
+    for (d, s) in (&mut d8).zip(&mut s8) {
+        let w = u64::from_le_bytes(s.try_into().expect("8 bytes"));
+        let word = |k: u32| {
+            let p = lo[(w >> (16 * k)) as u8 as usize] ^ hi[(w >> (16 * k + 8)) as u8 as usize];
+            (p as u64) << (16 * k)
+        };
+        let p = word(0) | word(1) | word(2) | word(3);
+        let v = u64::from_le_bytes((&*d).try_into().expect("8 bytes")) ^ p;
+        d.copy_from_slice(&v.to_le_bytes());
+    }
+    for (d, s) in d8.into_remainder().chunks_exact_mut(2).zip(s8.remainder().chunks_exact(2)) {
+        let p = lo[s[0] as usize] ^ hi[s[1] as usize];
         d[0] ^= p as u8;
         d[1] ^= (p >> 8) as u8;
+    }
+}
+
+/// x86-64 SIMD kernels: the split-nibble technique. The low and high bytes of 16 (SSSE3)
+/// or 32 (AVX2) words are gathered into one register each, each nibble indexes a 16-entry
+/// table of partial products with one `pshufb`, the partial products are XORed, and the
+/// low and high result bytes are interleaved back into words.
+#[cfg(target_arch = "x86_64")]
+mod x86 {
+    use std::arch::x86_64::*;
+
+    use super::{mul_acc_scalar, MulTable};
+
+    /// AVX2: 64 bytes (32 words) per step; the rest goes through the scalar path.
+    ///
+    /// Only call this when the CPU supports AVX2 (`Kernel` guarantees it).
+    #[target_feature(enable = "avx2")]
+    pub(super) fn mul_acc_avx2(dst: &mut [u8], src: &[u8], t: &MulTable) {
+        // Each 16-entry table repeated in both 128-bit lanes (pshufb looks up per lane).
+        let tab = |i: usize| {
+            // SAFETY: `t.nib[i]` is 16 readable bytes; unaligned loads are allowed.
+            let v = unsafe { _mm_loadu_si128(t.nib[i].as_ptr().cast()) };
+            _mm256_broadcastsi128_si256(v)
+        };
+        let (l0, l1, l2, l3) = (tab(0), tab(1), tab(2), tab(3));
+        let (h0, h1, h2, h3) = (tab(4), tab(5), tab(6), tab(7));
+        let nibble = _mm256_set1_epi8(0x0f);
+        let low_byte = _mm256_set1_epi16(0x00ff);
+        let len = dst.len().min(src.len());
+        let whole = len - len % 64;
+        let mut i = 0;
+        while i < whole {
+            // SAFETY: `i + 64 <= whole <= len`, so both 32-byte loads from `src` and the
+            // loads/stores at `dst` stay inside the slices; unaligned access is allowed.
+            let (a, b, da, db) = unsafe {
+                (
+                    _mm256_loadu_si256(src.as_ptr().add(i).cast()),
+                    _mm256_loadu_si256(src.as_ptr().add(i + 32).cast()),
+                    _mm256_loadu_si256(dst.as_ptr().add(i).cast()),
+                    _mm256_loadu_si256(dst.as_ptr().add(i + 32).cast()),
+                )
+            };
+            // Low and high bytes of the 32 words. packus works per 128-bit lane, so the
+            // word order is a0 b0 a1 b1 (lane halves); the unpacks below undo exactly that.
+            let lo = _mm256_packus_epi16(_mm256_and_si256(a, low_byte), _mm256_and_si256(b, low_byte));
+            let hi = _mm256_packus_epi16(_mm256_srli_epi16::<8>(a), _mm256_srli_epi16::<8>(b));
+            let n0 = _mm256_and_si256(lo, nibble);
+            let n1 = _mm256_and_si256(_mm256_srli_epi16::<4>(lo), nibble);
+            let n2 = _mm256_and_si256(hi, nibble);
+            let n3 = _mm256_and_si256(_mm256_srli_epi16::<4>(hi), nibble);
+            let plo = _mm256_xor_si256(
+                _mm256_xor_si256(_mm256_shuffle_epi8(l0, n0), _mm256_shuffle_epi8(l1, n1)),
+                _mm256_xor_si256(_mm256_shuffle_epi8(l2, n2), _mm256_shuffle_epi8(l3, n3)),
+            );
+            let phi = _mm256_xor_si256(
+                _mm256_xor_si256(_mm256_shuffle_epi8(h0, n0), _mm256_shuffle_epi8(h1, n1)),
+                _mm256_xor_si256(_mm256_shuffle_epi8(h2, n2), _mm256_shuffle_epi8(h3, n3)),
+            );
+            // Interleaving low/high bytes per lane yields a's 16 words, then b's.
+            let pa = _mm256_unpacklo_epi8(plo, phi);
+            let pb = _mm256_unpackhi_epi8(plo, phi);
+            // SAFETY: as for the loads above.
+            unsafe {
+                _mm256_storeu_si256(dst.as_mut_ptr().add(i).cast(), _mm256_xor_si256(da, pa));
+                _mm256_storeu_si256(dst.as_mut_ptr().add(i + 32).cast(), _mm256_xor_si256(db, pb));
+            }
+            i += 64;
+        }
+        mul_acc_scalar(&mut dst[whole..len], &src[whole..len], t);
+    }
+
+    /// SSSE3: 32 bytes (16 words) per step; the rest goes through the scalar path.
+    ///
+    /// Only call this when the CPU supports SSSE3 (`Kernel` guarantees it).
+    #[target_feature(enable = "ssse3")]
+    pub(super) fn mul_acc_ssse3(dst: &mut [u8], src: &[u8], t: &MulTable) {
+        // SAFETY: `t.nib[i]` is 16 readable bytes; unaligned loads are allowed.
+        let tab = |i: usize| unsafe { _mm_loadu_si128(t.nib[i].as_ptr().cast()) };
+        let (l0, l1, l2, l3) = (tab(0), tab(1), tab(2), tab(3));
+        let (h0, h1, h2, h3) = (tab(4), tab(5), tab(6), tab(7));
+        let nibble = _mm_set1_epi8(0x0f);
+        let low_byte = _mm_set1_epi16(0x00ff);
+        let len = dst.len().min(src.len());
+        let whole = len - len % 32;
+        let mut i = 0;
+        while i < whole {
+            // SAFETY: `i + 32 <= whole <= len`, so both 16-byte loads from `src` and the
+            // loads/stores at `dst` stay inside the slices; unaligned access is allowed.
+            let (a, b, da, db) = unsafe {
+                (
+                    _mm_loadu_si128(src.as_ptr().add(i).cast()),
+                    _mm_loadu_si128(src.as_ptr().add(i + 16).cast()),
+                    _mm_loadu_si128(dst.as_ptr().add(i).cast()),
+                    _mm_loadu_si128(dst.as_ptr().add(i + 16).cast()),
+                )
+            };
+            // Low bytes of a then b, and high bytes of a then b.
+            let lo = _mm_packus_epi16(_mm_and_si128(a, low_byte), _mm_and_si128(b, low_byte));
+            let hi = _mm_packus_epi16(_mm_srli_epi16::<8>(a), _mm_srli_epi16::<8>(b));
+            let n0 = _mm_and_si128(lo, nibble);
+            let n1 = _mm_and_si128(_mm_srli_epi16::<4>(lo), nibble);
+            let n2 = _mm_and_si128(hi, nibble);
+            let n3 = _mm_and_si128(_mm_srli_epi16::<4>(hi), nibble);
+            let plo = _mm_xor_si128(
+                _mm_xor_si128(_mm_shuffle_epi8(l0, n0), _mm_shuffle_epi8(l1, n1)),
+                _mm_xor_si128(_mm_shuffle_epi8(l2, n2), _mm_shuffle_epi8(l3, n3)),
+            );
+            let phi = _mm_xor_si128(
+                _mm_xor_si128(_mm_shuffle_epi8(h0, n0), _mm_shuffle_epi8(h1, n1)),
+                _mm_xor_si128(_mm_shuffle_epi8(h2, n2), _mm_shuffle_epi8(h3, n3)),
+            );
+            let pa = _mm_unpacklo_epi8(plo, phi);
+            let pb = _mm_unpackhi_epi8(plo, phi);
+            // SAFETY: as for the loads above.
+            unsafe {
+                _mm_storeu_si128(dst.as_mut_ptr().add(i).cast(), _mm_xor_si128(da, pa));
+                _mm_storeu_si128(dst.as_mut_ptr().add(i + 16).cast(), _mm_xor_si128(db, pb));
+            }
+            i += 32;
+        }
+        mul_acc_scalar(&mut dst[whole..len], &src[whole..len], t);
     }
 }
 
@@ -169,6 +431,51 @@ mod tests {
         assert_eq!(c, want);
     }
 
+    /// xorshift64, so the tests need no extra dependency.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn bytes(&mut self, n: usize) -> Vec<u8> {
+            (0..n).map(|_| self.next() as u8).collect()
+        }
+    }
+
+    /// `dst ^ c * src` computed one word at a time with `mul`.
+    fn reference(dst: &[u8], src: &[u8], c: u16) -> Vec<u8> {
+        dst.chunks_exact(2)
+            .zip(src.chunks_exact(2))
+            .flat_map(|(d, s)| {
+                let p = mul(c, u16::from_le_bytes([s[0], s[1]]));
+                (u16::from_le_bytes([d[0], d[1]]) ^ p).to_le_bytes()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn tables_match_mul() {
+        for c in [0u16, 1, 2, 0x1d3f, 0x8000, 0xffff] {
+            let t = MulTable::new(c);
+            for i in 0..4 {
+                for x in 0..16u16 {
+                    let p = mul(c, x << (4 * i));
+                    assert_eq!(u16::from_le_bytes([t.nib[i][x as usize], t.nib[4 + i][x as usize]]), p);
+                }
+            }
+            let (lo, hi) = t.bytes();
+            for b in 0..256u16 {
+                assert_eq!(lo[b as usize], mul(c, b));
+                assert_eq!(hi[b as usize], mul(c, b << 8));
+            }
+        }
+    }
+
     #[test]
     fn mul_acc_matches_scalar() {
         let src: Vec<u8> = (0..64u8).map(|b| b.wrapping_mul(37)).collect();
@@ -178,6 +485,104 @@ mod tests {
             let w = u16::from_le_bytes([src[i], src[i + 1]]);
             assert_eq!(u16::from_le_bytes([dst[i], dst[i + 1]]), mul(0x1d3f, w));
         }
+    }
+
+    /// Every kernel the CPU supports gives the reference result for random constants,
+    /// contents, lengths (odd word counts and tails shorter than one SIMD step included)
+    /// and misaligned starts.
+    #[test]
+    fn every_kernel_matches_reference() {
+        let kernels = Kernel::available();
+        println!("kernels: {:?}", kernels.iter().map(|k| k.name()).collect::<Vec<_>>());
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        let mut lens: Vec<usize> = (0..=200).step_by(2).collect();
+        lens.extend([254, 256, 258, 1022, 1024, 1026, 4094, 65536 + 62]);
+        for &len in &lens {
+            for _ in 0..8 {
+                let c = match rng.next() % 8 {
+                    0 => 0,
+                    1 => 1,
+                    2 => 0xffff,
+                    _ => rng.next() as u16,
+                };
+                let t = MulTable::new(c);
+                let off_s = (rng.next() % 32) as usize;
+                let off_d = (rng.next() % 32) as usize;
+                let src_buf = rng.bytes(len + off_s);
+                let dst_buf = rng.bytes(len + off_d);
+                let src = &src_buf[off_s..];
+                let want = reference(&dst_buf[off_d..], src, c);
+                for k in &kernels {
+                    let mut d = dst_buf.clone();
+                    k.mul_acc(&mut d[off_d..], src, &t);
+                    assert_eq!(&d[off_d..], &want[..], "{} c={c:#x} len={len}", k.name());
+                    assert_eq!(&d[..off_d], &dst_buf[..off_d], "{} wrote before the slice", k.name());
+                }
+            }
+        }
+    }
+
+    /// All 65536 words through every kernel for a spread of constants, and every
+    /// constant for a fixed random block.
+    #[test]
+    fn every_kernel_is_exhaustively_exact() {
+        let kernels = Kernel::available();
+        let words: Vec<u8> = (0..=u16::MAX).flat_map(u16::to_le_bytes).collect();
+        let zero = vec![0u8; words.len()];
+        let mut rng = Rng(42);
+        let consts: Vec<u16> = [0u16, 1, 2, 3, 0x100b, 0x8000, 0xffff].into_iter().chain((0..25).map(|_| rng.next() as u16)).collect();
+        for &c in &consts {
+            let want = reference(&zero, &words, c);
+            let t = MulTable::new(c);
+            for k in &kernels {
+                let mut d = zero.clone();
+                k.mul_acc(&mut d, &words, &t);
+                assert!(d == want, "{} c={c:#x}", k.name());
+            }
+        }
+        let src = rng.bytes(192);
+        let dst = rng.bytes(192);
+        for c in 0..=u16::MAX {
+            let want = reference(&dst, &src, c);
+            let t = MulTable::new(c);
+            for k in &kernels {
+                let mut d = dst.clone();
+                k.mul_acc(&mut d, &src, &t);
+                assert!(d == want, "{} c={c:#x}", k.name());
+            }
+        }
+    }
+
+    /// Kernel throughput (not run by default):
+    /// `cargo test --release -p newskite-par2 gf::tests::kernel_throughput -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn kernel_throughput() {
+        use std::time::Instant;
+        let mut rng = Rng(7);
+        let tables: Vec<MulTable> = (0..64u16).map(|c| MulTable::new(0x1234 ^ c)).collect();
+        for size in [2 << 10, 4 << 10, 32 << 10, 768 << 10, 16 << 20] {
+            let src = rng.bytes(size);
+            let mut dst = rng.bytes(size);
+            let reps = ((2usize << 30) / size).max(1);
+            for k in Kernel::available() {
+                let mut best = f64::MAX;
+                for _ in 0..3 {
+                    let t0 = Instant::now();
+                    for r in 0..reps {
+                        k.mul_acc(&mut dst, &src, &tables[r % 64]);
+                    }
+                    best = best.min(t0.elapsed().as_secs_f64());
+                }
+                println!("{:>6} {:>8} KiB: {:6.2} GB/s", k.name(), size >> 10, (size * reps) as f64 / best / 1e9);
+            }
+        }
+        let t0 = Instant::now();
+        let mut x = 0u16;
+        for c in 0..100_000u32 {
+            x ^= u16::from(std::hint::black_box(MulTable::new(c as u16)).nib[1][3]);
+        }
+        println!("MulTable::new: {:.0} ns ({x})", t0.elapsed().as_secs_f64() / 1e5 * 1e9);
     }
 
     #[test]

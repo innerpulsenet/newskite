@@ -6,17 +6,30 @@
 //! to the left gives `R'_j = sum_m A[j][m] * D_m` with `A[j][m] = c_m^e_j`, so
 //! `D = A^-1 * R'`. The slices are processed in byte ranges ("passes") so memory stays
 //! bounded by [`RepairOptions::memory_limit`] whatever the slice size and block count.
+//!
+//! Within a pass every thread owns one byte range of all `k` rows, reads its range of the
+//! recovery and input slices itself (positional reads on shared handles) and writes its
+//! range of the rebuilt slices, so all threads work whatever `k` is and no thread waits
+//! for another. Inputs are taken in groups and the rows updated in small sub-blocks, so
+//! the data being combined stays in cache while a group is applied.
 
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 
-use md5::{Digest, Md5};
-
-use crate::gf::{self, MulTable};
+use crate::gf::{self, Kernel, MulTable};
 use crate::packet::{recovery_intact, RecoveryRef, RecoverySet};
-use crate::verify::{read_padded, FileStatus, Verification};
+use crate::pio::{read_at_padded, write_all_at, LastFile, Source};
+use crate::verify::{check_slices, check_threads, is_complete, par_map, FileStatus, SliceCheck, Verification};
 use crate::{Event, Par2Error, Stage};
+
+/// Input slices read per group: each sub-block of an accumulator row is updated from this
+/// many inputs while it is in cache (their sub-blocks fit the first-level cache too).
+const GROUP: usize = 16;
+/// A thread gets at least this many bytes of a pass (tiny slices use fewer threads).
+const MIN_THREAD_BYTES: usize = 16 << 10;
 
 /// Tuning for [`repair`].
 #[derive(Clone, Debug)]
@@ -55,7 +68,7 @@ struct Rebuild {
 }
 
 /// Repairs `set` using `ver` (from [`crate::verify`] on the same folder). Nothing is
-/// replaced unless every rebuilt file checks out against its MD5.
+/// replaced unless every slice of every rebuilt file checks out against its MD5.
 pub fn repair(
     set: &RecoverySet,
     ver: &Verification,
@@ -95,7 +108,7 @@ pub fn repair(
         let handle = OpenOptions::new().read(true).write(true).create_new(true).open(&temp)?;
         rebuilds.push(Rebuild { file: fi, target, temp, handle });
     }
-    let result = rebuild_files(set, ver, opts, &missing, &chosen, &inverse, &consts, &mut rebuilds, on);
+    let result = rebuild_files(set, ver, opts, &missing, &chosen, &inverse, &consts, &rebuilds, on);
     if let Err(e) = result {
         for r in &rebuilds {
             let _ = std::fs::remove_file(&r.temp);
@@ -145,17 +158,26 @@ fn choose_recovery(
     let mut checked = 0usize;
     loop {
         while chosen.len() < k {
-            let Some(r) = pool.next() else {
+            // The next candidates, as many as are still needed, are checked at once and
+            // taken in order.
+            let batch: Vec<&RecoveryRef> = pool.by_ref().take(k - chosen.len()).collect();
+            if batch.is_empty() {
                 return Err(Par2Error::NotEnoughRecovery { needed: k, available: checked });
-            };
-            on(Event::File { stage: Stage::Prepare, index: chosen.len(), count: k, name: format!("recovery slice {}", r.exponent) });
-            match recovery_intact(r) {
-                Ok(true) => {
-                    chosen.push(r.clone());
-                    checked += 1;
+            }
+            for (n, r) in batch.iter().enumerate() {
+                let name = format!("recovery slice {}", r.exponent);
+                on(Event::File { stage: Stage::Prepare, index: chosen.len() + n, count: k, name });
+            }
+            let intact = par_map(&batch, check_threads(), |r| recovery_intact(r));
+            for (r, res) in batch.into_iter().zip(intact) {
+                match res {
+                    Ok(true) => {
+                        chosen.push(r.clone());
+                        checked += 1;
+                    }
+                    Ok(false) => on(Event::Note(format!("recovery slice {} is damaged; skipping it", r.exponent))),
+                    Err(e) => on(Event::Note(format!("recovery slice {} unreadable ({e}); skipping it", r.exponent))),
                 }
-                Ok(false) => on(Event::Note(format!("recovery slice {} is damaged; skipping it", r.exponent))),
-                Err(e) => on(Event::Note(format!("recovery slice {} unreadable ({e}); skipping it", r.exponent))),
             }
         }
         let a: Vec<u16> = chosen
@@ -174,6 +196,112 @@ fn choose_recovery(
     }
 }
 
+/// Every file slices are read from, numbered. Threads open them as they go (keeping the
+/// last one open), so a set of thousands of files never holds thousands of descriptors.
+#[derive(Default)]
+struct Sources {
+    paths: Vec<PathBuf>,
+    index: HashMap<PathBuf, usize>,
+}
+
+impl Sources {
+    fn id(&mut self, path: &Path) -> usize {
+        if let Some(&i) = self.index.get(path) {
+            return i;
+        }
+        self.paths.push(path.to_path_buf());
+        self.index.insert(path.to_path_buf(), self.paths.len() - 1);
+        self.paths.len() - 1
+    }
+}
+
+/// One known input slice of a pass: global index, source file, offset of the slice in
+/// it and the slice's data bytes (the rest of the slice is zero padding).
+struct Input {
+    global: usize,
+    file: usize,
+    offset: u64,
+    len: u64,
+}
+
+/// What every thread of a pass shares.
+struct Pass<'a> {
+    kernel: Kernel,
+    paths: &'a [PathBuf],
+    /// Chosen recovery slices: (source file, offset of the slice data) and exponent.
+    recovery: &'a [(usize, u64, u32)],
+    inputs: &'a [Input],
+    consts: &'a [u16],
+    inverse: &'a [u16],
+    /// Per missing slice: the copy it belongs to, its offset there and its data bytes.
+    targets: &'a [(&'a File, u64, u64)],
+    /// Offset of this pass in the slices.
+    c0: u64,
+}
+
+impl Pass<'_> {
+    /// One thread's share: `rows` are the `k` accumulator rows restricted to the range
+    /// starting `r0` bytes into the pass. Sends the bytes of work done to `progress`.
+    fn run(&self, rows: &mut [&mut [u8]], r0: usize, progress: &mpsc::Sender<u64>) -> io::Result<()> {
+        let k = rows.len();
+        let Some(rlen) = rows.first().map(|r| r.len()) else { return Ok(()) };
+        let pos = self.c0 + r0 as u64;
+        let (mut recovery_file, mut input_file) = (LastFile::default(), LastFile::default());
+        // R'_j, starting from the recovery data.
+        for (row, &(h, off, _)) in rows.iter_mut().zip(self.recovery) {
+            read_at_padded(recovery_file.get(h, Source::Path(&self.paths[h]))?, off + pos, row)?;
+        }
+        drop(recovery_file);
+        // Subtract every known slice: R'_j ^= c_i^e_j * D_i.
+        // Rows are updated a sub-block at a time: a sub-block of one row stays in the
+        // first-level cache while the whole group is added to it.
+        let sub = self.kernel.block().min(rlen);
+        let mut buf = vec![0u8; GROUP.min(self.inputs.len()).max(1) * rlen];
+        let mut tables = Vec::with_capacity(k * GROUP);
+        for group in self.inputs.chunks(GROUP) {
+            let n = group.len();
+            for (input, b) in group.iter().zip(buf.chunks_exact_mut(rlen)) {
+                let have = input.len.saturating_sub(pos).min(rlen as u64) as usize;
+                let f = input_file.get(input.file, Source::Path(&self.paths[input.file]))?;
+                read_at_padded(f, input.offset + pos, &mut b[..have])?;
+                b[have..].fill(0);
+            }
+            tables.clear();
+            for &(_, _, e) in self.recovery {
+                tables.extend(group.iter().map(|input| MulTable::new(gf::pow(self.consts[input.global], e))));
+            }
+            let mut s0 = 0;
+            while s0 < rlen {
+                let s1 = (s0 + sub).min(rlen);
+                for (j, row) in rows.iter_mut().enumerate() {
+                    for (i, b) in buf.chunks_exact(rlen).take(n).enumerate() {
+                        self.kernel.mul_acc(&mut row[s0..s1], &b[s0..s1], &tables[j * n + i]);
+                    }
+                }
+                s0 = s1;
+            }
+            let _ = progress.send((n * rlen) as u64);
+        }
+        // D_m = sum_j inverse[m][j] * R'_j, written into the owning copy.
+        let out = &mut buf[..rlen];
+        for (m, &(file, start, data_len)) in self.targets.iter().enumerate() {
+            out.fill(0);
+            for (j, row) in rows.iter().enumerate() {
+                let c = self.inverse[m * k + j];
+                if c != 0 {
+                    self.kernel.mul_acc(out, row, &MulTable::new(c));
+                }
+            }
+            let have = data_len.saturating_sub(pos).min(rlen as u64) as usize;
+            if have > 0 {
+                write_all_at(file, &out[..have], start + pos)?;
+            }
+            let _ = progress.send(rlen as u64);
+        }
+        Ok(())
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn rebuild_files(
     set: &RecoverySet,
@@ -183,7 +311,7 @@ fn rebuild_files(
     chosen: &[RecoveryRef],
     inverse: &[u16],
     consts: &[u16],
-    rebuilds: &mut [Rebuild],
+    rebuilds: &[Rebuild],
     on: &mut dyn FnMut(Event),
 ) -> Result<(), Par2Error> {
     let ss = set.slice_size;
@@ -194,123 +322,141 @@ fn rebuild_files(
             owner.push((fi, s));
         }
     }
-    let slots: Vec<usize> = rebuilds.iter().map(|r| r.file).collect();
-    let slot_of = |fi: usize| slots.iter().position(|&f| f == fi);
+    let mut sources = Sources::default();
+    let source: Vec<Option<(usize, u64)>> =
+        ver.sources.iter().map(|s| s.as_ref().map(|s| (sources.id(&s.path), s.offset))).collect();
 
     // Known-good slices into the copies.
-    let mut buf = vec![0u8; ss as usize];
-    for r in rebuilds.iter_mut() {
-        let e = &set.files[r.file];
-        for s in 0..e.slices.len() {
-            if let Some(src) = &ver.sources[e.first_slice + s] {
-                let n = e.slice_len(s, ss) as usize;
-                let mut f = File::open(&src.path)?;
-                read_padded(&mut f, src.offset, &mut buf[..n])?;
-                r.handle.seek(SeekFrom::Start(s as u64 * ss))?;
-                r.handle.write_all(&buf[..n])?;
-            }
-        }
-        r.handle.set_len(e.length)?;
-    }
-    drop(buf);
+    copy_known(set, &source, &sources.paths, rebuilds)?;
 
     let k = missing.len();
     if k > 0 {
-        let chunk = ((opts.memory_limit / (k + 2)).max(4096) as u64).min(ss) / 4 * 4;
-        let chunk = chunk.max(4);
+        let recovery: Vec<(usize, u64, u32)> = chosen.iter().map(|r| (sources.id(&r.path), r.offset, r.exponent)).collect();
+        let targets: Vec<(&File, u64, u64)> = missing
+            .iter()
+            .map(|&g| {
+                let (fi, s) = owner[g];
+                let r = rebuilds
+                    .iter()
+                    .find(|r| r.file == fi)
+                    .ok_or_else(|| Par2Error::Internal("rebuilt slice has no file".into()))?;
+                Ok((&r.handle, s as u64 * ss, set.files[fi].slice_len(s, ss)))
+            })
+            .collect::<Result<_, Par2Error>>()?;
+        let inputs: Vec<Input> = source
+            .iter()
+            .enumerate()
+            .filter_map(|(g, s)| {
+                let (fi, sl) = owner[g];
+                s.map(|(file, offset)| Input { global: g, file, offset, len: set.files[fi].slice_len(sl, ss) })
+            })
+            .collect();
+
+        // Memory: k accumulator rows plus a group of inputs and one output row.
+        let chunk = ((opts.memory_limit / (k + GROUP + 1)).max(4096) as u64).min(ss);
+        let chunk = if chunk < ss { chunk / 64 * 64 } else { ss };
         let passes = ss.div_ceil(chunk);
-        let available: Vec<usize> = (0..ver.sources.len()).filter(|&i| ver.sources[i].is_some()).collect();
-        let work_total = passes * (available.len() as u64 + k as u64);
+        let work_total = passes * (inputs.len() as u64 + k as u64);
         let mut work_done = 0u64;
-        let threads = opts.threads.max(1);
+        let mut acc = vec![0u8; k * chunk as usize];
         for pass in 0..passes {
             let c0 = pass * chunk;
             let len = chunk.min(ss - c0) as usize;
-            // R'_j, starting from the recovery data.
-            let mut acc: Vec<Vec<u8>> = Vec::with_capacity(k);
-            for r in chosen {
-                let mut b = vec![0u8; len];
-                let mut f = File::open(&r.path)?;
-                read_padded(&mut f, r.offset + c0, &mut b)?;
-                acc.push(b);
-            }
-            // Subtract every known slice: R'_j ^= c_i^e_j * D_i. Inputs are read in
-            // batches and the recovery rows split across threads.
-            let batch_cap = (opts.memory_limit / 4 / len.max(1)).clamp(1, 64);
-            let mut idx = 0;
-            while idx < available.len() {
-                let batch: Vec<usize> = available[idx..(idx + batch_cap).min(available.len())].to_vec();
-                idx += batch.len();
-                let mut data = Vec::with_capacity(batch.len());
-                for &g in &batch {
-                    let (fi, s) = owner[g];
-                    let src = ver.sources[g].as_ref().expect("available");
-                    let have = set.files[fi].slice_len(s, ss).saturating_sub(c0).min(len as u64) as usize;
-                    let mut b = vec![0u8; len];
-                    let mut f = File::open(&src.path)?;
-                    read_padded(&mut f, src.offset + c0, &mut b[..have])?;
-                    data.push(b);
+            let threads = opts.threads.max(1).min(len.div_ceil(MIN_THREAD_BYTES));
+            let part = len.div_ceil(threads).next_multiple_of(64);
+            // Each thread's range of every row.
+            let mut shares: Vec<Vec<&mut [u8]>> = (0..len.div_ceil(part)).map(|_| Vec::with_capacity(k)).collect();
+            for row in acc[..k * len].chunks_exact_mut(len) {
+                for (share, piece) in shares.iter_mut().zip(row.chunks_mut(part)) {
+                    share.push(piece);
                 }
-                let per = k.div_ceil(threads);
-                std::thread::scope(|scope| {
-                    for (part, rows) in acc.chunks_mut(per).enumerate() {
-                        let data = &data;
-                        let batch = &batch;
-                        scope.spawn(move || {
-                            for (o, row) in rows.iter_mut().enumerate() {
-                                let e = chosen[part * per + o].exponent;
-                                for (b, &g) in data.iter().zip(batch) {
-                                    let t = MulTable::new(gf::pow(consts[g], e));
-                                    gf::mul_acc(row, b, &t);
-                                }
-                            }
-                        });
-                    }
-                });
-                work_done += batch.len() as u64;
-                on(Event::Bytes { stage: Stage::Repair, done: work_done, total: work_total });
             }
-            // D_m = sum_j inverse[m][j] * R'_j, written into the owning copy.
-            let mut tmp = vec![0u8; len];
-            for (m, &g) in missing.iter().enumerate() {
-                tmp.fill(0);
-                for (j, row) in acc.iter().enumerate() {
-                    let c = inverse[m * k + j];
-                    if c != 0 {
-                        gf::mul_acc(&mut tmp, row, &MulTable::new(c));
+            let ctx = Pass {
+                kernel: Kernel::best(),
+                paths: &sources.paths,
+                recovery: &recovery,
+                inputs: &inputs,
+                consts,
+                inverse,
+                targets: &targets,
+                c0,
+            };
+            let (tx, rx) = mpsc::channel::<u64>();
+            let results: Vec<io::Result<()>> = std::thread::scope(|scope| {
+                let workers: Vec<_> = shares
+                    .into_iter()
+                    .enumerate()
+                    .map(|(t, mut rows)| {
+                        let (ctx, tx) = (&ctx, tx.clone());
+                        scope.spawn(move || ctx.run(&mut rows, t * part, &tx))
+                    })
+                    .collect();
+                drop(tx);
+                let mut bytes = 0u64;
+                let mut last = work_done;
+                for n in rx {
+                    bytes += n;
+                    let done = work_done + bytes / len as u64;
+                    if done != last {
+                        last = done;
+                        on(Event::Bytes { stage: Stage::Repair, done, total: work_total });
                     }
                 }
-                let (fi, s) = owner[g];
-                let have = set.files[fi].slice_len(s, ss).saturating_sub(c0).min(len as u64) as usize;
-                if have > 0 {
-                    let slot = slot_of(fi).ok_or_else(|| Par2Error::Internal("rebuilt slice has no file".into()))?;
-                    let h = &mut rebuilds[slot].handle;
-                    h.seek(SeekFrom::Start(s as u64 * ss + c0))?;
-                    h.write_all(&tmp[..have])?;
-                }
-                work_done += 1;
-                on(Event::Bytes { stage: Stage::Repair, done: work_done, total: work_total });
-            }
+                workers
+                    .into_iter()
+                    .map(|w| w.join().unwrap_or_else(|_| Err(io::Error::other("repair thread panicked"))))
+                    .collect()
+            });
+            results.into_iter().collect::<io::Result<()>>()?;
+            work_done += inputs.len() as u64 + k as u64;
         }
     }
 
-    // Check every copy before anything is replaced.
-    for r in rebuilds.iter_mut() {
+    check_copies(set, rebuilds)
+}
+
+/// Copies the known-good slices into the copies; consecutive slices stored one after the
+/// other in the same file go in one run.
+fn copy_known(set: &RecoverySet, source: &[Option<(usize, u64)>], paths: &[PathBuf], rebuilds: &[Rebuild]) -> io::Result<()> {
+    let ss = set.slice_size;
+    for r in rebuilds {
         let e = &set.files[r.file];
-        r.handle.flush()?;
-        r.handle.sync_all()?;
-        r.handle.seek(SeekFrom::Start(0))?;
-        let mut h = Md5::new();
-        let mut b = vec![0u8; 1 << 20];
-        loop {
-            let n = r.handle.read(&mut b)?;
-            if n == 0 {
-                break;
+        let mut s = 0;
+        while s < e.slices.len() {
+            let Some((h, off)) = source[e.first_slice + s] else {
+                s += 1;
+                continue;
+            };
+            let mut end = s + 1;
+            while end < e.slices.len() && source[e.first_slice + end] == Some((h, off + (end - s) as u64 * ss)) {
+                end += 1;
             }
-            h.update(&b[..n]);
+            let start = s as u64 * ss;
+            let total = (end as u64 * ss).min(e.length) - start;
+            let mut from = File::open(&paths[h])?;
+            let mut to = &r.handle;
+            from.seek(SeekFrom::Start(off))?;
+            to.seek(SeekFrom::Start(start))?;
+            io::copy(&mut from.take(total), &mut to)?;
+            s = end;
         }
-        if h.finalize().as_slice() != e.md5 {
-            return Err(Par2Error::VerifyAfterRepair(e.name.clone()));
+        r.handle.set_len(e.length)?;
+    }
+    Ok(())
+}
+
+/// Syncs every copy, then checks each one slice by slice (all slices of all copies spread
+/// over several threads) before anything is replaced.
+fn check_copies(set: &RecoverySet, rebuilds: &[Rebuild]) -> Result<(), Par2Error> {
+    par_map(rebuilds, check_threads(), |r| r.handle.sync_all()).into_iter().collect::<io::Result<()>>()?;
+    let mut jobs = Vec::with_capacity(rebuilds.len());
+    for r in rebuilds {
+        jobs.push(SliceCheck { file: Source::Open(&r.handle), len: r.handle.metadata()?.len(), entry: &set.files[r.file] });
+    }
+    let checked = check_slices(&jobs, set.slice_size, check_threads(), &mut |_| {});
+    for (job, res) in jobs.iter().zip(checked) {
+        if !is_complete(job.entry, job.len, &res?) {
+            return Err(Par2Error::VerifyAfterRepair(job.entry.name.clone()));
         }
     }
     Ok(())
