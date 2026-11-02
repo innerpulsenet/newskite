@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use newskite_engine::{download_with_pool, DownloadRequest, EngineError, EngineOptions, JobReport};
-use newskite_postproc::{detect_tools, PostEvent, PostOptions, PostReport, PostStage, Verdict};
+use newskite_postproc::{PostEvent, PostOptions, PostReport, PostStage, Verdict};
 use newskite_store::{Job, JobFile, JobState, StoreError};
 use newskite_types::{format, EngineEvent, FailureKind, JobOutcome, ServerConfig, Settings, StepRecord, StepState};
 use tokio::sync::mpsc;
@@ -555,15 +555,13 @@ async fn post_process(inner: &Arc<Inner>, job: &Job, settings: &Settings) -> (Re
     let dir = job.dest_dir.clone();
     let name = job.name.clone();
     let job_id = job.id;
-    let task_inner = inner.clone();
+    let ev = inner.clone();
     let started = Instant::now();
     let result = tokio::task::spawn_blocking(move || {
-        let tools = task_inner.tools.get_or_init(detect_tools);
-        let ev = task_inner.clone();
         // Time per stage, from the stage changes.
         let mut stage_ms: HashMap<PostStage, u64> = HashMap::new();
         let mut current: Option<(PostStage, Instant)> = None;
-        let report = newskite_postproc::process_with_events(&dir, &name, &opts, tools, &mut |e| match e {
+        let report = newskite_postproc::process_with_events(&dir, &name, &opts, &mut |e| match e {
             PostEvent::Log(line) => {
                 let level = if line.contains("could not") || line.contains("still incomplete") {
                     LogLevel::Warn
