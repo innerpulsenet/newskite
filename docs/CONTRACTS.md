@@ -648,3 +648,18 @@ drop, items that cannot be opened are logged (and shown under the header when no
 with them), and the window un-minimizes and asks for focus; an empty list only raises it.
 A headless run holds the lock without listening, so a GUI launch then still shows the
 "already open" message.
+
+Review polish (additive). `queue::{Nav, step_selection}` and `QueueState::{visible, reveal}`:
+the lists record their rows as drawn, and ↑/↓/Home/End (unmodified, taken after Alt+↑/↓,
+which egui would also match) select through them, outside text fields, modals and the Log
+view; the chosen row scrolls into view and any focused widget gives up the keyboard.
+`DockState::log_search` and `queue::search_field` (the name filter is one): the Log view's
+header has a search that Ctrl+F focuses and `docks::messages(.., search, ..)` keeps lines
+containing it (any case), with "No lines contain “…”" when none do. `Action::RevealPath` and
+`desktop::show_item` (FileManager1 `ShowItems`, else the folder): the detail pane's NZB
+path is a link that shows the file in its folder. `statusbar::show(.., rail, ..)` draws the
+free-space reading only on the rail. `SettingsDraft::make_primary(i)` moves a server row
+(and its row id) to the top; server cards are titled `Server N` with `primary` /
+`fail-over` beside it (the address is in the fields). The failover snapshots use a fixed
+local clock (`failover_t0`).
+

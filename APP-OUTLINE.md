@@ -125,7 +125,8 @@ Each feature lists: what it does, rules, and edge cases the implementation must 
 
 ### F8. Settings
 - **Connection**: a list of servers {host, port, TLS, username, password, connections, enabled};
-  add/remove/edit rows; a "Test" action that performs a real NNTP handshake and shows the raw reply
+  add/remove/edit rows; "Make primary" moves a row to the top; each card says whether it is the
+  primary or a fail-over; a "Test" action that performs a real NNTP handshake and shows the raw reply
   (accepts a `DATE`-style command).
 - **Downloads**: download folder, watch folder, watch enabled.
 - **Performance**: max connections, speed limit (KiB/s, 0 = unlimited).
@@ -227,7 +228,8 @@ Rules:
   remove (inline `Remove?` Yes/No). Right click opens the same menu: pause/hold/resume/download
   now, move to top/up/down/bottom, open download folder, archive password, remove.
 - Click selects a row (the detail pane opens). Keys on the selection: Space toggles, Delete
-  asks to remove, Alt+↑/↓ move, Esc clears. Ctrl+F focuses the filter.
+  asks to remove, Alt+↑/↓ move, Esc clears; ↑/↓ and Home/End walk the rows on screen (the
+  chosen row scrolls into view). Ctrl+F focuses the filter.
 - Under the queue, the jobs that finished in the last 24 hours, in the same row style.
 - Empty state: "The queue is empty. Add an NZB to begin." with an Add NZB button.
 
@@ -253,7 +255,8 @@ Tabs:
   cells glow briefly), the **files** (one lane of cells per file with `n / N` articles;
   per-file byte tracks for jobs without a map), the **numbers** (size, average speed, time
   downloading and post-processing, articles, missing, slices rebuilt, files cleaned up;
-  only measured values) and **where** (folder, extraction folder, NZB).
+  only measured values) and **where** (folder and extraction folder open on click; the NZB
+  is shown selected in its folder).
 - **Log** — the job's own log (kept across restarts, newest 500 lines), Copy log, Open log
   file.
 
@@ -264,7 +267,7 @@ Toasts in the lower right announce each finished (6 s) or failed (15 s) job, wit
 
 ### 6.3 Log and server strip
 - **Log** (a view of its own) — last 500 lines, newest first, level filter (All / Warnings /
-  Errors); three columns (level mark, clock, text) so long lines wrap under their own text.
+  Errors) and a search (Ctrl+F; lines containing the text, any case); three columns (level mark, clock, text) so long lines wrap under their own text.
   A line about a job opens it. Everything is also written to `newskite.log` in the data
   folder (rotated at 4 MB).
 - **Server strip** (above the status bar) — `host:port`, TLS/Plain, role, per-server health
@@ -282,9 +285,9 @@ failed job). Center: what the queue is doing (`Downloading · 18.4 MB/s`, `Pause
 and the fastest second on record (`peak …`) beside a sparkline of the last 10 min (or the
 stored 24 h); hovering it shows the throughput graph: the live plot over the 24 h history
 strip (two time axes never share one plot; one stored sample still draws a visible, flat
-trace). Right: free space on the download folder's filesystem (warning color when low or
-smaller than what the queue still needs; the lifetime total on hover) and the innerpulse
-credit.
+trace). Right: free space on the download folder's filesystem while the sidebar is a rail
+(the wide sidebar's disk meter says it otherwise; warning color when low or smaller than
+what the queue still needs; the lifetime total on hover) and the innerpulse credit.
 
 ### 6.5 Settings sheet (modal)
 Sections, each a labeled group; footer `Cancel` / `Save`:

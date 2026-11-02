@@ -125,6 +125,18 @@ impl SettingsDraft {
         self.row_ids.push(new_row_id());
     }
 
+    /// Moves a row to the top, where downloads start (the others become fail-over in
+    /// their order).
+    pub fn make_primary(&mut self, index: usize) {
+        if index == 0 || index >= self.settings.servers.len() {
+            return;
+        }
+        let srv = self.settings.servers.remove(index);
+        self.settings.servers.insert(0, srv);
+        let id = self.row_ids.remove(index);
+        self.row_ids.insert(0, id);
+    }
+
     /// Removes a row; the last row is replaced by an empty disabled one so at least one
     /// row always exists.
     pub fn remove_server(&mut self, index: usize) {
@@ -497,7 +509,10 @@ fn connection_section(
 ) {
     section(ui, pal, "Connection", |ui| {
         let mut remove = None;
+        let mut primary = None;
         let count = draft.settings.servers.len();
+        // The row downloads start from: the first enabled one with a host.
+        let lead = draft.settings.servers.iter().position(|s| s.enabled && !s.host.trim().is_empty());
         for i in 0..count {
             let row_id = draft.row_ids[i];
             if i > 0 {
@@ -505,18 +520,26 @@ fn connection_section(
             }
             let srv = &mut draft.settings.servers[i];
             ui.horizontal(|ui| {
-                let title = if srv.host.trim().is_empty() {
-                    format!("Server {}", i + 1)
-                } else {
-                    format!("Server {} · {}", i + 1, srv.address())
-                };
-                ui.label(RichText::new(title).strong().color(pal.text));
+                // The address is in the fields below; the title names the row and its role,
+                // short enough never to reach the buttons.
+                ui.label(RichText::new(format!("Server {}", i + 1)).strong().color(pal.text));
+                if let Some(lead) = lead {
+                    let role = if i == lead { "primary" } else if srv.enabled && i > lead { "fail-over" } else { "" };
+                    ui.label(RichText::new(role).small().color(pal.muted));
+                }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if compact_button(ui, pal, ButtonKind::Outline, "Remove", true)
                         .on_hover_text("Remove this server")
                         .clicked()
                     {
                         remove = Some(i);
+                    }
+                    if i > 0
+                        && compact_button(ui, pal, ButtonKind::Outline, "Make primary", true)
+                            .on_hover_text("Move this server to the top: downloads start here, the others are fail-over")
+                            .clicked()
+                    {
+                        primary = Some(i);
                     }
                     let running = draft.tests.get(&row_id) == Some(&TestState::Running);
                     let can_test = !srv.host.trim().is_empty() && !running;
@@ -608,6 +631,8 @@ fn connection_section(
         }
         if let Some(i) = remove {
             draft.remove_server(i);
+        } else if let Some(i) = primary {
+            draft.make_primary(i);
         }
         ui.add_space(4.0);
         if kit_button(ui, pal, ButtonKind::Outline, Some(Icon::Plus), "Add server", true).clicked() {
@@ -909,6 +934,24 @@ mod tests {
         assert_eq!(d.settings.servers.len(), 1, "never zero rows");
         assert!(!d.settings.servers[0].enabled);
         d.remove_server(99); // out of range is ignored
+    }
+
+    #[test]
+    fn make_primary_moves_the_row_and_its_id_to_the_top() {
+        let mut d = SettingsDraft::new(Settings::default());
+        d.add_server();
+        d.add_server();
+        for (i, s) in d.settings.servers.iter_mut().enumerate() {
+            s.host = format!("h{i}");
+        }
+        let ids = d.row_ids.clone();
+        d.make_primary(2);
+        let hosts: Vec<&str> = d.settings.servers.iter().map(|s| s.host.as_str()).collect();
+        assert_eq!(hosts, ["h2", "h0", "h1"], "the others keep their order");
+        assert_eq!(d.row_ids, vec![ids[2], ids[0], ids[1]], "a test result follows its row");
+        d.make_primary(0);
+        d.make_primary(9);
+        assert_eq!(d.row_ids, vec![ids[2], ids[0], ids[1]], "the top row and out of range change nothing");
     }
 
     #[test]

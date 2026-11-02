@@ -15,7 +15,7 @@ use super::docks;
 use super::fonts;
 use super::queue::{
     controls_cell, empty_queue, filter_box, finished_subline, history_actions, home_relative, job_menu,
-    live_subline, matches_filter, no_match, now_unix, queue_summary, result_qualifier, EMPTY_HISTORY,
+    live_subline, matches_filter, no_match, now_unix, queue_summary, result_qualifier, search_field, EMPTY_HISTORY,
 };
 use super::theme::Palette;
 use super::toolbar::{open_nzb_row, queue_control};
@@ -76,6 +76,8 @@ enum RowKind {
 
 /// Draws the header and the current view.
 pub fn show(ui: &mut Ui, pal: &Palette, data: &Data, view: &mut ViewState, actions: &mut Vec<Action>) {
+    // Filled again as the lists draw (the Log view has none).
+    view.queue.visible.clear();
     header(ui, pal, data, view, actions);
     if view.open_nzb.visible {
         open_nzb_row(ui, pal, view, actions);
@@ -85,7 +87,7 @@ pub fn show(ui: &mut Ui, pal: &Palette, data: &Data, view: &mut ViewState, actio
     view.queue.note_finishes(&data.jobs, now);
     match view.tab {
         Tab::Log => {
-            docks::messages(ui, pal, data, view.docks.log_filter, !view.reduced_motion, actions);
+            docks::messages(ui, pal, data, view.docks.log_filter, &view.docks.log_search, !view.reduced_motion, actions);
         }
         tab => {
             egui::ScrollArea::vertical().id_salt(("center", tab as u8)).auto_shrink([false, false]).show(ui, |ui| {
@@ -166,7 +168,20 @@ fn header_actions(ui: &mut Ui, pal: &Palette, data: &Data, view: &mut ViewState,
         }
     }));
     match view.tab {
-        Tab::Log => items.push(Box::new(|ui, view, _actions| docks::log_filter_chips(ui, pal, &mut view.docks.log_filter))),
+        Tab::Log => {
+            items.push(Box::new(|ui, view, _actions| docks::log_filter_chips(ui, pal, &mut view.docks.log_filter)));
+            items.push(Box::new(|ui, view, _actions| {
+                search_field(
+                    ui,
+                    pal,
+                    &mut view.docks.log_search,
+                    &mut view.queue.focus_filter,
+                    "log-search",
+                    "Search the log",
+                    "Show only lines that contain this text (Ctrl+F)",
+                )
+            }));
+        }
         tab => {
             if tab == Tab::Queue {
                 // A run started for single jobs leaves the rest queued: offer the whole queue.
@@ -326,6 +341,7 @@ fn list(ui: &mut Ui, pal: &Palette, data: &Data, jobs: &[&Job], view: &mut ViewS
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing.y = 0.0;
             let last = jobs.len().saturating_sub(1);
+            view.queue.visible.extend(jobs.iter().map(|j| j.id));
             for (i, &job) in jobs.iter().enumerate() {
                 row(ui, pal, data, job, view, actions, kind, i == last);
             }
@@ -395,6 +411,10 @@ fn row(
         });
     });
     let real = inner.response.rect;
+    if selected && view.queue.reveal {
+        ui.scroll_to_rect(real, None);
+        view.queue.reveal = false;
+    }
     if (real.height() - h).abs() > 0.5 {
         ui.ctx().data_mut(|d| d.insert_temp(id, real.height()));
         ui.ctx().request_repaint();

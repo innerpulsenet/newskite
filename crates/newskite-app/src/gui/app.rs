@@ -156,6 +156,9 @@ pub enum Action {
     DeleteJobFiles(i64),
     /// Open a folder (or a file's folder) in the file manager.
     OpenPath(PathBuf),
+    /// Show a file selected in its folder in the file manager (the folder alone when the
+    /// file is gone), without opening the file itself.
+    RevealPath(PathBuf),
     /// Open the application log file.
     OpenLogFile,
     /// Start editing a job's archive password (the row's inline editor).
@@ -954,6 +957,7 @@ impl NewskiteApp {
             }
             Action::OpenJobFolder(id) => self.open_job_folder(id),
             Action::OpenPath(p) => self.open_path(&p),
+            Action::RevealPath(p) => self.reveal_path(&p),
             Action::OpenLogFile => {
                 let p = self.service.log_file_path();
                 self.open_path(&p);
@@ -1206,6 +1210,21 @@ impl NewskiteApp {
         }
     }
 
+    fn reveal_path(&mut self, p: &std::path::Path) {
+        let shown = if p.is_file() {
+            crate::desktop::show_item(p)
+        } else {
+            match p.parent().filter(|d| d.is_dir()) {
+                Some(dir) => crate::desktop::show_folder(dir),
+                None => Err("it is no longer there".to_owned()),
+            }
+        };
+        if let Err(e) = shown {
+            self.service.log(LogLevel::Error, format!("cannot show {} in the file manager: {e}", p.display()));
+            self.data.logs = self.service.logs();
+        }
+    }
+
     fn open_path(&mut self, p: &std::path::Path) {
         let opened = if p.is_dir() { crate::desktop::show_folder(p) } else { crate::desktop::open_file(p) };
         if let Err(e) = opened {
@@ -1426,6 +1445,22 @@ impl NewskiteApp {
                 }
             }
         }
+        // ↑/↓ and Home/End walk the rows on screen. Alt+↑/↓ (above) were taken first: the
+        // plain keys would match them too.
+        if !typing && !modal && self.view.tab != Tab::Log {
+            let keys = [(Key::ArrowUp, queue::Nav::Up), (Key::ArrowDown, queue::Nav::Down), (Key::Home, queue::Nav::Home), (Key::End, queue::Nav::End)];
+            let nav = ctx.input_mut(|i| keys.into_iter().find(|(k, _)| i.consume_key(Modifiers::NONE, *k)).map(|(_, n)| n));
+            if let Some(next) = nav.and_then(|n| queue::step_selection(&self.view.queue.visible, self.view.queue.selected, n)) {
+                // A row or button that had the keyboard would also walk egui's focus.
+                ctx.memory_mut(|m| {
+                    if let Some(f) = m.focused() {
+                        m.surrender_focus(f);
+                    }
+                });
+                self.actions.push(Action::Select(Some(next)));
+                self.view.queue.reveal = true;
+            }
+        }
     }
 
     /// One frame: drain events, lay out every panel, apply actions.
@@ -1492,7 +1527,7 @@ impl NewskiteApp {
                     .stroke(egui::Stroke::new(1.0, pal.border)),
             )
             .show(ctx, |ui| {
-                statusbar::show(ui, &pal, &self.data, self.reduced_motion, &mut actions)
+                statusbar::show(ui, &pal, &self.data, rail, self.reduced_motion, &mut actions)
             });
 
         // The server readings: one quiet line above the status bar. Toasts stack from its
