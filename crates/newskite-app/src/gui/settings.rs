@@ -587,7 +587,7 @@ fn postprocess_section(ui: &mut Ui, pal: &Palette, s: &mut Settings) {
         });
         ui.label(
             RichText::new(
-                "Uses par2, 7z, unrar and unzip when installed; missing tools are skipped.",
+                "Extracts RAR, 7z and zip itself; PAR2 repair uses par2 when installed.",
             )
             .small()
             .color(pal.muted),

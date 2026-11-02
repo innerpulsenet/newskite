@@ -1,10 +1,13 @@
-//! Archive listing, safety checks and extraction through 7-Zip / unrar / unzip.
+//! Archive extraction: the native backends (see [`crate::native`]) first, with 7-Zip /
+//! unrar / unzip as a fallback for archives a backend reports as unsupported; shared
+//! safety checks (entry paths, staging, link removal, merging into the target).
 
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use crate::detect::{ArchiveKind, ArchiveSet};
+use crate::native::{self, NativeError};
 use crate::tools::{ToolCommand, ToolRun, Tools};
 
 /// Listing is fast; a stuck listing almost certainly means a tool waiting on something.
@@ -39,8 +42,9 @@ impl Extractor {
     }
 }
 
-/// Prefer unrar for RAR, 7-Zip for everything else, unzip for single-volume zip when
-/// 7-Zip is missing. (7-Zip can also read RAR when unrar is absent.)
+/// Fallback tool for a set the native backend cannot read: unrar for RAR, 7-Zip for
+/// everything else, unzip for single-volume zip when 7-Zip is missing. (7-Zip can also
+/// read RAR when unrar is absent.)
 pub(crate) fn choose_extractor(set: &ArchiveSet, tools: &Tools) -> Option<Extractor> {
     let sevenz = tools.sevenz.clone().map(Extractor::SevenZip);
     match set.kind {
@@ -168,9 +172,9 @@ pub(crate) fn failure_reason(tool: &str, run: &ToolRun, password_given: bool) ->
         || (tool == "unzip" && run.code == Some(82));
     if password_problem {
         return if password_given {
-            "wrong password".into()
+            native::WRONG_PASSWORD.into()
         } else {
-            "archive is password-protected; set a password for this job".into()
+            native::PASSWORD_REQUIRED.into()
         };
     }
     if [
@@ -241,11 +245,15 @@ fn run_succeeded(tool: &str, run: &ToolRun) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SetOutcome {
     Extracted,
+    /// Not produced since extraction became native (kept for the caller's match).
+    #[allow(dead_code)]
     Skipped(String),
     Failed(String),
 }
 
-/// List, check and extract one set into `target` (which must exist).
+/// List, check and extract one set into `target` (which must exist): natively, or with
+/// an external tool when the native backend reports the archive as unsupported and a
+/// suitable tool is installed.
 pub(crate) fn extract_set(
     set: &ArchiveSet,
     target: &Path,
@@ -254,16 +262,65 @@ pub(crate) fn extract_set(
     log: &mut dyn FnMut(String),
 ) -> SetOutcome {
     let name = set.first.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let Some(ex) = choose_extractor(set, tools) else {
-        let hint = match set.kind {
-            ArchiveKind::Rar => "install unrar or 7-Zip",
-            ArchiveKind::SevenZip => "install 7-Zip",
-            ArchiveKind::Zip => "install 7-Zip or unzip",
-        };
-        let reason = format!("no tool to extract {} archives ({hint})", set.kind.name());
-        log(format!("extract: {name}: {reason}"));
-        return SetOutcome::Skipped(reason);
+    let staging = match make_staging_dir(target) {
+        Ok(p) => p,
+        Err(e) => return SetOutcome::Failed(format!("could not create a staging folder in {}: {e}", target.display())),
     };
+    let native = native::extract(set, &staging, password, log);
+
+    if let Err(NativeError::Unsupported(why)) = &native {
+        // Nothing of a run that stopped on an unsupported feature is kept; the tool
+        // starts over in a staging folder of its own.
+        if let Err(e) = std::fs::remove_dir_all(&staging) {
+            log(format!("extract: could not remove staging folder {}: {e}", staging.display()));
+        }
+        let Some(ex) = choose_extractor(set, tools) else {
+            let hint = match set.kind {
+                ArchiveKind::Rar => "unrar or 7-Zip",
+                ArchiveKind::SevenZip => "7-Zip",
+                ArchiveKind::Zip => "7-Zip",
+            };
+            let reason = format!("{why}; install {hint} to extract it");
+            log(format!("extract: {name}: {reason}"));
+            return SetOutcome::Failed(reason);
+        };
+        log(format!("extract: {name}: native extraction not possible ({why}); falling back to {}", ex.name()));
+        return extract_with_tool(set, target, &ex, password, log);
+    }
+
+    // Same finishing steps as for a tool (see `extract_with_tool`). The native sink
+    // never creates links, so the link sweep is a second line of defense only.
+    let staged_links = remove_links_outside(&staging, true, log);
+    let merged = merge_into(&staging, target, log);
+    if let Err(e) = std::fs::remove_dir_all(&staging) {
+        log(format!("extract: could not remove staging folder {}: {e}", staging.display()));
+    }
+    let target_links = remove_escaping_links(target, log);
+
+    let summary = match native {
+        Ok(s) => s,
+        Err(e) => return SetOutcome::Failed(e.to_string()),
+    };
+    if let Some(link) = summary.escaping_link {
+        return SetOutcome::Failed(format!("archive contained a link pointing outside the target ({link})"));
+    }
+    if let Err(reason) = staged_links.and(merged).and(target_links) {
+        return SetOutcome::Failed(reason);
+    }
+    SetOutcome::Extracted
+}
+
+/// The pre-native extraction path through an external tool: list, check, extract into
+/// a private staging folder, then sweep links and merge into `target`.
+fn extract_with_tool(
+    set: &ArchiveSet,
+    target: &Path,
+    ex: &Extractor,
+    password: Option<&str>,
+    log: &mut dyn FnMut(String),
+) -> SetOutcome {
+    let name = set.first.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let ex = ex.clone();
     let tool = ex.name();
 
     // 1. List and refuse entries that could escape the target folder.

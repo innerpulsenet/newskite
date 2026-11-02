@@ -49,8 +49,8 @@ crates it depends on.
                  ┌─────────────────┘  │   └────────────────┐
          ┌───────▼────────┐  ┌────────▼───────┐  ┌──────────▼────────┐
          │ newskite-engine│  │ newskite-store │  │ newskite-postproc │
-         │ segment fetch, │  │ SQLite: jobs,  │  │ par2 / 7z / unrar │
-         │ decode, writes │  │ settings, ...  │  │ / unzip, cleanup  │
+         │ segment fetch, │  │ SQLite: jobs,  │  │ par2, native rar, │
+         │ decode, writes │  │ settings, ...  │  │ 7z, zip, cleanup  │
          └──┬──────────┬──┘  └────────┬───────┘  └──────────┬────────┘
      ┌──────▼─────┐ ┌──▼───────────┐  │                     │
      │newskite-nzb│ │ newskite-nntp│  │                     │
@@ -161,9 +161,10 @@ backup of the files, or anyone who can watch your processes, can recover these:
   username and password, are kept as plain JSON in the `settings` table of the database in
   `~/.local/share/newskite/db`.
 - **Archive passwords** you enter for a job are stored in plain text with that job (the `jobs`
-  table). During extraction they are passed to `7z`/`unrar` (and `unzip`) on the command line,
-  so other local users can see them in the process list while the tool runs. The log shows
-  those commands with the password masked as `-p***`.
+  table). Extraction is built in and keeps the password in memory. Only when an archive
+  needs the external fallback (see below) is the password passed to `7z`/`unrar` (or
+  `unzip`) on the command line, where other local users can see it in the process list
+  while the tool runs. The log shows those commands with the password masked as `-p***`.
 - **Headless CLI:** prefer the `NEWSKITE_PASS` environment variable over `--pass`, because a
   password given on the command line is visible to other users in the process list. Passwords given with `--server`/`--pass`/`NEWSKITE_PASS` are kept only in
   memory and never written to the database.
@@ -172,19 +173,25 @@ Passwords are never written to the message log.
 
 ## Post-processing tools
 
-Repair and extraction use external programs, found on `PATH` at run time. Each one is
-optional: when it is missing, that step is skipped and the job log says why.
+RAR, 7z and ZIP archives (including split volumes and passwords) are extracted by
+Newskite itself; no program needs to be installed for that. PAR2 repair uses the external
+`par2` program, found on `PATH` at run time; when it is missing, that step is skipped and
+the job log says why. The archive tools are an optional fallback, used only for archives
+the built-in extraction cannot read (spanned `.z01` ZIP sets, rare codecs).
 
 | Tool | Used for | Debian/Ubuntu package |
 |---|---|---|
 | `par2` | PAR2 verify and repair | `par2` |
-| `7z` (or `7zz`, `7za`) | 7z, ZIP and most RAR archives | `7zip` (or `p7zip-full` on older releases) |
-| `unrar` | RAR archives (preferred for RAR) | `unrar` (non-free) |
-| `unzip` | ZIP archives when 7-Zip is missing | `unzip` |
+| `7z` (or `7zz`, `7za`) | fallback for 7z, ZIP and RAR archives | `7zip` (or `p7zip-full` on older releases) |
+| `unrar` | fallback for RAR archives (preferred for RAR) | `unrar` (non-free) |
+| `unzip` | fallback for single ZIP archives when 7-Zip is missing | `unzip` |
 
 ```sh
-sudo apt install par2 7zip unzip     # plus unrar from the non-free/multiverse component
+sudo apt install par2 7zip     # 7zip only as an extraction fallback
 ```
+
+Building from source compiles the bundled UnRAR library, so a C++ compiler (`g++` or
+`clang++`) is needed.
 
 ## Packaging
 

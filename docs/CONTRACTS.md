@@ -7,8 +7,9 @@ unless unavoidable and commented, `thiserror` for error enums, American English 
 
 Stack: **egui/eframe** GUI (pure Rust, cross-platform), **tokio** async engine, **rustls**
 TLS (`ring` provider, native roots + webpki-roots fallback), **rusqlite** (bundled SQLite)
-store, external `par2`/`7z`/`unrar`/`unzip` binaries for post-processing (detected at
-runtime; missing tools degrade gracefully). Linux (KDE) first; must still compile on
+store, native archive extraction (`zip`, `sevenz-rust2`, bundled UnRAR via `unrar_sys`)
+plus external `par2` and optional `7z`/`unrar`/`unzip` fallback binaries for
+post-processing (detected at runtime; missing tools degrade gracefully). Linux (KDE) first; must still compile on
 Windows/macOS (use `cfg` for platform code, never assume `/`).
 
 Dependency graph (arrows = depends on):
@@ -307,7 +308,13 @@ password passed to the tool as an argument (documented); never extract outside t
 where the tool allows listing). Cleanup only after a successful extraction. Commands are
 spawned with argument vectors, never through a shell.
 
-Implementation notes (additive API, see crate docs in `src/lib.rs`): extraction always goes
+Implementation notes (additive API, see crate docs in `src/lib.rs`): extraction is native
+(in-process zip / 7z / RAR, works with `Tools::none()`); an external tool is used only when
+the native backend reports an archive as unsupported (spanned `.zNN` zip, unknown codec),
+and such a set fails with an "install ..." reason when no tool is found. The native writer
+sanitizes every entry path, never follows or creates links (link entries are skipped and
+logged; an escaping one fails the set) and reports progress every 5% through `log`.
+Extraction always goes
 to `dir/<extraction_dir_name(job_name)>/` (`<name>.extracted` if a file has that name).
 Each set is extracted into a fresh private `.newskite-staging-*` folder inside it; on
 success *and* failure, links leaving the staging folder (or with absolute destinations) are
