@@ -2,14 +2,15 @@
 //!
 //! * `newskite --headless ...` runs the headless CLI (`newskite_cli`).
 //! * Otherwise the window opens; positional `.nzb` paths, `file://` and local `nzb://`
-//!   URIs are queued at launch.
+//!   URIs are queued at launch, or handed to the window already open (`handoff`).
 
 use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::Parser;
 use eframe::egui;
-use newskite_app::gui::{appearance, fonts, theme};
+use newskite_app::gui::{appearance, fonts, theme, UiMsg};
+use newskite_app::handoff;
 use newskite_app::launch::{self, LaunchItem, Mode};
 use newskite_app::{AppConfig, NewskiteApp};
 use newskite_service::{LogLevel, Service, ServiceError, ServiceOptions, StoreError};
@@ -57,8 +58,9 @@ fn fatal(message: &str) -> ExitCode {
 /// The app icon (the innerpulse ink tile and mark).
 const APP_ICON_PNG: &[u8] = include_bytes!("../../../assets/brand/app-icon-256.png");
 
-/// Another process holds the data directory: say so in a small window (no panic, no
-/// half-open second window) and exit.
+/// Another process holds the data directory and did not take the launch items (it is
+/// headless, or has no hand-off socket): say so in a small window (no panic, no half-open
+/// second window) and exit.
 fn already_open(data_dir: &std::path::Path, items: &[LaunchItem]) -> ExitCode {
     let message = launch::instance_conflict_message(data_dir, items);
     eprintln!("newskite: {}", message.replace("\n\n", " "));
@@ -212,7 +214,18 @@ fn run_gui(items: Vec<LaunchItem>) -> ExitCode {
         Err(ServiceError::Store(StoreError::Invalid(msg)))
             if launch::is_instance_conflict(&msg) =>
         {
-            return already_open(&data_dir, &items);
+            // The open window takes the NZBs (and comes forward); only when nothing
+            // answers (a headless run holds the lock) is the user told to switch.
+            return match handoff::send(&data_dir, &items) {
+                Ok(()) => {
+                    tracing::info!("handed {} launch item(s) to the open window", items.len());
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    tracing::info!("no open window took the launch items: {e}");
+                    already_open(&data_dir, &items)
+                }
+            };
         }
         Err(e) => {
             return fatal(&format!(
@@ -239,6 +252,14 @@ fn run_gui(items: Vec<LaunchItem>) -> ExitCode {
     if imported > 0 {
         tracing::info!("queued {imported} NZB(s) from the command line");
     }
+    // Later launches hand their NZBs to this window (we hold the lock now).
+    let listener = match handoff::Listener::bind(&data_dir) {
+        Ok(l) => Some(l),
+        Err(e) => {
+            tracing::warn!("later launches cannot hand NZBs to this window: {e}");
+            None
+        }
+    };
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_app_id(newskite_types::APP_ID)
@@ -262,7 +283,7 @@ fn run_gui(items: Vec<LaunchItem>) -> ExitCode {
         "Newskite",
         native,
         Box::new(move |cc| {
-            Ok(Box::new(NewskiteApp::new(
+            let app = NewskiteApp::new(
                 cc.egui_ctx.clone(),
                 app_service,
                 handle,
@@ -270,7 +291,19 @@ fn run_gui(items: Vec<LaunchItem>) -> ExitCode {
                     appearance_file: Some(appearance_file),
                     ..AppConfig::default()
                 },
-            )))
+            );
+            if let Some(listener) = listener {
+                let tx = app.sender();
+                let ctx = cc.egui_ctx.clone();
+                let served = listener.serve(move |items| {
+                    let _ = tx.send(UiMsg::Launched(items));
+                    ctx.request_repaint();
+                });
+                if let Err(e) = served {
+                    tracing::warn!("later launches cannot hand NZBs to this window: {e}");
+                }
+            }
+            Ok(Box::new(app))
         }),
     );
 

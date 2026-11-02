@@ -277,7 +277,7 @@ pub fn is_instance_conflict(error_text: &str) -> bool {
 }
 
 /// The text of the "already open" window: what happened, what to do, and which launch
-/// arguments were not queued (they are not handed to the running window).
+/// arguments were not queued (the process holding the lock did not take them).
 pub fn instance_conflict_message(data_dir: &std::path::Path, items: &[LaunchItem]) -> String {
     let mut msg = format!(
         "Another Newskite window is already open and using {}.\n\n\

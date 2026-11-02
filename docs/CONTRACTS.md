@@ -544,8 +544,9 @@ downloading live in the accent, done ok, failed err, paused warn). Progress is a
 (≤ 40 near-square cells, each an equal slice of the job). NNTP Activity shows `Articles` (count
 of `SegmentDone` this session) and `Missing` (sum of `FileFailed.missing`). The window icon is
 `assets/brand/app-icon-256.png`. If `Service::open` fails because another process holds the
-data directory lock, the binary shows a native "Newskite is already open" message naming the
-NZB arguments that were not queued and exits 1 (no hand-off to the running window yet).
+data directory lock, the binary hands its launch items to that window (`handoff`, below) and
+exits 0; only when nothing takes them does it show a native "Newskite is already open" message
+naming the NZB arguments that were not queued and exit 1.
 
 Review fixes (additive). The "already open" and fatal start-up messages are drawn in a small
 eframe window of the app's own; only when no window can open (eframe itself failed) does
@@ -635,3 +636,15 @@ editor (row menu) takes a 320 px controls box and drops the row's figure while i
 Toasts stack from the top of the server strip. On the sidebar rail an entry's slot is a
 36 px square and its count is a pill over the icon's top-right corner, cut out of it by a
 ring in the color behind (counts above 99 read `99+`; the accessible label has the number).
+
+Single-instance hand-off (additive). The window that holds the data directory's lock binds
+`handoff::SOCKET_FILE_NAME` (`newskite.sock`, mode 0600) next to `newskite.lock`, replacing a
+leftover socket file, and answers on a thread of its own (`handoff::Listener::{bind, serve}`).
+A later launch that finds the lock taken sends one JSON line, `{"open": [...]}` (local NZBs as
+absolute `file://` URIs with every byte escaped, anything else as the original argument, parsed
+again by `launch::parse_item`), and waits for `ok` (`handoff::send`, 5 s timeouts; requests
+over 1 MiB are cut). The window gets `UiMsg::Launched(items)`: NZBs go through `AddNzb` like a
+drop, items that cannot be opened are logged (and shown under the header when no NZB came
+with them), and the window un-minimizes and asks for focus; an empty list only raises it.
+A headless run holds the lock without listening, so a GUI launch then still shows the
+"already open" message.

@@ -4,6 +4,7 @@
 
 pub mod desktop;
 pub mod gui;
+pub mod handoff;
 pub mod launch;
 
 pub use gui::{AppConfig, NewskiteApp, ThemeMode};

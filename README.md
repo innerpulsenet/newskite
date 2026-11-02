@@ -116,7 +116,9 @@ newskite file:///home/me/Downloads/a.nzb         # file:// and nzb:///path URIs 
 
 Open Settings (gear icon or `Ctrl+,`) and add your news server: host, port (563 for TLS,
 119 without), username, password and connection count. **Test** shows the server's actual
-reply. Then import an NZB (toolbar, `Ctrl+O`, or drag it onto the window) and press Start.
+reply. Then import an NZB (Add NZB, `Ctrl+O`, or drag it onto the window) and press Start.
+With the window already open, opening an NZB from the file manager or an `nzb://` link
+queues it there and brings the window forward.
 
 Web links (`http(s)://`, `nzb://http...`, `nzblnk:`) are recognized but not fetched yet; the
 app logs them as unsupported.
