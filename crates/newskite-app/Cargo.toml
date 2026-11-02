@@ -65,7 +65,8 @@ rusqlite = { version = "0.41.1", features = ["bundled"] }
 name = "newskite"
 maintainer = "Pat"
 copyright = "2026, Pat"
-# A machine-readable copyright file: the app's own license and the OFL fonts it embeds.
+# A machine-readable copyright file: the app's own license, the OFL fonts and the
+# UnRAR library it embeds.
 license-file = ["../../packaging/debian/copyright", "0"]
 section = "net"
 priority = "optional"
