@@ -73,8 +73,12 @@ pub struct QueueState {
     pub selected: Option<i64>,
     /// Job awaiting removal confirmation.
     pub confirm_remove: Option<i64>,
+    /// Finished job whose folder deletion awaits confirmation.
+    pub confirm_delete: Option<i64>,
     /// "Clear history" awaiting confirmation.
     pub confirm_clear: bool,
+    /// "Delete files too" (from the Clear history confirmation) awaiting confirmation.
+    pub confirm_clear_files: bool,
     /// Job whose archive password is being edited, with the text typed so far.
     pub password_edit: Option<(i64, String)>,
     /// Focus the filter field next frame (Ctrl+F).
@@ -665,9 +669,32 @@ fn history_tab(
     };
     let q = &mut view.queue;
     summary_row(ui, pal, &text, |ui| {
-        if q.confirm_clear {
+        let n = all.len();
+        let s = if n == 1 { "" } else { "s" };
+        if q.confirm_clear_files {
+            if kit_button(ui, pal, ButtonKind::Text, None, "Cancel", true).clicked() {
+                q.confirm_clear_files = false;
+            }
+            if kit_button(ui, pal, ButtonKind::Outline, Some(Icon::Trash), "Delete", true).clicked() {
+                actions.push(Action::ClearHistoryAndFiles);
+                q.confirm_clear_files = false;
+            }
+            ui.label(
+                RichText::new(format!(
+                    "Permanently delete the download folder{s} of {n} job{s}? This cannot be undone."
+                ))
+                .color(pal.negative),
+            );
+        } else if q.confirm_clear {
             if kit_button(ui, pal, ButtonKind::Text, None, "Cancel", true).clicked() {
                 q.confirm_clear = false;
+            }
+            if kit_button(ui, pal, ButtonKind::Text, Some(Icon::Trash), "Delete files too…", true)
+                .on_hover_text("Also delete each job's download folder from disk")
+                .clicked()
+            {
+                q.confirm_clear = false;
+                q.confirm_clear_files = true;
             }
             if kit_button(ui, pal, ButtonKind::Outline, None, "Clear", true).clicked() {
                 actions.push(Action::ClearHistory);
@@ -883,6 +910,19 @@ fn inline_editors(
             return true;
         }
     }
+    if q.confirm_delete == Some(job.id) {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        ui.label(RichText::new("Delete files?").color(pal.negative))
+            .on_hover_text(format!("Permanently delete {} and remove the job", job.dest_dir.display()));
+        if ui.small_button("Yes").clicked() {
+            actions.push(Action::DeleteJobFiles(job.id));
+            q.confirm_delete = None;
+        }
+        if ui.small_button("No").clicked() {
+            q.confirm_delete = None;
+        }
+        return true;
+    }
     if q.confirm_remove == Some(job.id) {
         ui.spacing_mut().item_spacing.x = 6.0;
         ui.label(RichText::new("Remove?").color(pal.negative));
@@ -987,7 +1027,10 @@ fn history_actions(
             q.password_edit = Some((job.id, String::new()));
         }
     }
-    if icon_button(ui, pal, Icon::Close, pal.muted, "Remove from the list").clicked() {
+    if icon_button(ui, pal, Icon::Trash, pal.muted, "Delete files and remove from the list").clicked() {
+        q.confirm_delete = Some(job.id);
+    }
+    if icon_button(ui, pal, Icon::Close, pal.muted, "Remove from the list (files stay on disk)").clicked() {
         q.confirm_remove = Some(job.id);
     }
 }
@@ -1067,6 +1110,10 @@ fn job_menu(
     };
     if ui.button(text).clicked() {
         q.confirm_remove = Some(job.id);
+        ui.close();
+    }
+    if !job.state.is_pending() && ui.button("Delete files and remove…").clicked() {
+        q.confirm_delete = Some(job.id);
         ui.close();
     }
 }

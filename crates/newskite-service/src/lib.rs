@@ -28,6 +28,11 @@
 //!   downloading; completed files are kept), [`Service::start_job`] downloads one job without
 //!   starting the rest of the queue (or adds it to the active run), and
 //!   [`Service::clear_history`] removes finished jobs from the list.
+//! * **Deleting files.** [`Service::delete_job_files`] removes a finished job from the list
+//!   and deletes its download folder; [`Service::clear_history_and_files`] does that for
+//!   every finished job. A folder is refused (and the job kept) when it is not a plain
+//!   absolute path, is or holds the download folder or the home folder, or overlaps another
+//!   job's folder. Links inside are removed, never followed.
 //! * **Per job.** Usable servers come from [`Settings::usable_servers`]; with none, the job is
 //!   left `queued`, a single error "no enabled server configured" is logged and the run stops.
 //!   Files recorded as `done` in earlier runs are passed to the engine as `skip_files`, so an
@@ -67,6 +72,7 @@
 #[cfg(test)]
 extern crate self as newskite_service;
 
+mod files;
 mod runner;
 mod shutdown;
 mod timers;
@@ -89,6 +95,7 @@ use tokio_util::sync::CancellationToken;
 pub use newskite_store::{
     Bookmark, Job, JobFile, JobState, NewBookmark, Store, StoreError, ThroughputSample, Totals,
 };
+pub use files::Deleted;
 pub use shutdown::shutdown_command;
 
 /// Number of lines kept in the in-memory log ring.
@@ -460,6 +467,10 @@ impl Inner {
     }
 }
 
+fn plural(n: u64) -> &'static str {
+    if n == 1 { "" } else { "s" }
+}
+
 /// Size and modification time (unix nanoseconds) of an NZB file; a file replaced under
 /// the same name gets a new fingerprint.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -808,6 +819,85 @@ impl Service {
             self.inner.emit(ServiceEvent::JobsChanged);
         }
         removed
+    }
+
+    /// Removes a finished (`done` or `failed`) job from the list and deletes its download
+    /// folder with everything in it. Pending jobs are refused with [`ServiceError::Other`]
+    /// (remove them first). When the folder is unsafe to delete (see the module docs) or
+    /// the deletion fails, the job stays in the list and the error is returned.
+    pub fn delete_job_files(&self, id: i64) -> Result<Deleted, ServiceError> {
+        let result = (|| {
+            let job = self.inner.store.get_job(id)?.ok_or(ServiceError::NotFound(id))?;
+            self.delete_files_of(&job, &self.jobs()).map(|d| (job, d))
+        })();
+        match result {
+            Ok((job, d)) => {
+                self.inner.log(
+                    LogLevel::Info,
+                    format!("deleted {} and its files ({} file{}, {})", job.name, d.files, plural(d.files), format::bytes(d.bytes)),
+                );
+                self.inner.emit(ServiceEvent::JobsChanged);
+                Ok(d)
+            }
+            Err(e) => {
+                self.inner.log(LogLevel::Error, format!("could not delete the files of job {id}: {e}"));
+                Err(e)
+            }
+        }
+    }
+
+    /// [`Service::delete_job_files`] for every finished job. Jobs whose folder cannot be
+    /// deleted stay in the list (each failure is logged). Returns the jobs removed and the
+    /// total deleted.
+    pub fn clear_history_and_files(&self) -> (usize, Deleted) {
+        let all = self.jobs();
+        let mut removed = 0;
+        let mut total = Deleted::default();
+        for job in all.iter().filter(|j| matches!(j.state, JobState::Done | JobState::Failed)) {
+            match self.delete_files_of(job, &all) {
+                Ok(d) => {
+                    removed += 1;
+                    total.files += d.files;
+                    total.bytes += d.bytes;
+                }
+                Err(e) => self.inner.log(LogLevel::Error, format!("could not delete the files of {}: {e}", job.name)),
+            }
+        }
+        if removed > 0 {
+            self.inner.log(
+                LogLevel::Info,
+                format!(
+                    "deleted {removed} finished job{} and their files ({} file{}, {})",
+                    plural(removed as u64),
+                    total.files,
+                    plural(total.files),
+                    format::bytes(total.bytes)
+                ),
+            );
+            self.inner.emit(ServiceEvent::JobsChanged);
+        }
+        (removed, total)
+    }
+
+    /// Checks, deletes the folder, then removes the row (so a failed deletion keeps the
+    /// job visible) and records the source NZB as seen.
+    fn delete_files_of(&self, job: &Job, all: &[Job]) -> Result<Deleted, ServiceError> {
+        if !matches!(job.state, JobState::Done | JobState::Failed) || self.inner.lock_state().active_job == Some(job.id) {
+            return Err(ServiceError::Other(format!("{} is not finished ({})", job.name, job.state)));
+        }
+        let settings = self.settings();
+        if let Some(why) = files::refuse_reason(job, &settings.download_dir, all) {
+            return Err(ServiceError::Other(format!("refusing to delete: {why}")));
+        }
+        let deleted = files::delete_tree(&job.dest_dir)?;
+        match self.inner.store.remove_job(job.id) {
+            Ok(()) | Err(StoreError::NotFound) => {}
+            Err(e) => return Err(store_err(job.id, e)),
+        }
+        if let Some(fp) = Fingerprint::of(&job.source_path) {
+            let _ = self.inner.store.mark_source_seen(&job.source_path, fp.size, fp.mtime);
+        }
+        Ok(deleted)
     }
 
     /// Clears a pause, emits [`ServiceEvent::Resumed`] and starts a run if none is active.

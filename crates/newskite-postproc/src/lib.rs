@@ -42,10 +42,13 @@
 //!    password the tools are made non-interactive (`-p-` for unrar, a placeholder
 //!    password for 7-Zip/unzip), and stdin is always the null device, so a tool can never
 //!    hang on a prompt.
-//! 3. **Cleanup** (when [`PostOptions::cleanup`] is set) runs only when the extraction
-//!    verdict is [`Verdict::Ok`]: volumes of every extracted set are deleted and, when no
-//!    set was skipped, also all `.par2` files and the `name.1` backups par2 left after a
-//!    repair. Deleted paths are returned in [`PostReport::removed`].
+//! 3. **Cleanup.** With [`PostOptions::cleanup`], the volumes of every extracted set are
+//!    deleted when the extraction verdict is [`Verdict::Ok`]. With
+//!    [`PostOptions::remove_leftovers`], all `.par2` files, the `name.1` backups par2 left
+//!    after a repair and release sidecars (`.sfv`, `.nfo`, ...) are deleted when PAR2
+//!    verified or repaired the files (or there were none) and no archive set failed or was
+//!    skipped; this also applies to downloads without archives. Deleted paths are
+//!    returned in [`PostReport::removed`].
 
 mod detect;
 mod extract;
@@ -69,15 +72,18 @@ pub struct PostOptions {
     pub repair: bool,
     /// Extract archives.
     pub extract: bool,
-    /// Delete archives and parity files after a successful extraction.
+    /// Delete archive volumes after a successful extraction.
     pub cleanup: bool,
+    /// Delete leftovers once the data is known good: `.par2` files, the `name.1` backups
+    /// par2 leaves after a repair, and release sidecars (`.sfv`, `.nfo`, ...).
+    pub remove_leftovers: bool,
     /// Archive password for this job (never logged).
     pub password: Option<String>,
 }
 
 impl Default for PostOptions {
     fn default() -> Self {
-        Self { repair: true, extract: true, cleanup: true, password: None }
+        Self { repair: true, extract: true, cleanup: true, remove_leftovers: true, password: None }
     }
 }
 
@@ -89,6 +95,7 @@ impl PostOptions {
             repair: s.repair,
             extract: s.extract,
             cleanup: s.cleanup,
+            remove_leftovers: s.remove_leftovers,
             password: password.filter(|p| !p.is_empty()),
         }
     }
@@ -100,6 +107,7 @@ impl fmt::Debug for PostOptions {
             .field("repair", &self.repair)
             .field("extract", &self.extract)
             .field("cleanup", &self.cleanup)
+            .field("remove_leftovers", &self.remove_leftovers)
             .field("password", &self.password.as_ref().map(|_| "***"))
             .finish()
     }
@@ -242,22 +250,99 @@ pub fn process(
     let mut report = PostReport { par2: par2_verdict, extract: Verdict::Skipped(String::new()), extracted_to: None, removed: Vec::new() };
 
     // 2. Extraction
+    let extracted = extract_phase(&dir, job_name, opts, tools, &mut report, log)?;
+
+    // 3. Cleanup. `files` is listed after par2 renamed obfuscated files back.
+    let files = list_files(&dir)?;
+    let mut doomed: Vec<PathBuf> = Vec::new();
+    if opts.cleanup && report.extract == Verdict::Ok {
+        doomed.extend(extracted.volumes.iter().cloned());
+    }
+    let leftovers = if opts.remove_leftovers { leftovers_allowed(&report, &extracted) } else { Err("disabled".into()) };
+    match leftovers {
+        Ok(()) => {
+            doomed.extend(files.iter().filter(|f| detect::is_par2(f) || is_sidecar(f)).cloned());
+            doomed.extend(backups);
+        }
+        Err(why) if opts.remove_leftovers => log(format!("cleanup: keeping parity and sidecar files ({why})")),
+        Err(_) => {}
+    }
+    if !doomed.is_empty() {
+        doomed.sort();
+        doomed.dedup();
+        for p in doomed {
+            match std::fs::remove_file(&p) {
+                Ok(()) => report.removed.push(p),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => log(format!("cleanup: could not remove {}: {e}", p.display())),
+            }
+        }
+        log(format!("cleanup: removed {} file(s)", report.removed.len()));
+        let kept = list_files(&dir).map(|v| v.len()).unwrap_or(0);
+        if kept > 0 {
+            log(format!("cleanup: kept {kept} other file(s) that are not archives, parity or release sidecars"));
+        }
+    }
+    Ok(report)
+}
+
+/// [`Verdict::Skipped`] reason when the download has no PAR2 files.
+pub(crate) const NO_PAR2: &str = "no PAR2 files";
+
+/// What extraction did, for cleanup.
+#[derive(Default)]
+struct Extracted {
+    /// Volumes of every set that extracted.
+    volumes: Vec<PathBuf>,
+    /// Some archive set was skipped (its volumes and parity are still needed).
+    skipped_any: bool,
+}
+
+/// Parity files, par2 backups and sidecars may go once the data is known good: PAR2
+/// verified or repaired it (or there was no PAR2 data to begin with) and no archive set
+/// failed or was skipped. With PAR2 skipped for another reason (tool missing) the files
+/// were never checked, so the parity data stays.
+fn leftovers_allowed(report: &PostReport, extracted: &Extracted) -> Result<(), String> {
+    match &report.par2 {
+        Verdict::Ok | Verdict::Repaired => {}
+        Verdict::Skipped(r) if r == NO_PAR2 => {}
+        v => return Err(format!("par2 {v}")),
+    }
+    if report.extract.is_failed() {
+        return Err(format!("extract {}", report.extract));
+    }
+    if extracted.skipped_any {
+        return Err("an archive set was skipped".into());
+    }
+    Ok(())
+}
+
+/// Step 2 of [`process`]: sets `report.extract`/`extracted_to`.
+fn extract_phase(
+    dir: &Path,
+    job_name: &str,
+    opts: &PostOptions,
+    tools: &Tools,
+    report: &mut PostReport,
+    log: &mut dyn FnMut(String),
+) -> Result<Extracted, PostError> {
+    let mut out = Extracted::default();
     if !opts.extract {
         report.extract = Verdict::Skipped("extraction disabled".into());
-        return Ok(report);
+        return Ok(out);
     }
     if report.par2.is_failed() {
         report.extract = Verdict::Skipped("not attempted because PAR2 verification failed".into());
         log(format!("extract: {}", report.extract));
-        return Ok(report);
+        return Ok(out);
     }
     // par2 may have renamed files back to their real names; look again.
-    let files = list_files(&dir)?;
+    let files = list_files(dir)?;
     let (sets, broken) = detect::find_archive_sets(&files);
     if sets.is_empty() && broken.is_empty() {
         report.extract = Verdict::Skipped("no archives found".into());
         log(format!("extract: {}", report.extract));
-        return Ok(report);
+        return Ok(out);
     }
 
     let mut failures: Vec<String> = broken.iter().map(|b| format!("{}: first volume missing", b.name)).collect();
@@ -268,11 +353,11 @@ pub fn process(
     let mut extracted: Vec<&detect::ArchiveSet> = Vec::new();
 
     if !sets.is_empty() {
-        let target = extraction_target(&dir, job_name);
+        let target = extraction_target(dir, job_name);
         if let Err(e) = std::fs::create_dir_all(&target) {
             report.extract = Verdict::Failed(format!("could not create {}: {e}", target.display()));
             log(format!("extract: {}", report.extract));
-            return Ok(report);
+            return Ok(out);
         }
         let password = opts.password.as_deref().filter(|p| !p.is_empty());
         for set in &sets {
@@ -305,32 +390,9 @@ pub fn process(
         Verdict::Ok
     };
     log(format!("extract: {}", report.extract));
-
-    // 3. Cleanup
-    if opts.cleanup && report.extract == Verdict::Ok {
-        let mut doomed: Vec<PathBuf> = extracted.iter().flat_map(|s| s.volumes.iter().cloned()).collect();
-        if skipped.is_empty() {
-            // Every set extracted: the parity data and the release's sidecar files are
-            // leftovers too. `files` was listed after par2 renamed obfuscated files back.
-            doomed.extend(files.iter().filter(|f| detect::is_par2(f) || is_sidecar(f)).cloned());
-            doomed.extend(backups);
-        }
-        doomed.sort();
-        doomed.dedup();
-        for p in doomed {
-            match std::fs::remove_file(&p) {
-                Ok(()) => report.removed.push(p),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => log(format!("cleanup: could not remove {}: {e}", p.display())),
-            }
-        }
-        log(format!("cleanup: removed {} file(s)", report.removed.len()));
-        let kept = list_files(&dir).map(|v| v.len()).unwrap_or(0);
-        if kept > 0 {
-            log(format!("cleanup: kept {kept} other file(s) that are not archives, parity or release sidecars"));
-        }
-    }
-    Ok(report)
+    out.volumes = extracted.iter().flat_map(|s| s.volumes.iter().cloned()).collect();
+    out.skipped_any = !skipped.is_empty();
+    Ok(out)
 }
 
 /// Release sidecar files (checksums, info, scene metadata) that have no use once the

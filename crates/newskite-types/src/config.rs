@@ -57,14 +57,17 @@ pub struct PostProcessSettings {
     pub enabled: bool,
     pub repair: bool,
     pub extract: bool,
-    /// After every archive set extracts: delete the archives, parity files and release
-    /// sidecars (.sfv, .nfo, ...). On by default.
+    /// After every archive set extracts: delete the archive volumes. On by default.
     pub cleanup: bool,
+    /// Once PAR2 verified or repaired the download (or it has no PAR2 data) and nothing
+    /// failed to extract: delete the parity files, par2's `.1` backups and release
+    /// sidecars (.sfv, .nfo, ...), with or without archives. On by default.
+    pub remove_leftovers: bool,
 }
 
 impl Default for PostProcessSettings {
     fn default() -> Self {
-        Self { enabled: true, repair: true, extract: true, cleanup: true }
+        Self { enabled: true, repair: true, extract: true, cleanup: true, remove_leftovers: true }
     }
 }
 
