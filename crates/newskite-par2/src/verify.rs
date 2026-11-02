@@ -2,12 +2,15 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
 
 use md5::{Digest, Md5};
 
 use crate::packet::{FileEntry, RecoverySet};
+use crate::pio::{read_at_padded, LastFile, Source};
 use crate::{Event, Stage};
 
 /// Where one good input slice can be read.
@@ -96,158 +99,315 @@ pub fn safe_target(dir: &Path, name: &str) -> Option<PathBuf> {
     any.then_some(out)
 }
 
-/// Reads up to `buf.len()` bytes at `offset`, zero-filling the rest. Returns bytes read.
-pub(crate) fn read_padded(f: &mut File, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
-    f.seek(SeekFrom::Start(offset))?;
-    let mut n = 0;
-    while n < buf.len() {
-        match f.read(&mut buf[n..]) {
-            Ok(0) => break,
-            Ok(k) => n += k,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(e),
-        }
-    }
-    buf[n..].fill(0);
-    Ok(n)
-}
-
 fn md5_16k(path: &Path) -> Option<[u8; 16]> {
-    let mut f = File::open(path).ok()?;
+    let f = File::open(path).ok()?;
     let mut buf = vec![0u8; 16384];
-    let mut n = 0;
-    while n < buf.len() {
-        match f.read(&mut buf[n..]) {
-            Ok(0) => break,
-            Ok(k) => n += k,
-            Err(_) => return None,
-        }
-    }
+    let n = read_at_padded(&f, 0, &mut buf).ok()?;
     Some(Md5::digest(&buf[..n]).into())
 }
 
-/// Checks `path` against `entry` slice by slice. Returns (whole file correct, good slice
-/// indices within the file).
-fn check_file(
-    path: &Path,
-    entry: &FileEntry,
-    slice_size: u64,
-    buf: &mut [u8],
-    progress: &mut dyn FnMut(u64),
-) -> io::Result<(bool, Vec<usize>)> {
-    let mut f = File::open(path)?;
-    let len = f.metadata()?.len();
-    let mut whole = Md5::new();
-    let mut crc_ok = Vec::new();
-    for k in 0..entry.slices.len() {
-        let start = k as u64 * slice_size;
-        if start >= len {
-            break;
-        }
-        let n = read_padded(&mut f, start, buf)?;
-        whole.update(&buf[..n.min(entry.slice_len(k, slice_size) as usize)]);
-        if crc32fast::hash(buf) == entry.slices[k].crc {
-            crc_ok.push(k);
-        }
-        progress(n as u64);
-    }
-    let intact = len == entry.length && whole.finalize().as_slice() == entry.md5;
-    if intact {
-        return Ok((true, (0..entry.slices.len()).collect()));
-    }
-    // Damaged: confirm the CRC matches with MD5 (a second read of those slices only).
-    let mut good = Vec::new();
-    for k in crc_ok {
-        read_padded(&mut f, k as u64 * slice_size, buf)?;
-        if Md5::digest(&*buf).as_slice() == entry.slices[k].md5 {
-            good.push(k);
-        }
-    }
-    Ok((false, good))
+/// Threads for checking slices (MD5 is the cost, so more cores help until the disk is the
+/// limit).
+pub(crate) fn check_threads() -> usize {
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(8)
 }
 
-fn full_md5(path: &Path) -> Option<[u8; 16]> {
-    let mut f = File::open(path).ok()?;
-    let mut h = Md5::new();
-    let mut buf = vec![0u8; 1 << 20];
-    loop {
-        match f.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => h.update(&buf[..n]),
-            Err(_) => return None,
+/// `f` over `items` on up to `threads` threads; the results in item order. A panic in `f`
+/// is passed on to the caller.
+pub(crate) fn par_map<T: Sync, R: Send>(items: &[T], threads: usize, f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    let next = AtomicUsize::new(0);
+    let threads = threads.max(1).min(items.len());
+    let mut out: Vec<(usize, R)> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut done = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(item) = items.get(i) else { break done };
+                        done.push((i, f(item)));
+                    }
+                })
+            })
+            .collect();
+        workers.into_iter().flat_map(|w| w.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))).collect()
+    });
+    out.sort_by_key(|(i, _)| *i);
+    out.into_iter().map(|(_, r)| r).collect()
+}
+
+/// Bytes per read when checking slices (whole slices, at least one), so a spinning disk
+/// serving several threads still reads long runs.
+const CHECK_READ: u64 = 8 << 20;
+/// Upper bound for the read buffers of all checking threads together.
+const CHECK_MEMORY: u64 = 256 << 20;
+
+/// A file to check slice by slice against `entry`.
+pub(crate) struct SliceCheck<'a> {
+    pub(crate) file: Source<'a>,
+    /// The file's length (slices at or past it are not read and count as bad).
+    pub(crate) len: u64,
+    pub(crate) entry: &'a FileEntry,
+}
+
+/// Progress of [`scan_slices`], reported on the calling thread.
+pub(crate) enum CheckProgress {
+    /// Started on file `index`.
+    Started(usize),
+    /// Bytes read.
+    Bytes(u64),
+}
+
+/// Reads the first `count` slices of every `(file, count)` (zero-padded to the slice size
+/// as PAR2 defines it) on up to `threads` threads, in runs of consecutive slices so one big
+/// file goes as fast as many small ones, and maps each slice with `f(file, slice, bytes)`.
+/// Returns per file the results in slice order up to the first read error, and that error.
+pub(crate) fn scan_slices<R: Send>(
+    files: &[(Source<'_>, usize)],
+    slice_size: u64,
+    threads: usize,
+    progress: &mut dyn FnMut(CheckProgress),
+    f: impl Fn(usize, usize, &[u8]) -> R + Sync,
+) -> Vec<(Vec<R>, Option<io::Error>)> {
+    let per_read = (CHECK_READ / slice_size).max(1) as usize;
+    // Work items: (file, first slice, slice count), in file order.
+    let mut items = Vec::new();
+    for (j, &(_, count)) in files.iter().enumerate() {
+        let mut first = 0;
+        while first < count {
+            let n = per_read.min(count - first);
+            items.push((j, first, n));
+            first += n;
         }
     }
-    Some(h.finalize().into())
+    let buf_len = per_read * slice_size as usize;
+    let threads = threads.max(1).min(items.len()).min((CHECK_MEMORY / buf_len as u64).max(1) as usize);
+    let next = AtomicUsize::new(0);
+    let (tx, rx) = mpsc::channel();
+    let mut found: Vec<(usize, io::Result<Vec<R>>)> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                let (tx, next, items, f) = (tx.clone(), &next, &items, &f);
+                scope.spawn(move || {
+                    let mut buf = vec![0u8; buf_len];
+                    let mut last = LastFile::default();
+                    let mut out = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(&(j, first, n)) = items.get(i) else { break out };
+                        if first == 0 {
+                            let _ = tx.send(CheckProgress::Started(j));
+                        }
+                        let buf = &mut buf[..n * slice_size as usize];
+                        let read = last.get(j, files[j].0).and_then(|f| read_at_padded(f, first as u64 * slice_size, buf));
+                        let res = read.map(|got| {
+                            let _ = tx.send(CheckProgress::Bytes(got as u64));
+                            buf.chunks_exact(slice_size as usize).enumerate().map(|(k, s)| f(j, first + k, s)).collect()
+                        });
+                        out.push((i, res));
+                    }
+                })
+            })
+            .collect();
+        drop(tx);
+        for p in rx {
+            progress(p);
+        }
+        workers
+            .into_iter()
+            .flat_map(|w| w.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic)))
+            .collect()
+    });
+    found.sort_by_key(|(i, _)| *i);
+    let mut results: Vec<(Vec<R>, Option<io::Error>)> = files.iter().map(|_| (Vec::new(), None)).collect();
+    for (i, res) in found {
+        let (got, err) = &mut results[items[i].0];
+        match res {
+            Ok(r) if err.is_none() => got.extend(r),
+            Ok(_) => {}
+            Err(e) => {
+                err.get_or_insert(e);
+            }
+        }
+    }
+    results
+}
+
+/// For each job, which of its entry's slices the file holds intact (MD5 of the padded
+/// slice), checked on up to `threads` threads; a read error fails the job.
+pub(crate) fn check_slices(
+    jobs: &[SliceCheck<'_>],
+    slice_size: u64,
+    threads: usize,
+    progress: &mut dyn FnMut(CheckProgress),
+) -> Vec<io::Result<Vec<bool>>> {
+    let files: Vec<(Source<'_>, usize)> = jobs
+        .iter()
+        .map(|j| (j.file, j.len.div_ceil(slice_size).min(j.entry.slices.len() as u64) as usize))
+        .collect();
+    let scanned = scan_slices(&files, slice_size, threads, progress, |j, k, slice| {
+        Md5::digest(slice).as_slice() == jobs[j].entry.slices[k].md5
+    });
+    jobs.iter()
+        .zip(scanned)
+        .map(|(job, (mut good, err))| match err {
+            Some(e) => Err(e),
+            None => {
+                good.resize(job.entry.slices.len(), false);
+                Ok(good)
+            }
+        })
+        .collect()
+}
+
+/// Whether a file of `len` bytes whose slices check out as `good` is `entry` exactly.
+pub(crate) fn is_complete(entry: &FileEntry, len: u64, good: &[bool]) -> bool {
+    // Equal slices (each MD5-checked) and equal length make equal content; an empty file
+    // has no slices, so its whole-file MD5 decides.
+    len == entry.length && good.iter().all(|&g| g) && (entry.length > 0 || Md5::digest([]).as_slice() == entry.md5)
 }
 
 /// Verifies `set` against the files in `dir`. `others` are further candidate files (all
 /// regular files of the folder that are not PAR2 files); renamed copies and stray good
 /// slices are looked for in them.
+///
+/// Every slice is checked by its MD5 (a file is intact when all its slices are and its
+/// length is right), with the slices of all files spread over several threads.
 pub fn verify(set: &RecoverySet, dir: &Path, others: &[PathBuf], on: &mut dyn FnMut(Event)) -> Verification {
     let slice_size = set.slice_size;
-    let mut buf = vec![0u8; slice_size as usize];
+    let count = set.files.len();
     let mut sources: Vec<Option<SliceSource>> = vec![None; set.slice_count()];
-    let mut reports = Vec::new();
     let total_bytes = set.data_bytes();
     let mut done_bytes = 0u64;
     let targets: BTreeSet<PathBuf> = set.files.iter().filter_map(|f| safe_target(dir, &f.name)).collect();
     let mut used: BTreeSet<PathBuf> = BTreeSet::new();
-
-    for (i, entry) in set.files.iter().enumerate() {
-        on(Event::File { stage: Stage::Verify, index: i, count: set.files.len(), name: entry.name.clone() });
-        let Some(target) = safe_target(dir, &entry.name) else {
-            reports.push(FileReport { name: entry.name.clone(), length: entry.length, target: None, status: FileStatus::UnsafeName });
-            continue;
-        };
-        let total = entry.slices.len();
-        let is_file = std::fs::symlink_metadata(&target).map(|m| m.is_file()).unwrap_or(false);
-        let mut status = FileStatus::Missing { found: 0, total };
-        if is_file {
-            let mut tick = |n: u64| {
-                done_bytes += n;
-                on(Event::Bytes { stage: Stage::Verify, done: done_bytes.min(total_bytes), total: total_bytes });
+    let threads = check_threads();
+    let mut reports: Vec<FileReport> = set
+        .files
+        .iter()
+        .map(|e| {
+            let target = safe_target(dir, &e.name);
+            let status = match target {
+                Some(_) => FileStatus::Missing { found: 0, total: e.slices.len() },
+                None => FileStatus::UnsafeName,
             };
-            match check_file(&target, entry, slice_size, &mut buf, &mut tick) {
-                Ok((true, _)) => status = FileStatus::Intact,
-                Ok((false, good)) => {
-                    for &k in &good {
-                        sources[entry.first_slice + k] =
-                            Some(SliceSource { path: target.clone(), offset: k as u64 * slice_size });
-                    }
-                    status = FileStatus::Damaged { found: good.len(), total };
-                }
-                Err(e) => on(Event::Note(format!("{}: could not read: {e}", entry.name))),
+            FileReport { name: e.name.clone(), length: e.length, target, status }
+        })
+        .collect();
+
+    // The files under their own names, all checked at once. Every file gets a `File` event:
+    // those present when their check starts, the others right away.
+    let mut present = vec![false; count];
+    let mut opened = Vec::new();
+    for (i, (entry, r)) in set.files.iter().zip(&reports).enumerate() {
+        let meta = r.target.as_ref().and_then(|t| std::fs::symlink_metadata(t).ok()).filter(|m| m.is_file());
+        match (&r.target, meta) {
+            (Some(target), Some(m)) => {
+                present[i] = true;
+                opened.push((i, target.clone(), m.len()));
             }
-            if entry.length == 0 && status != FileStatus::Intact {
-                status = FileStatus::Damaged { found: 0, total: 0 };
-            }
+            _ => on(Event::File { stage: Stage::Verify, index: i, count, name: entry.name.clone() }),
         }
-        if status == FileStatus::Intact {
-            for k in 0..total {
-                sources[entry.first_slice + k] = Some(SliceSource { path: target.clone(), offset: k as u64 * slice_size });
-            }
-            used.insert(target.clone());
-        } else {
-            // A complete copy under another name (obfuscated posts).
-            let found = others.iter().find(|p| {
-                !targets.contains(*p)
-                    && !used.contains(*p)
-                    && std::fs::metadata(p).map(|m| m.is_file() && m.len() == entry.length).unwrap_or(false)
-                    && md5_16k(p) == Some(entry.md5_16k)
-                    && full_md5(p) == Some(entry.md5)
-            });
-            if let Some(p) = found {
-                for k in 0..total {
-                    sources[entry.first_slice + k] = Some(SliceSource { path: p.clone(), offset: k as u64 * slice_size });
-                }
-                used.insert(p.clone());
-                status = FileStatus::Misnamed(p.clone());
-            }
+    }
+    let mut tick = |p: CheckProgress, files: &[usize], on: &mut dyn FnMut(Event)| match p {
+        CheckProgress::Started(j) => {
+            let i = files[j];
+            on(Event::File { stage: Stage::Verify, index: i, count, name: set.files[i].name.clone() });
         }
-        reports.push(FileReport { name: entry.name.clone(), length: entry.length, target: Some(target), status });
+        CheckProgress::Bytes(n) => {
+            done_bytes += n;
+            on(Event::Bytes { stage: Stage::Verify, done: done_bytes.min(total_bytes), total: total_bytes });
+        }
+    };
+    let jobs: Vec<SliceCheck<'_>> = opened
+        .iter()
+        .map(|(i, target, len)| SliceCheck { file: Source::Path(target), len: *len, entry: &set.files[*i] })
+        .collect();
+    let of: Vec<usize> = opened.iter().map(|o| o.0).collect();
+    let checked = check_slices(&jobs, slice_size, threads, &mut |p| tick(p, &of, on));
+    for ((i, target, len), res) in opened.iter().zip(checked) {
+        let entry = &set.files[*i];
+        match res {
+            Ok(good) => {
+                for k in (0..good.len()).filter(|&k| good[k]) {
+                    sources[entry.first_slice + k] = Some(SliceSource { path: target.clone(), offset: k as u64 * slice_size });
+                }
+                reports[*i].status = if is_complete(entry, *len, &good) {
+                    used.insert(target.clone());
+                    FileStatus::Intact
+                } else {
+                    FileStatus::Damaged { found: good.iter().filter(|&&g| g).count(), total: entry.slices.len() }
+                };
+            }
+            Err(e) => on(Event::Note(format!("{}: could not read: {e}", entry.name))),
+        }
+    }
+    for (i, entry) in set.files.iter().enumerate() {
+        if present[i] && entry.length == 0 && reports[i].status != FileStatus::Intact {
+            reports[i].status = FileStatus::Damaged { found: 0, total: 0 };
+        }
     }
 
-    // Stray slices: aligned slices of other files (damaged renamed copies).
+    // Complete copies under other names (obfuscated posts): the candidates of the right
+    // size and first-16k hash are checked at once, then picked in file order.
+    let sizes: Vec<Option<u64>> = others
+        .iter()
+        .map(|p| std::fs::metadata(p).ok().filter(|m| m.is_file()).map(|m| m.len()))
+        .collect();
+    let mut head: HashMap<usize, Option<[u8; 16]>> = HashMap::new();
+    let mut candidates = Vec::new();
+    for (i, entry) in set.files.iter().enumerate() {
+        if matches!(reports[i].status, FileStatus::Intact | FileStatus::UnsafeName) {
+            continue;
+        }
+        for (o, p) in others.iter().enumerate() {
+            if sizes[o] != Some(entry.length) || targets.contains(p) || used.contains(p) {
+                continue;
+            }
+            if *head.entry(o).or_insert_with(|| md5_16k(p)) != Some(entry.md5_16k) {
+                continue;
+            }
+            candidates.push((i, p));
+        }
+    }
+    let jobs: Vec<SliceCheck<'_>> = candidates
+        .iter()
+        .map(|(i, p)| SliceCheck { file: Source::Path(p), len: set.files[*i].length, entry: &set.files[*i] })
+        .collect();
+    let of: Vec<usize> = candidates.iter().map(|c| c.0).collect();
+    let checked = check_slices(&jobs, slice_size, threads, &mut |p| tick(p, &of, on));
+    let mut partial = Vec::new();
+    for ((i, p), res) in candidates.iter().zip(checked) {
+        let entry = &set.files[*i];
+        let Ok(good) = res else { continue };
+        if !is_complete(entry, entry.length, &good) {
+            partial.push((*i, *p, good));
+            continue;
+        }
+        if matches!(reports[*i].status, FileStatus::Misnamed(_)) || used.contains(*p) {
+            continue;
+        }
+        for k in 0..entry.slices.len() {
+            sources[entry.first_slice + k] = Some(SliceSource { path: (*p).clone(), offset: k as u64 * slice_size });
+        }
+        used.insert((*p).clone());
+        reports[*i].status = FileStatus::Misnamed((*p).clone());
+    }
+    // Damaged copies under other names: their good slices are known from the check above.
+    for (i, p, good) in partial {
+        let entry = &set.files[i];
+        if used.contains(p) {
+            continue;
+        }
+        for k in (0..good.len()).filter(|&k| good[k]) {
+            sources[entry.first_slice + k]
+                .get_or_insert_with(|| SliceSource { path: p.clone(), offset: k as u64 * slice_size });
+        }
+    }
+
+    // Stray slices: aligned slices of other files (damaged renamed copies). Every slice is
+    // matched by CRC32 first; the MD5 is computed only when a still-missing slice has that
+    // CRC. The scan runs on several threads, the matches are taken in file order.
     let mut wanted: HashMap<u32, Vec<usize>> = HashMap::new();
     let mut owner: Vec<(usize, usize)> = Vec::with_capacity(sources.len());
     for (fi, e) in set.files.iter().enumerate() {
@@ -259,26 +419,30 @@ pub fn verify(set: &RecoverySet, dir: &Path, others: &[PathBuf], on: &mut dyn Fn
         }
     }
     if !wanted.is_empty() {
-        for p in others.iter().filter(|p| !targets.contains(*p) && !used.contains(*p)) {
-            let Ok(mut f) = File::open(p) else { continue };
-            let len = f.metadata().map(|m| m.len()).unwrap_or(0);
-            let mut off = 0u64;
+        let strays: Vec<(&PathBuf, u64)> = others
+            .iter()
+            .filter(|p| !targets.contains(*p) && !used.contains(*p))
+            .filter_map(|p| Some((p, std::fs::metadata(p).ok()?.len())))
+            .collect();
+        let files: Vec<(Source<'_>, usize)> =
+            strays.iter().map(|(p, len)| (Source::Path(p), len.div_ceil(slice_size) as usize)).collect();
+        let snapshot = &sources;
+        let scanned = scan_slices(&files, slice_size, threads, &mut |_| {}, |_, _, slice| {
+            let crc = crc32fast::hash(slice);
+            let missing = wanted.get(&crc)?.iter().any(|&g| snapshot[g].is_none());
+            missing.then(|| (crc, <[u8; 16]>::from(Md5::digest(slice))))
+        });
+        for ((p, _), (hashes, _)) in strays.iter().zip(scanned) {
             let mut hits = 0;
-            while off < len && !wanted.is_empty() {
-                if read_padded(&mut f, off, &mut buf).is_err() {
-                    break;
+            for (k, hash) in hashes.into_iter().enumerate() {
+                let Some((crc, md5)) = hash else { continue };
+                if let Some(&g) = wanted[&crc].iter().find(|&&g| {
+                    let (fi, k) = owner[g];
+                    sources[g].is_none() && set.files[fi].slices[k].md5 == md5
+                }) {
+                    sources[g] = Some(SliceSource { path: (*p).clone(), offset: k as u64 * slice_size });
+                    hits += 1;
                 }
-                if let Some(cands) = wanted.get(&crc32fast::hash(&buf)) {
-                    let md5: [u8; 16] = Md5::digest(&buf).into();
-                    if let Some(&g) = cands.iter().find(|&&g| {
-                        let (fi, k) = owner[g];
-                        sources[g].is_none() && set.files[fi].slices[k].md5 == md5
-                    }) {
-                        sources[g] = Some(SliceSource { path: p.clone(), offset: off });
-                        hits += 1;
-                    }
-                }
-                off += slice_size;
             }
             if hits > 0 {
                 on(Event::Note(format!(
@@ -287,14 +451,14 @@ pub fn verify(set: &RecoverySet, dir: &Path, others: &[PathBuf], on: &mut dyn Fn
                 )));
             }
         }
-        // Update the counts with the stray slices.
-        for (fi, r) in reports.iter_mut().enumerate() {
-            let e = &set.files[fi];
-            let found = (0..e.slices.len()).filter(|k| sources[e.first_slice + k].is_some()).count();
-            match &mut r.status {
-                FileStatus::Damaged { found: f, .. } | FileStatus::Missing { found: f, .. } => *f = found,
-                _ => {}
-            }
+    }
+    // Update the counts with the slices found in other files.
+    for (fi, r) in reports.iter_mut().enumerate() {
+        let e = &set.files[fi];
+        let found = (0..e.slices.len()).filter(|k| sources[e.first_slice + k].is_some()).count();
+        match &mut r.status {
+            FileStatus::Damaged { found: f, .. } | FileStatus::Missing { found: f, .. } => *f = found,
+            _ => {}
         }
     }
 
