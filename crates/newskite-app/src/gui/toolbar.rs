@@ -10,7 +10,9 @@ use super::brand;
 use super::fonts;
 use super::icons;
 use super::theme::Palette;
-use super::widgets::{error_line, icon_button, spaced, tool_button, Icon, ToolState};
+use super::widgets::{
+    compact_button, error_line, icon_button, spaced, tool_button, ButtonKind, Icon, ToolState,
+};
 
 /// Width below which toolbar labels are hidden (icons + tooltips only).
 const LABEL_MIN_WIDTH: f32 = 900.0;
@@ -247,15 +249,11 @@ fn open_nzb_row(ui: &mut Ui, pal: &Palette, view: &mut ViewState, actions: &mut 
         if resp.changed() {
             view.open_nzb.error = None;
         }
-        let browse = ui.add_enabled(!view.dialog_open, egui::Button::new("Browse…"));
-        if browse.clicked() {
+        if compact_button(ui, pal, ButtonKind::Outline, "Browse…", !view.dialog_open).clicked() {
             actions.push(Action::BrowseNzb);
         }
         let text = view.open_nzb.path.trim().to_owned();
-        let add = ui.add_enabled(
-            !text.is_empty(),
-            egui::Button::new(RichText::new("Add").strong()),
-        );
+        let add = compact_button(ui, pal, ButtonKind::Outline, "Add", !text.is_empty());
         if (add.clicked() || submit) && !text.is_empty() {
             // Pasted file:// URIs (as file managers copy them) and ~ paths work too.
             match crate::launch::path_from_text(&text) {

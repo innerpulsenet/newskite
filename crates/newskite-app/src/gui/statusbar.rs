@@ -220,7 +220,7 @@ pub fn show(
             if data.totals.jobs_pending > 0 {
                 ui.label(
                     RichText::new(format!("{} in queue", data.totals.jobs_pending))
-                        .small()
+                        .font(super::fonts::mono_id(11.0))
                         .color(pal.muted),
                 );
             }

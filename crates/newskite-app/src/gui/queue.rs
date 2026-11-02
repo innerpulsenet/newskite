@@ -18,8 +18,8 @@ use super::fonts;
 use super::motion::{self, Beat};
 use super::theme::Palette;
 use super::widgets::{
-    article_grid, icon_button, keycap, kit_button, paint_icon, segment_track_live, spaced,
-    state_badge, ButtonKind, Icon, EYEBROW_TRACKING,
+    article_grid, compact_button, icon_button, icon_button_enabled, keycap, kit_button,
+    paint_icon, segment_track_live, spaced, state_badge, ButtonKind, Icon, EYEBROW_TRACKING,
 };
 
 /// Seconds the just-imported job's name stays in the accent before settling.
@@ -52,8 +52,8 @@ const CONTROLS_W: f32 = 160.0;
 const NAME_MIN: f32 = 150.0;
 const PROGRESS_MIN: f32 = 110.0;
 const PROGRESS_MAX: f32 = 240.0;
-/// History table: actions column.
-const HISTORY_ACTIONS_W: f32 = 166.0;
+/// History table: actions column (up to six icon buttons).
+const HISTORY_ACTIONS_W: f32 = 184.0;
 /// History table: result chip plus its qualifier.
 const RESULT_W: f32 = 120.0;
 /// History table: finish time.
@@ -99,7 +99,10 @@ impl RowBg {
         let ctx = &resp.ctx;
         let hover = ctx.animate_bool(resp.id.with("row-hover"), resp.contains_pointer());
         let sel = ctx.animate_bool(resp.id.with("row-selected"), selected);
-        let rect = resp.rect.shrink2(egui::vec2(0.0, 2.0));
+        // Inside the visible part of the table, clear of its right edge (an open
+        // inspector borders it there).
+        let mut rect = resp.rect.intersect(self.painter.clip_rect()).shrink2(egui::vec2(0.0, 2.0));
+        rect.max.x -= 6.0;
         let radius = egui::CornerRadius::same(8);
         // A faint hairline between rows; the washes below cover it.
         let mut shapes = vec![egui::Shape::hline(
@@ -507,6 +510,12 @@ fn queue_tab(
                 format::bytes(done),
                 format::bytes(total)
             ));
+            // The track's figure, so it reads without hovering.
+            ui.label(
+                RichText::new(format!("{}%", format::percent(done, total)))
+                    .font(fonts::mono_id(12.0))
+                    .color(pal.muted),
+            );
         }
     });
     if jobs.is_empty() {
@@ -664,16 +673,24 @@ fn no_match(ui: &mut Ui, pal: &Palette, filter: &str) {
 fn header_labels(h: &mut egui_extras::TableRow<'_, '_>, pal: &Palette, labels: &[&str]) {
     for (i, t) in labels.iter().enumerate() {
         h.col(|ui| {
-            if i == 0 {
-                // Lines up with the rows' first cell (see RAIL_ROOM).
-                ui.add_space(RAIL_ROOM);
-            }
             let job = spaced(
                 &t.to_uppercase(),
                 fonts::mono_id(11.0),
                 pal.faint,
                 EYEBROW_TRACKING,
             );
+            if *t == "#" {
+                // Over the right-aligned positions.
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.add_space(4.0);
+                    ui.add(egui::Label::new(job).selectable(false));
+                });
+                return;
+            }
+            if i == 0 {
+                // Lines up with the rows' first cell (see RAIL_ROOM).
+                ui.add_space(RAIL_ROOM);
+            }
             ui.add(egui::Label::new(job).selectable(false));
         });
     }
@@ -739,13 +756,16 @@ fn queue_table(
                     let mut bg = None;
                     row.col(|ui| {
                         bg = Some(RowBg::reserve(ui, clip));
-                        // Room for the selection rail before the position.
-                        ui.add_space(RAIL_ROOM);
-                        ui.label(
-                            RichText::new(pos.map_or("–".to_owned(), |p| (p + 1).to_string()))
-                                .font(fonts::mono_id(12.0))
-                                .color(pal.faint),
-                        );
+                        // Positions sit at the right of their column, clear of the
+                        // selection rail at the row's left edge.
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.add_space(4.0);
+                            ui.label(
+                                RichText::new(pos.map_or("–".to_owned(), |p| (p + 1).to_string()))
+                                    .font(fonts::mono_id(12.0))
+                                    .color(pal.faint),
+                            );
+                        });
                     });
                     row.col(|ui| {
                         let highlight = if view.queue.highlight == Some(job.id) {
@@ -983,7 +1003,7 @@ fn name_cell(ui: &mut Ui, pal: &Palette, job: &Job, highlight: Option<f32>, live
             (Some(e), JobState::Failed, _) => (e.clone(), pal.negative),
             (_, _, Some(l)) => (l, pal.accent_fg),
             (_, JobState::Done, _) if job.stats.download_ms >= 1000 => (finished_subline(job), pal.muted),
-            _ => (job.dest_dir.display().to_string(), pal.muted),
+            _ => (home_relative(&job.dest_dir), pal.muted),
         };
         ui.add(
             egui::Label::new(RichText::new(sub).small().color(color))
@@ -991,6 +1011,15 @@ fn name_cell(ui: &mut Ui, pal: &Palette, job: &Job, highlight: Option<f32>, live
                 .selectable(false),
         );
     });
+}
+
+/// `path` with the home folder written as `~` (sublines show many folders under it).
+pub fn home_relative(path: &std::path::Path) -> String {
+    match std::env::home_dir().and_then(|h| path.strip_prefix(&h).ok().map(|r| r.to_path_buf())) {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
+        Some(rest) => format!("~{}{}", std::path::MAIN_SEPARATOR, rest.display()),
+        None => path.display().to_string(),
+    }
 }
 
 /// `"8m 12s · 25.3 MB/s · extracted"` for a finished job (measured figures only).
@@ -1122,7 +1151,7 @@ fn inline_editors(
                     .desired_width(76.0),
             );
             let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if ui.small_button("Save").clicked() || enter {
+            if compact_button(ui, pal, ButtonKind::Outline, "Save", true).clicked() || enter {
                 let pw = (!text.is_empty()).then(|| text.clone());
                 actions.push(Action::SetJobPassword(job.id, pw));
                 q.password_edit = None;
@@ -1136,11 +1165,11 @@ fn inline_editors(
         ui.spacing_mut().item_spacing.x = 6.0;
         ui.label(RichText::new("Delete files?").color(pal.negative))
             .on_hover_text(format!("Permanently delete {} and remove the job", job.dest_dir.display()));
-        if ui.small_button("Yes").clicked() {
+        if compact_button(ui, pal, ButtonKind::Danger, "Yes", true).clicked() {
             actions.push(Action::DeleteJobFiles(job.id));
             q.confirm_delete = None;
         }
-        if ui.small_button("No").clicked() {
+        if compact_button(ui, pal, ButtonKind::Text, "No", true).clicked() {
             q.confirm_delete = None;
         }
         return true;
@@ -1148,11 +1177,11 @@ fn inline_editors(
     if q.confirm_remove == Some(job.id) {
         ui.spacing_mut().item_spacing.x = 6.0;
         ui.label(RichText::new("Remove?").color(pal.negative));
-        if ui.small_button("Yes").clicked() {
+        if compact_button(ui, pal, ButtonKind::Danger, "Yes", true).clicked() {
             actions.push(Action::RemoveJob(job.id));
             q.confirm_remove = None;
         }
-        if ui.small_button("No").clicked() {
+        if compact_button(ui, pal, ButtonKind::Text, "No", true).clicked() {
             q.confirm_remove = None;
         }
         return true;
@@ -1188,16 +1217,13 @@ fn controls_cell(
         .position(|&id| id == job.id)
         .map(|p| (p == 0, p + 1 == order.len()));
     let first = place.is_none_or(|(f, _)| f);
-    let up = icon_button(
+    let up = icon_button_enabled(
         ui,
         pal,
         Icon::ChevronUp,
-        if first {
-            Palette::fade(pal.muted, 0.4)
-        } else {
-            pal.muted
-        },
-        "Move up (Alt+↑)",
+        pal.muted,
+        if first { "Already first in the queue" } else { "Move up (Alt+↑)" },
+        !first,
     );
     if up.clicked() && !first {
         actions.push(Action::MoveJob(job.id, JobMove::Up));

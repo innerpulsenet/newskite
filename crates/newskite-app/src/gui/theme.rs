@@ -31,18 +31,23 @@ pub fn parse_user_color(s: &str) -> Option<Color32> {
     Rgb::from_str(s).ok().map(to_color32)
 }
 
-/// Moves `fg` toward `toward` in 10% steps until it reaches `min_contrast` against
-/// `bg` (or `toward` itself is reached). Keeps hues recognizable while readable.
-fn readable_on(fg: Rgb, bg: Rgb, toward: Rgb, min_contrast: f32) -> Rgb {
+/// Moves `fg` toward `toward` in 5% steps until it reaches `min_contrast` against every
+/// one of `grounds` (or `toward` itself is reached). Keeps hues recognizable while
+/// readable.
+fn readable_on_all(fg: Rgb, grounds: &[Rgb], toward: Rgb, min_contrast: f32) -> Rgb {
     let mut c = fg;
-    for step in 0..=10u8 {
-        c = fg.mix(toward, f32::from(step) / 10.0);
-        if c.contrast(bg) >= min_contrast {
+    for step in 0..=20u8 {
+        c = fg.mix(toward, f32::from(step) / 20.0);
+        if grounds.iter().all(|g| c.contrast(*g) >= min_contrast) {
             break;
         }
     }
     c
 }
+
+/// Contrast every kind of small text must reach on every surface it sits on (WCAG AA
+/// for text under 18 px).
+pub const TEXT_CONTRAST: f32 = 4.5;
 
 /// Picks whichever of `a`/`b` contrasts more with `bg`.
 fn best_contrast(bg: Rgb, a: Rgb, b: Rgb) -> Rgb {
@@ -126,7 +131,19 @@ impl Palette {
     /// Derives the palette from desktop tokens.
     pub fn from_tokens(t: &Tokens, dark: bool) -> Self {
         let soft = |c: Rgb, amount: f32| to_color32(t.surface_raised.mix(c, amount));
-        let accent_fg = readable_on(t.accent, t.surface, t.text, 4.5);
+        // Secondary text, captions and status words are small type on every surface, so
+        // each reaches 4.5:1 on all three (desktop schemes often ship a muted text that
+        // does not, e.g. Breeze light). A status color also has to read on its own chip
+        // wash. Colors that already pass are kept as they are.
+        let grounds = [t.surface, t.surface_raised, t.surface_sunken];
+        let readable = |c: Rgb, min: f32| readable_on_all(c, &grounds, t.text, min);
+        // Chips tint their ground with the status color (see `widgets::status_chip`);
+        // a little margin keeps antialiased glyph edges above the line too.
+        let status = |c: Rgb| {
+            let washed = [t.surface, t.surface_raised, t.surface_sunken, t.surface.mix(c, 0.2), t.surface_raised.mix(c, 0.2)];
+            readable_on_all(c, &washed, t.text, TEXT_CONTRAST + 0.5)
+        };
+        let accent_fg = readable(t.accent, TEXT_CONTRAST);
         // Shadows: darker than any surface. Mixing the sunken surface toward the
         // darker of text/surface keeps them derived from tokens in both schemes.
         let shadow_base = if dark { t.surface_sunken } else { t.text };
@@ -138,8 +155,8 @@ impl Palette {
             raised: to_color32(t.surface_raised),
             sunken: to_color32(t.surface_sunken),
             text: to_color32(t.text),
-            muted: to_color32(t.text_muted),
-            faint: to_color32(t.text_muted.mix(t.surface, 0.22)),
+            muted: to_color32(readable(t.text_muted, 5.0)),
+            faint: to_color32(readable(t.text_muted.mix(t.surface, 0.22), TEXT_CONTRAST)),
             accent: to_color32(t.accent),
             accent_text: to_color32(t.accent_text),
             accent_fg: to_color32(accent_fg),
@@ -147,11 +164,11 @@ impl Palette {
             border: to_color32(t.border),
             border_strong: to_color32(t.border.mix(t.text, 0.35)),
             hover: to_color32(t.surface_raised.mix(t.text, 0.09)),
-            positive: to_color32(t.positive),
+            positive: to_color32(status(t.positive)),
             positive_soft: soft(t.positive, if dark { 0.22 } else { 0.16 }),
-            warning: to_color32(t.warning),
+            warning: to_color32(status(t.warning)),
             warning_soft: soft(t.warning, if dark { 0.22 } else { 0.16 }),
-            negative: to_color32(t.negative),
+            negative: to_color32(status(t.negative)),
             negative_soft: soft(t.negative, if dark { 0.22 } else { 0.16 }),
             shadow: Color32::from_rgba_unmultiplied(
                 shadow_base.r,
@@ -372,9 +389,11 @@ mod tests {
                 v.widgets.noninteractive.bg_stroke.color,
                 to_color32(t.border)
             );
-            assert_eq!(v.weak_text_color, Some(to_color32(t.text_muted)));
-            assert_eq!(v.warn_fg_color, to_color32(t.warning));
-            assert_eq!(v.error_fg_color, to_color32(t.negative));
+            // Text colors are the tokens made readable (see `Palette::from_tokens`).
+            let p = Palette::from_tokens(t, dark);
+            assert_eq!(v.weak_text_color, Some(p.muted));
+            assert_eq!(v.warn_fg_color, p.warning);
+            assert_eq!(v.error_fg_color, p.negative);
             assert_eq!(v.widgets.active.bg_stroke.color, to_color32(t.accent));
         }
     }
@@ -409,7 +428,7 @@ mod tests {
             let theme = fallback(dark);
             let t = &theme.tokens;
             // The readable accent reaches 4.5:1 unless the tokens make that impossible.
-            let fg = readable_on(t.accent, t.surface, t.text, 4.5);
+            let fg = readable_on_all(t.accent, &[t.surface], t.text, 4.5);
             assert!(
                 fg.contrast(t.surface) >= 4.5,
                 "dark={dark}: {}",
@@ -421,6 +440,38 @@ mod tests {
             let fg = v.selection.stroke.color;
             let fg_rgb = Rgb::new(fg.r(), fg.g(), fg.b());
             assert!(fg_rgb.contrast(sel_rgb) >= 3.0, "dark={dark}");
+        }
+    }
+
+    /// Every small-text color reaches 4.5:1 on every surface in every theme the app
+    /// ships or is tested with: the fallbacks, Breeze dark and light, ink and paper.
+    #[test]
+    fn small_text_is_readable_on_every_surface() {
+        let breeze = |s: &str| newskite_theme::from_kdeglobals_str(s).expect("fixture parses");
+        let themes = [
+            ("fallback dark", fallback(true)),
+            ("fallback light", fallback(false)),
+            ("breeze dark", breeze(include_str!("../../../newskite-theme/tests/fixtures/breeze-dark.kdeglobals"))),
+            ("breeze light", breeze(include_str!("../../../newskite-theme/tests/fixtures/breeze-light.kdeglobals"))),
+            ("ink", super::super::brand_tokens::ink()),
+            ("paper", super::super::brand_tokens::paper()),
+        ];
+        let rgb = |c: Color32| Rgb::new(c.r(), c.g(), c.b());
+        for (name, theme) in themes {
+            let p = Palette::from_theme(&theme);
+            for (what, fg) in [
+                ("muted", p.muted),
+                ("faint", p.faint),
+                ("accent_fg", p.accent_fg),
+                ("positive", p.positive),
+                ("warning", p.warning),
+                ("negative", p.negative),
+            ] {
+                for (ground, bg) in [("surface", p.surface), ("raised", p.raised), ("sunken", p.sunken)] {
+                    let c = rgb(fg).contrast(rgb(bg));
+                    assert!(c >= TEXT_CONTRAST - 0.01, "{name}: {what} on {ground} is {c:.2}:1");
+                }
+            }
         }
     }
 
