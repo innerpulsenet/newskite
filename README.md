@@ -209,8 +209,8 @@ AppStream id and the Wayland `app_id` / X11 `WM_CLASS` the window sets.
 ```sh
 cargo install cargo-deb --locked     # once
 cargo deb -p newskite
-# -> target/debian/newskite_0.1.0-1_amd64.deb
-sudo apt install ./target/debian/newskite_0.1.0-1_amd64.deb
+# -> target/debian/newskite_0.9.0-1_amd64.deb
+sudo apt install ./target/debian/newskite_0.9.0-1_amd64.deb
 ```
 
 The metadata is in `[package.metadata.deb]` in `crates/newskite-app/Cargo.toml`. The package
