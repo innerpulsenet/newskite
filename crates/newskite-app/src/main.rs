@@ -3,6 +3,11 @@
 //! * `newskite --headless ...` runs the headless CLI (`newskite_cli`).
 //! * Otherwise the window opens; positional `.nzb` paths, `file://` and local `nzb://`
 //!   URIs are queued at launch, or handed to the window already open (`handoff`).
+//!
+//! On Windows the binary uses the GUI subsystem, so no console window opens behind the
+//! app; the text modes attach to the console they were started from.
+
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
 use std::process::ExitCode;
 use std::time::Duration;
@@ -17,7 +22,12 @@ use newskite_service::{LogLevel, Service, ServiceError, ServiceOptions, StoreErr
 use newskite_types::config::default_data_dir;
 
 fn main() -> ExitCode {
-    match launch::parse_args(std::env::args_os()) {
+    let mode = launch::parse_args(std::env::args_os());
+    #[cfg(windows)]
+    if !matches!(mode, Mode::Gui(_)) {
+        newskite_app::win::attach_parent_console();
+    }
+    match mode {
         Mode::Headless(args) => {
             newskite_cli::run_headless(newskite_cli::HeadlessArgs::parse_from(args))
         }
