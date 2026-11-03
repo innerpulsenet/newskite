@@ -53,9 +53,9 @@ jobs:
       # on the development machine and are not run here.
       - name: Test
         run: |
-          cargo test --workspace --exclude newskite --locked
+          cargo test --workspace --exclude newskite --locked --no-fail-fast
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test -p newskite --lib --bins --locked
+          cargo test -p newskite --lib --bins --locked --no-fail-fast
 
       - name: Build
         run: cargo build --release --locked -p newskite
@@ -123,8 +123,8 @@ jobs:
 
       - name: Test
         run: |
-          cargo test --workspace --exclude newskite --locked
-          cargo test -p newskite --lib --bins --locked
+          cargo test --workspace --exclude newskite --locked --no-fail-fast
+          cargo test -p newskite --lib --bins --locked --no-fail-fast
 
       - name: Build
         run: cargo build --release --locked -p newskite
