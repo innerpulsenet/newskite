@@ -25,6 +25,12 @@ use unrar_sys as ffi;
 use super::{check_listing, safe_relative, NativeError, Sink};
 use crate::detect::ArchiveSet;
 
+// UnRAR reads its settings path from the registry (`GetRarDataPath`), but `unrar_sys`
+// does not link the library those functions live in, so MSVC builds fail to link.
+#[cfg(windows)]
+#[link(name = "advapi32")]
+extern "system" {}
+
 /// Longest link destination kept from a RAR 4 link entry's data.
 const LINK_TARGET_MAX: usize = 4096;
 /// Size of the redirection (link destination) buffer, in wide characters.
