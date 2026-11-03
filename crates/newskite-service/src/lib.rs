@@ -97,7 +97,7 @@ use tokio_util::sync::CancellationToken;
 pub use newskite_store::{
     Bookmark, Job, JobFile, JobLogLine, JobState, JobStats, NewBookmark, Store, StoreError, ThroughputSample, Totals,
 };
-pub use newskite_types::{FailureKind, JobOutcome, ServerHealth, StepRecord, StepState};
+pub use newskite_types::{FailureKind, JobOutcome, RepairOutlook, ServerHealth, StepRecord, StepState};
 pub use files::Deleted;
 pub use shutdown::shutdown_command;
 
@@ -380,6 +380,9 @@ pub(crate) struct Inner {
     /// Article maps of the jobs downloading now, kept up to date from engine events and
     /// saved to the store when their run ends (see [`Service::article_map`]).
     pub(crate) articles: Mutex<HashMap<i64, ArticleMap>>,
+    /// The latest repair outlook of each job downloaded this session; saved with the job's
+    /// outcome when it finishes.
+    pub(crate) outlooks: Mutex<HashMap<i64, RepairOutlook>>,
 }
 
 /// Lock a mutex, recovering the data if a panicking thread poisoned it.
@@ -647,6 +650,7 @@ impl Service {
             speed_limit: SpeedLimit::default(),
             backup_first: Mutex::new(HashMap::new()),
             articles: Mutex::new(HashMap::new()),
+            outlooks: Mutex::new(HashMap::new()),
         });
         inner.speed_limit.set(inner.settings().speed_limit_bps());
         match inner.store.reset_interrupted() {
@@ -1184,6 +1188,16 @@ impl Service {
                 None
             }
         }
+    }
+
+    /// A job's repair outlook: live while it downloads (and until it finishes), then as
+    /// saved with its outcome.
+    pub fn repair_outlook(&self, job_id: i64) -> Option<RepairOutlook> {
+        if let Some(o) = lock(&self.inner.outlooks).get(&job_id) {
+            return Some(*o);
+        }
+        let job = self.inner.store.get_job(job_id).ok()??;
+        job.stats.outcome.and_then(|o| o.repair_outlook)
     }
 
     /// Per-file rows of a job (empty on error).

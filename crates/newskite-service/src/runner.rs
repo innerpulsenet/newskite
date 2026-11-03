@@ -384,6 +384,7 @@ async fn download_job(
         speed_limit: inner.speed_limit.clone(),
         connect_timeout: crate::CONNECT_TIMEOUT,
         skip_files,
+        stop_unrepairable: settings.stop_unrepairable,
     };
     let articles_total: u64 = nzb.files.iter().map(|f| f.segments.len() as u64).sum();
     let _ = inner.store.mark_job_started(job.id, crate::now_secs(), articles_total);
@@ -447,6 +448,16 @@ async fn download_job(
                 let fin = Finish::failed(FailureKind::MissingArticles).missing(ids.len());
                 fail_job(inner, &job, &missing_message(&ids), fin);
             }
+            None
+        }
+        Err(EngineError::Unrepairable { needed, available, missing }) => {
+            let reason = format!(
+                "stopped early: {missing} missing article{} damaged {needed} slice{}, but at most {available} recovery block{} can arrive",
+                if missing == 1 { "" } else { "s" },
+                if needed == 1 { "" } else { "s" },
+                if available == 1 { "" } else { "s" },
+            );
+            fail_job(inner, &job, &reason, Finish::failed(FailureKind::Unrepairable).missing(missing));
             None
         }
         Err(EngineError::AuthFailed(m)) => {
@@ -695,7 +706,10 @@ async fn finish_partial(inner: &Arc<Inner>, job: &Job, settings: &Settings, ids:
 }
 
 /// Records the finish in the store and tells subscribers.
-fn record_finish(inner: &Inner, job: &Job, ok: bool, detail: String, fin: Finish) {
+fn record_finish(inner: &Inner, job: &Job, ok: bool, detail: String, mut fin: Finish) {
+    if let Some(o) = lock(&inner.outlooks).remove(&job.id) {
+        fin.outcome.repair_outlook = Some(o);
+    }
     if let Err(e) = inner.store.set_job_outcome(job.id, crate::now_secs(), fin.post_ms, fin.missing, &fin.outcome) {
         if !matches!(e, StoreError::NotFound) {
             inner.log_job(job.id, LogLevel::Warn, format!("could not record the outcome of {}: {e}", job.name));
@@ -829,6 +843,9 @@ async fn forward_events(
                         if missing.len() == 1 { "" } else { "s" }
                     ),
                 );
+            }
+            EngineEvent::Repair(o) => {
+                lock(&inner.outlooks).insert(job_id, *o);
             }
             EngineEvent::Log(line) => inner.log_job(job_id, LogLevel::Info, line.clone()),
             EngineEvent::Warn(line) => inner.log_job(job_id, LogLevel::Warn, line.clone()),

@@ -21,6 +21,7 @@ pub mod icons;
 pub mod inspector;
 pub mod motion;
 pub mod queue;
+pub mod repair;
 pub mod serverstrip;
 pub mod settings;
 pub mod sidebar;

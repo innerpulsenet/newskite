@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::RepairOutlook;
+
 /// Progress events emitted by the download engine (`engine://event` in the outline).
 /// `SegmentDone` is high-frequency; consumers must never turn it into one log line per
 /// segment.
@@ -23,6 +25,8 @@ pub enum EngineEvent {
     FileComplete { file: usize },
     FileDone { name: String, path: PathBuf, bytes: u64 },
     FileFailed { name: String, missing: Vec<String> },
+    /// The job's repair outlook changed (sent whenever a figure of it changes).
+    Repair(RepairOutlook),
     /// Human-readable engine line (job started, server fail-over, ...).
     Log(String),
     /// A problem that did not stop the download (retries, missing articles, CRC errors).

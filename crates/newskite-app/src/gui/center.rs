@@ -679,5 +679,16 @@ fn subline(ui: &mut Ui, pal: &Palette, data: &Data, job: &Job, kind: RowKind, qu
             _ => (home_relative(&job.dest_dir), quiet),
         }
     };
+    // A job with damage so far shows how much of its recovery data it has used up.
+    let outlook = data.outlook(job).filter(|o| o.known && o.needed > 0 && job.state != JobState::Failed && job.state != JobState::Done);
+    if let Some(o) = outlook {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            super::repair::row_reading(ui, pal, &o);
+            ui.add_space(10.0);
+            ui.add(egui::Label::new(RichText::new(text).size(12.0).color(color)).truncate().selectable(false));
+        });
+        return;
+    }
     ui.add(egui::Label::new(RichText::new(text).size(12.0).color(color)).truncate().selectable(false));
 }

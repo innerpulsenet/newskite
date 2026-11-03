@@ -236,6 +236,15 @@ fn seed_populated(store: &Store, dir: &Path) {
                 slices_rebuilt: 4,
                 articles_repaired: 4,
                 files_removed: 9,
+                repair_outlook: Some(newskite_types::RepairOutlook {
+                    known: true,
+                    blocks: 878,
+                    needed: 4,
+                    posted: 44,
+                    available: 44,
+                    exact: true,
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
         )
@@ -1050,6 +1059,147 @@ fn downloading_row_shows_eta_and_finish_flash() {
     h.run_steps(12);
     let t = h.ctx.input(|i| i.time);
     assert!(app(&h).view.queue.flash(id, t).is_none(), "wash fades out");
+}
+
+/// A downloading job with a live repair outlook (sent as the engine reports it): the row
+/// reads it out and the inspector draws the budget.
+#[test]
+fn live_repair_budget_shows_in_the_row_and_the_inspector() {
+    let fx = Fixture::new(|store, dir| {
+        seed_populated(store, dir);
+        let job = store
+            .insert_job_at(
+                &NewJob {
+                    name: "Damaged.Post.Live".into(),
+                    bytes_total: 900 * 1024 * 1024,
+                    dest_dir: Path::new("/home/reader/Downloads/Newskite/Damaged.Post.Live").into(),
+                    source_path: dir.join("damaged.nzb"),
+                    password: None,
+                },
+                now() - 60,
+            )
+            .expect("job");
+        store.set_job_progress(job.id, 610 * 1024 * 1024).expect("progress");
+        use newskite_types::ArticleState::{Done, Missing, Waiting};
+        seed_map(store, job.id, &[("a8f3c1", 900), ("77e0b2", 1), ("c91d4e", 60)], |k| {
+            if k % 23 == 7 && k < 620 {
+                Missing
+            } else if k < 640 {
+                Done
+            } else {
+                Waiting
+            }
+        });
+    });
+    let mut h = fx.harness_with(true, SIZE, false);
+    h.run_steps(3);
+    let id = app(&h).data.jobs.iter().find(|j| j.name == "Damaged.Post.Live").map(|j| j.id).expect("job");
+    {
+        let app = h.state_mut().as_mut().expect("app");
+        for j in app.data.jobs.iter_mut() {
+            if j.id == id {
+                j.state = JobState::Downloading;
+            }
+        }
+    }
+    let outlook = newskite_types::RepairOutlook {
+        known: true,
+        blocks: 1_800,
+        needed: 38,
+        posted: 48,
+        available: 44,
+        exact: false,
+        ..Default::default()
+    };
+    app(&h)
+        .sender()
+        .send(newskite_app::gui::UiMsg::Service(newskite_service::ServiceEvent::Engine {
+            job_id: id,
+            event: newskite_types::EngineEvent::Repair(outlook),
+        }))
+        .expect("send");
+    run_until(&mut h, |h| app(h).data.outlooks.contains_key(&id));
+    h.get_by_label("38 / ≤44 recovery blocks");
+    h.get_by_label("Damaged.Post.Live").click();
+    h.run_steps(4);
+    h.get_by_label("Tight");
+    h.get_by_label("38 of 1,800 slices damaged; up to 6 recovery blocks to spare.");
+    assert_no_bad_numbers(&h);
+    snapshot(&mut h, "repair-live-dark");
+}
+
+/// A job stopped because it could not be repaired: the problem card says so and offers the
+/// backup retry, and the budget shows how far short it fell.
+#[test]
+fn unrepairable_job_explains_itself() {
+    use newskite_types::{FailureKind, JobOutcome, RepairOutlook};
+    let fx = Fixture::new(|store, dir| {
+        seed_populated(store, dir);
+        let job = store
+            .insert_job_at(
+                &NewJob {
+                    name: "Taken.Down.Release".into(),
+                    bytes_total: 2 * 1024 * 1024 * 1024,
+                    dest_dir: Path::new("/home/reader/Downloads/Newskite/Taken.Down.Release").into(),
+                    source_path: dir.join("taken.nzb"),
+                    password: None,
+                },
+                now() - 600,
+            )
+            .expect("job");
+        let reason = "stopped early: 212 missing articles damaged 61 slices, but at most 40 recovery blocks can arrive";
+        store.set_job_state(job.id, JobState::Failed, Some(reason)).expect("state");
+        store.mark_job_started(job.id, now() - 590, 2_900).expect("start");
+        store.add_job_download_ms(job.id, 41_000).expect("ms");
+        store
+            .set_job_outcome(
+                job.id,
+                now() - 540,
+                0,
+                212,
+                &JobOutcome {
+                    failure: Some(FailureKind::Unrepairable),
+                    repair_outlook: Some(RepairOutlook {
+                        known: true,
+                        blocks: 2_740,
+                        needed: 61,
+                        posted: 52,
+                        available: 40,
+                        exact: false,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .expect("outcome");
+        use newskite_types::ArticleState::{Done, Missing, Waiting};
+        seed_map(store, job.id, &[("taken.part01.rar", 1_400), ("taken.part02.rar", 1_400), ("taken.vol00+52.par2", 100)], |k| {
+            if (k % 13 == 4 && k < 1_620) || (2_800..2_812).contains(&k) {
+                Missing
+            } else if !(1_640..2_800).contains(&k) {
+                Done
+            } else {
+                Waiting
+            }
+        });
+    });
+    let mut h = fx.harness(true, SIZE);
+    h.run_steps(2);
+    h.get_by_label("History (3)").click();
+    h.run_steps(3);
+    h.get_by_label("Taken.Down.Release").click();
+    h.run_steps(4);
+    h.get_by_label(FailureKind::Unrepairable.hint());
+    h.get_by_label("Stopped early: 61 damaged slices, at most 40 recovery blocks");
+    assert_eq!(h.get_all_by_label("Can't be repaired").count(), 3, "problem title, result step and budget verdict");
+    h.get_by_label("61 slices damaged, but at most 40 recovery blocks can arrive: 21 short.");
+    h.get_by_label("Repair budget: 40 damaged, 0 spare, 21 short, 12 lost blocks");
+    h.get_by_label("Retry on backup");
+    assert_no_bad_numbers(&h);
+    snapshot(&mut h, "inspector-unrepairable-dark");
+    h.get_by_label("Repair budget: 40 damaged, 0 spare, 21 short, 12 lost blocks").scroll_to_me();
+    h.run_steps(3);
+    snapshot(&mut h, "inspector-unrepairable-budget-dark");
 }
 
 #[test]

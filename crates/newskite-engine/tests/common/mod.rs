@@ -118,6 +118,7 @@ pub fn options(connections: usize) -> EngineOptions {
         speed_limit: newskite_engine::SpeedLimit::default(),
         connect_timeout: Duration::from_secs(5),
         skip_files: HashSet::new(),
+        stop_unrepairable: false,
     }
 }
 

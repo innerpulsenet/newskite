@@ -87,6 +87,7 @@ fn main() {
                 speed_limit: newskite_engine::SpeedLimit::default(),
                 connect_timeout: Duration::from_secs(5),
                 skip_files: HashSet::new(),
+                stop_unrepairable: false,
             };
             let req = DownloadRequest { nzb: nzb.clone(), dest_dir: dir.path().to_path_buf(), servers: vec![cfg.clone()], options };
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();

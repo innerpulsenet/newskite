@@ -776,6 +776,11 @@ fn postprocess_section(ui: &mut Ui, pal: &Palette, s: &mut Settings) {
                 );
             });
         });
+        toggle(ui, pal, &mut s.stop_unrepairable, "Stop downloads that can't be repaired").on_hover_text(
+            "While a job downloads, its missing articles are weighed against the PAR2 recovery data posted with it. \
+             Once more is missing than that data could ever rebuild, the download stops instead of fetching \
+             the rest; its files stay, so Retry (or Retry on backup) picks up where it left off.",
+        );
         ui.label(
             RichText::new(
                 "PAR2 repair and RAR, 7z and zip extraction are built in; no external tools are needed.",

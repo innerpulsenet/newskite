@@ -10,6 +10,8 @@ description = "Newskite download engine: concurrent NNTP segment fetch, yEnc dec
 newskite-types.workspace = true
 newskite-nzb.workspace = true
 newskite-nntp.workspace = true
+newskite-par2.workspace = true
+md-5 = "0.10"
 thiserror.workspace = true
 tracing.workspace = true
 tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }

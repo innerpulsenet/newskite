@@ -43,7 +43,8 @@ async fn acceptance_two_mib_eight_parts_with_auth() {
     assert!(server.connections_accepted() <= 4, "reuses at most 4 connections");
 
     // Event order: Layout, FileStarted, 8 x SegmentDone (done reaching 8), FileDone.
-    let file_events: Vec<&EngineEvent> = out.events.iter().filter(|e| !matches!(e, EngineEvent::Log(_) | EngineEvent::Warn(_))).collect();
+    let file_events: Vec<&EngineEvent> =
+        out.events.iter().filter(|e| !matches!(e, EngineEvent::Log(_) | EngineEvent::Warn(_) | EngineEvent::Repair(_))).collect();
     assert!(matches!(file_events[0], EngineEvent::Layout { files }
         if files.len() == 1 && files[0].segments == 8 && !files[0].complete));
     assert!(matches!(file_events[1], EngineEvent::FileStarted { name, segments: 8 } if name == "payload.bin"));
@@ -60,6 +61,13 @@ async fn acceptance_two_mib_eight_parts_with_auth() {
     assert_eq!(places, (0..8).map(|i| (0, i)).collect::<Vec<_>>());
     assert!(matches!(file_events[10], EngineEvent::FileDone { bytes, .. } if *bytes == (2 * MIB) as u64));
     assert_eq!(file_events.len(), 11);
+    // No PAR2 in the job: once the file's first article showed it is not PAR2, there is
+    // nothing to repair with.
+    let last_outlook = out.events.iter().rev().find_map(|e| match e {
+        EngineEvent::Repair(o) => Some(*o),
+        _ => None,
+    });
+    assert!(last_outlook.is_some_and(|o| o.no_par2 && !o.known));
 
     let logs = logs(&out.events);
     assert!(logs.iter().any(|l| l.starts_with("Starting download: 1 file(s)")));

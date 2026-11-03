@@ -21,6 +21,7 @@ use crate::limiter::RateLimiter;
 use crate::naming::{claim_key, part_path, suffix_number, with_suffix};
 use crate::pool::ConnectionPool;
 use crate::pwrite::{read_exact_at, write_all_at};
+use crate::repair::{is_par2_name, vol_blocks, Head, Tracker};
 use crate::{backoff_delay, DownloadRequest, EngineError, FileReport, JobReport, Progress};
 
 /// Message ids listed in a missing-article summary line.
@@ -193,6 +194,9 @@ struct Shared {
     /// Articles rejected as damaged, foreign or with an invalid id (see
     /// [`BAD_ARTICLE_LOG_LIMIT`]).
     bad_articles: AtomicUsize,
+    /// The repair outlook (see [`crate::repair`]).
+    repair: Mutex<Tracker>,
+    stop_unrepairable: bool,
 }
 
 impl Shared {
@@ -246,6 +250,48 @@ impl Shared {
             }
         }
         self.abort.cancel();
+    }
+
+    /// A decoded part of file `fi`, article `si`, about to be stored.
+    fn note_part(&self, fi: usize, si: usize, part: &YencPart) {
+        let head = (part.begin == 1).then(|| Head::of(&part.data, part.size));
+        let changed = lock(&self.repair).note_part(fi, si, &part.name, part.size, (part.begin, part.end), head);
+        if changed {
+            self.update_outlook();
+        }
+    }
+
+    /// Article `si` of file `fi` is missing or failed its CRC.
+    fn note_damaged(&self, fi: usize, si: usize) {
+        if lock(&self.repair).note_damaged(fi, si) {
+            self.update_outlook();
+        }
+    }
+
+    /// Recomputes the repair outlook; reports a change, and stops the job when it can no
+    /// longer be repaired and the caller asked for that.
+    fn update_outlook(&self) {
+        let (o, was) = {
+            let mut t = lock(&self.repair);
+            let o = t.outlook();
+            if t.last == Some(o) {
+                return;
+            }
+            (o, t.last.replace(o))
+        };
+        if o.known && !was.is_some_and(|w| w.known) {
+            let approx = if o.exact { "" } else { "up to " };
+            self.log(format!("PAR2: {} slice(s) protected, {approx}{} recovery block(s) posted", o.blocks, o.posted));
+        }
+        self.emit(EngineEvent::Repair(o));
+        if o.hopeless() && self.stop_unrepairable && !self.abort.is_cancelled() {
+            let missing = self.files.iter().map(|f| lock(&f.missing).len()).sum();
+            self.warn(format!(
+                "Stopping: the damage needs at least {} recovery block(s), but at most {} can still arrive ({} posted); the download cannot be repaired",
+                o.needed, o.available, o.posted
+            ));
+            self.fail(EngineError::Unrepairable { needed: o.needed, available: o.available, missing });
+        }
     }
 
     fn next_item(&self) -> Option<(usize, usize)> {
@@ -410,7 +456,6 @@ pub(crate) async fn run(
     .map_err(|e| io::Error::other(format!("preparing the download folder failed: {e}")))??;
 
     let mut claimed = HashSet::new();
-    let mut queue = VecDeque::new();
     let mut download_bytes = 0u64;
     let mut download_files = 0usize;
     let mut skipped_names = Vec::new();
@@ -431,14 +476,24 @@ pub(crate) async fn run(
         } else {
             download_files += 1;
             download_bytes += nzb.files[fi].total_bytes();
-            queue.extend((0..file.segments.len()).map(|si| (fi, si)));
         }
     }
+    let queue = download_order(&files, &pre_skipped);
 
     let total_segments = queue.len();
     let slots: Vec<ServerSlot> = servers.into_iter().map(ServerSlot::new).collect();
     let capacity: usize = slots.iter().map(|s| usize::from(s.cfg.connections.max(1))).sum();
     let workers = options.connections.max(1).min(capacity).min(total_segments);
+    let tracker = Tracker::new(
+        files
+            .iter()
+            .map(|f| {
+                let numbers = f.segments.iter().map(|s| s.number).collect();
+                (f.label.clone(), numbers, f.segments.iter().map(|s| s.bytes).collect())
+            })
+            .collect(),
+        UNKNOWN_SEGMENT_BYTES,
+    );
 
     let shared = Arc::new(Shared {
         dest_dir,
@@ -459,6 +514,8 @@ pub(crate) async fn run(
         bytes_written: AtomicU64::new(0),
         failovers: AtomicUsize::new(0),
         bad_articles: AtomicUsize::new(0),
+        repair: Mutex::new(tracker),
+        stop_unrepairable: options.stop_unrepairable,
     });
 
     // A new job tries every server again; earlier login failures stay in last_error.
@@ -477,6 +534,22 @@ pub(crate) async fn run(
     for name in &skipped_names {
         shared.log(format!("{name}: already complete, skipping"));
     }
+    // Files complete from an earlier run still count for the repair outlook.
+    let found: Vec<(usize, PathBuf)> = pre_skipped
+        .iter()
+        .enumerate()
+        .filter(|(_, &s)| s)
+        .map(|(fi, _)| (fi, shared.dest_dir.join(&shared.files[fi].label)))
+        .collect();
+    if !found.is_empty() {
+        let s = shared.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            for (fi, path) in found {
+                note_on_disk(&s, fi, &path);
+            }
+        })
+        .await;
+    }
     // Before any file event: the article events place themselves in this layout.
     shared.emit(EngineEvent::Layout {
         files: shared
@@ -486,6 +559,7 @@ pub(crate) async fn run(
             .map(|(f, &complete)| FileLayout { name: f.label.clone(), segments: f.segments.len(), complete })
             .collect(),
     });
+    shared.update_outlook();
 
     let mut set = JoinSet::new();
     for _ in 0..workers {
@@ -554,6 +628,51 @@ fn skipped_report(shared: &Shared, file: &FileJob) -> FileReport {
     };
     let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
     FileReport { name, path, bytes, missing: Vec::new(), crc_errors: 0 }
+}
+
+/// The queue: the PAR2 index (the smallest `.par2` that is not a volume, else the smallest
+/// volume) whole, then the first article of every other file, then the rest in NZB order.
+fn download_order(files: &[FileJob], skipped: &[bool]) -> VecDeque<(usize, usize)> {
+    let todo: Vec<usize> = (0..files.len()).filter(|&fi| !skipped[fi]).collect();
+    let declared = |fi: usize| files[fi].segments.iter().map(|s| s.bytes).fold(0u64, u64::saturating_add);
+    let index = todo
+        .iter()
+        .copied()
+        .filter(|&fi| is_par2_name(&files[fi].label))
+        .min_by_key(|&fi| (vol_blocks(&files[fi].label).is_some(), declared(fi)));
+    let mut queue = VecDeque::new();
+    if let Some(fi) = index {
+        queue.extend((0..files[fi].segments.len()).map(|si| (fi, si)));
+    }
+    let rest: Vec<usize> = todo.into_iter().filter(|&fi| Some(fi) != index).collect();
+    queue.extend(rest.iter().filter(|&&fi| !files[fi].segments.is_empty()).map(|&fi| (fi, 0)));
+    for fi in rest {
+        queue.extend((1..files[fi].segments.len()).map(|si| (fi, si)));
+    }
+    queue
+}
+
+/// Blocking: tells the repair outlook about file `fi`, complete at `path` from an earlier
+/// run (its first bytes, and its recovery blocks when it is PAR2).
+fn note_on_disk(shared: &Shared, fi: usize, path: &Path) {
+    let Ok(f) = File::open(path) else { return };
+    let len = f.metadata().map_or(0, |m| m.len());
+    let mut head = vec![0u8; len.min(16 * 1024) as usize];
+    let head = read_exact_at(&f, &mut head, 0).is_ok().then(|| Head::of(&head, len));
+    let par2 = {
+        let mut t = lock(&shared.repair);
+        t.note_complete(fi, len, head);
+        t.is_par2(fi)
+    };
+    if par2 {
+        read_par2(shared, fi, path);
+    }
+}
+
+/// Blocking: reads file `fi` at `path` as PAR2 for the repair outlook.
+fn read_par2(shared: &Shared, fi: usize, path: &Path) {
+    let (sets, _) = newskite_par2::load(&[path.to_path_buf()]);
+    lock(&shared.repair).note_par2(fi, &sets);
 }
 
 async fn worker(shared: Arc<Shared>) {
@@ -979,6 +1098,7 @@ async fn record_missing(shared: &Arc<Shared>, fi: usize, si: usize, reason: Opti
     }
     lock(&file.missing).push((seg.number, seg.message_id.clone()));
     shared.emit(EngineEvent::SegmentMissing { file: fi, index: si });
+    shared.note_damaged(fi, si);
     finish_segment(shared, fi, si, None).await
 }
 
@@ -1020,8 +1140,10 @@ async fn store_part(shared: &Arc<Shared>, fi: usize, si: usize, decoded: Decoded
     if out.skipped {
         return finish_segment(shared, fi, si, None).await;
     }
+    shared.note_part(fi, si, &part);
     if part.crc_ok == Some(false) {
         file.crc_errors.fetch_add(1, Ordering::Relaxed);
+        shared.note_damaged(fi, si);
     }
     let len = part.data.len() as u64;
     let end = part.end;
@@ -1096,6 +1218,8 @@ async fn open_output(shared: Arc<Shared>, fi: usize, first: Arc<YencPart>) -> io
     if out.skipped {
         shared.log(format!("{}: already complete, skipping", out.name));
         shared.emit(EngineEvent::FileComplete { file: fi });
+        let (s, path) = (shared.clone(), out.final_path.clone());
+        let _ = tokio::task::spawn_blocking(move || note_on_disk(&s, fi, &path)).await;
     } else {
         shared.emit(EngineEvent::FileStarted { name: out.name.clone(), segments: file.segments.len() });
     }
@@ -1274,7 +1398,13 @@ async fn finalize(shared: &Arc<Shared>, fi: usize) -> io::Result<()> {
             FileReport { name, path, bytes: target, missing: Vec::new(), crc_errors }
         }
     };
+    let path = report.path.clone();
     *lock(&file.report) = Some(report);
+    if lock(&shared.repair).is_par2(fi) {
+        let s = shared.clone();
+        let _ = tokio::task::spawn_blocking(move || read_par2(&s, fi, &path)).await;
+    }
+    shared.update_outlook();
     Ok(())
 }
 
@@ -1352,6 +1482,8 @@ mod tests {
             bytes_written: AtomicU64::new(0),
             failovers: AtomicUsize::new(0),
             bad_articles: AtomicUsize::new(0),
+            repair: Mutex::new(Tracker::new(Vec::new(), 0)),
+            stop_unrepairable: false,
         };
         let ids: Vec<String> = (1..=5).map(|i| format!("id{i}@x")).collect();
         fail_file(&shared, "f.bin", &ids);
@@ -1384,6 +1516,8 @@ mod tests {
             bytes_written: AtomicU64::new(0),
             failovers: AtomicUsize::new(0),
             bad_articles: AtomicUsize::new(0),
+            repair: Mutex::new(Tracker::new(Vec::new(), 0)),
+            stop_unrepairable: false,
         };
         for i in 0..60 {
             shared.log_bad_article(&format!("f.bin: article <{i}@x> could not be decoded"));
@@ -1423,6 +1557,8 @@ mod tests {
             bytes_written: AtomicU64::new(0),
             failovers: AtomicUsize::new(0),
             bad_articles: AtomicUsize::new(0),
+            repair: Mutex::new(Tracker::new(Vec::new(), 0)),
+            stop_unrepairable: false,
         };
         assert_eq!(shared.order(&[false, false, false], 0), vec![0, 1, 2]);
         assert_eq!(shared.order(&[false, false, false], 2), vec![2, 0, 1]);

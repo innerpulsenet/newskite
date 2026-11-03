@@ -812,6 +812,10 @@ async fn missing_article_is_repaired_by_par2_and_files_can_be_deleted() {
     assert_eq!(o.articles_repaired, 1);
     assert_eq!(o.failure, None);
     assert!(o.par2_summary.as_deref().unwrap().contains("1 missing"), "{o:?}");
+    // The outlook it downloaded with: article 3 holds bytes 20 480..30 720, slices 10 to 14.
+    let outlook = newskite_types::RepairOutlook { known: true, blocks: 20, needed: 5, posted: 8, available: 8, exact: true, no_par2: false };
+    assert_eq!(o.repair_outlook, Some(outlook));
+    assert_eq!(svc.repair_outlook(job.id), Some(outlook));
     let log = svc.job_log(job.id);
     assert!(log.iter().any(|l| l.level == "warn" && l.text.contains("trying a PAR2 repair")), "{log:#?}");
     assert!(svc.logs().iter().filter(|l| l.job_id == Some(job.id)).count() > 3);
@@ -826,4 +830,46 @@ async fn missing_article_is_repaired_by_par2_and_files_can_be_deleted() {
     assert!(!job.dest_dir.exists());
     assert!(svc.jobs().is_empty());
     assert!(tmp.path().join("downloads").exists(), "the download folder itself stays");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn damage_beyond_the_par2_data_stops_the_job_as_unrepairable() {
+    let tmp = TempDir::new().unwrap();
+    let data = common::random_bytes(40 * 1024, 78);
+    let src = tmp.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("m.bin"), &data).unwrap();
+    let written = newskite_par2::create(&src, &["m.bin"], 2048, 8, &src.join("m")).unwrap();
+    let file = TestFile::new("u", "m.bin", data, 4);
+    let par2: Vec<TestFile> = written
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let name = p.file_name().unwrap().to_string_lossy().into_owned();
+            TestFile::new(&format!("q{i}"), &name, std::fs::read(p).unwrap(), 1)
+        })
+        .collect();
+    // Articles 2 and 3: slices 5 to 14, ten of them, against 8 recovery blocks.
+    let gone = [file.articles[1].0.clone(), file.articles[2].0.clone()];
+    let mut all: Vec<&TestFile> = vec![&file];
+    all.extend(par2.iter());
+    let mock = mock_for(&all, &[gone[0].as_str(), gone[1].as_str()], 0).await;
+    let mut settings = test_settings(tmp.path(), vec![server_for(&mock, 1)]);
+    settings.postprocess = newskite_types::PostProcessSettings::default();
+    let svc = open_service(tmp.path(), settings);
+    let job = svc.add_nzb(&write_nzb(&tmp.path().join("n"), "m.nzb", None, &all)).unwrap();
+
+    assert!(svc.start());
+    wait_idle(&svc, 30).await;
+    let failed = svc.jobs().remove(0);
+    assert_eq!(failed.state, JobState::Failed);
+    let error = failed.error.clone().unwrap();
+    assert!(error.starts_with("stopped early: 2 missing articles damaged 10 slices, but at most 8 recovery blocks"), "{error}");
+    let o = failed.stats.outcome.as_ref().unwrap();
+    assert_eq!(o.failure, Some(newskite_types::FailureKind::Unrepairable));
+    assert!(o.verify.is_none(), "no post-processing for a job that cannot be repaired");
+    let outlook = o.repair_outlook.unwrap();
+    assert!(outlook.hopeless() && outlook.needed == 10, "{outlook:?}");
+    assert_eq!(failed.stats.articles_missing, 2);
+    assert!(svc.job_log(job.id).iter().any(|l| l.text.starts_with("Stopping: the damage needs at least 10")));
 }

@@ -116,7 +116,7 @@ pub fn timeline(job: &Job, post: Option<&PostProgress>, done: u64, speed: u64, n
     let dl_time = ms_text(st.download_ms);
     let download_failed = matches!(
         outcome.and_then(|o| o.failure),
-        Some(FailureKind::Auth | FailureKind::Connection | FailureKind::Disk | FailureKind::Nzb)
+        Some(FailureKind::Auth | FailureKind::Connection | FailureKind::Disk | FailureKind::Nzb | FailureKind::Unrepairable)
     ) || (outcome.is_some_and(|o| o.failure == Some(FailureKind::MissingArticles) && o.verify.is_none()));
     let dl = match job.state {
         JobState::Queued if st.started_at.is_none() => Step::new("Download", Mark::Waiting, "Waiting in the queue"),
@@ -149,6 +149,10 @@ pub fn timeline(job: &Job, post: Option<&PostProgress>, done: u64, speed: u64, n
                 Some(FailureKind::MissingArticles) => {
                     format!("{} article(s) missing on every server", st.articles_missing)
                 }
+                Some(FailureKind::Unrepairable) => match outcome.and_then(|o| o.repair_outlook) {
+                    Some(r) => format!("Stopped early: {} damaged slices, at most {} recovery blocks", r.needed, r.available),
+                    None => "Stopped early: too few recovery blocks".into(),
+                },
                 Some(k) => k.label().to_string(),
                 None => "failed".into(),
             };
@@ -419,6 +423,13 @@ fn overview(
     lifecycle(ui, pal, &steps, reduced);
     ui.add_space(12.0);
 
+    // The repair budget, once there is something measured to show (or while it is being
+    // measured).
+    if let Some(o) = data.outlook(job).filter(|o| o.known || o.no_par2 || job.state == JobState::Downloading) {
+        super::repair::section(ui, pal, egui::Id::new(("inspector-repair", job.id)), &o, pal.raised, reduced);
+        ui.add_space(12.0);
+    }
+
     // Every article of the job as recorded by its runs, then one lane per file.
     let held = job.state == JobState::Paused;
     match data.article_maps.get(&job.id).filter(|m| !m.is_empty()) {
@@ -569,7 +580,16 @@ fn problem(ui: &mut Ui, pal: &Palette, data: &Data, job: &Job, state: &mut Inspe
                 actions.push(Action::RetryJob(job.id));
             }
             // Missing articles and server trouble are what a fail-over server can fix.
-            if matches!(kind, None | Some(FailureKind::MissingArticles | FailureKind::Connection | FailureKind::Auth | FailureKind::Repair)) {
+            if matches!(
+                kind,
+                None | Some(
+                    FailureKind::MissingArticles
+                        | FailureKind::Unrepairable
+                        | FailureKind::Connection
+                        | FailureKind::Auth
+                        | FailureKind::Repair
+                )
+            ) {
                 let servers = data.settings.usable_servers();
                 let ok = servers.len() >= 2;
                 let r = kit_button(ui, pal, ButtonKind::Outline, Some(Icon::RetryBackup), "Retry on backup", ok);
