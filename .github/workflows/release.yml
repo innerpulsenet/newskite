@@ -54,8 +54,9 @@ jobs:
       - name: Test
         run: |
           cargo test --workspace --exclude newskite --locked --no-fail-fast
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $first = $LASTEXITCODE
           cargo test -p newskite --lib --bins --locked --no-fail-fast
+          if ($first -ne 0 -or $LASTEXITCODE -ne 0) { exit 1 }
 
       - name: Build
         run: cargo build --release --locked -p newskite
@@ -123,8 +124,10 @@ jobs:
 
       - name: Test
         run: |
-          cargo test --workspace --exclude newskite --locked --no-fail-fast
-          cargo test -p newskite --lib --bins --locked --no-fail-fast
+          status=0
+          cargo test --workspace --exclude newskite --locked --no-fail-fast || status=1
+          cargo test -p newskite --lib --bins --locked --no-fail-fast || status=1
+          exit "$status"
 
       - name: Build
         run: cargo build --release --locked -p newskite
