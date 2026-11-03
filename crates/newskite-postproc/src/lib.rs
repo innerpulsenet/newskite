@@ -244,11 +244,29 @@ pub enum PostError {
 /// spaces and dots trimmed, Windows reserved device names prefixed with `_`, and capped
 /// at 200 bytes. Never empty, `.` or `..` (falls back to `extracted`).
 pub fn extraction_dir_name(job_name: &str) -> String {
-    let mapped: String = job_name
+    windows_safe_name(job_name, true)
+}
+
+/// One path component of an archive entry, made storable on Windows by the rules of
+/// [`extraction_dir_name`] except that leading dots stay: `.gitignore` is extracted as
+/// `.gitignore`. Trailing dots and spaces, which Windows would drop, are still trimmed.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn entry_component_name(name: &str) -> String {
+    windows_safe_name(name, false)
+}
+
+fn windows_safe_name(name: &str, trim_leading_dots: bool) -> String {
+    let mapped: String = name
         .chars()
         .map(|c| if c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') { '_' } else { c })
         .collect();
-    let mut s = mapped.trim_matches(|c: char| c == ' ' || c == '.').to_string();
+    let trimmed = mapped.trim_end_matches([' ', '.']);
+    let mut s = if trim_leading_dots {
+        trimmed.trim_start_matches([' ', '.'])
+    } else {
+        trimmed.trim_start_matches(' ')
+    }
+    .to_string();
     if s.len() > 200 {
         let mut cut = 200;
         while !s.is_char_boundary(cut) {
@@ -635,6 +653,17 @@ mod tests {
         let long = "é".repeat(300);
         let s = extraction_dir_name(&long);
         assert!(s.len() <= 200 && !s.is_empty());
+    }
+
+    #[test]
+    fn entry_component_keeps_leading_dots() {
+        assert_eq!(entry_component_name(".gitignore"), ".gitignore");
+        assert_eq!(entry_component_name(".config"), ".config");
+        assert_eq!(extraction_dir_name(".config"), "config");
+        assert_eq!(entry_component_name("notes. "), "notes");
+        assert_eq!(entry_component_name("a:b"), "a_b");
+        assert_eq!(entry_component_name("CON.txt"), "_CON.txt");
+        assert_eq!(entry_component_name("..."), "extracted");
     }
 
     #[test]
