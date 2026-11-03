@@ -143,7 +143,7 @@ pub(crate) fn safe_relative(name: &str) -> Result<Option<PathBuf>, NativeError> 
             continue;
         }
         #[cfg(windows)]
-        let c = crate::extraction_dir_name(c);
+        let c = crate::entry_component_name(c);
         out.push(c);
     }
     // Paranoia: whatever the platform made of the components, only normal ones remain.
