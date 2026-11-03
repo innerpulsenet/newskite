@@ -873,3 +873,59 @@ async fn damage_beyond_the_par2_data_stops_the_job_as_unrepairable() {
     assert_eq!(failed.stats.articles_missing, 2);
     assert!(svc.job_log(job.id).iter().any(|l| l.text.starts_with("Stopping: the damage needs at least 10")));
 }
+
+/// A post whose data arrives whole while some of its PAR2 volume's articles are gone (the
+/// shape of a partly taken-down release): complete, never failed, with or without
+/// post-processing. With post-processing off the volume's partial stays, like any file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn articles_lost_only_in_par2_volumes_do_not_fail_the_job() {
+    for postprocess in [true, false] {
+        let tmp = TempDir::new().unwrap();
+        let data = common::random_bytes(40 * 1024, 79);
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("m.bin"), &data).unwrap();
+        let written = newskite_par2::create(&src, &["m.bin"], 2048, 8, &src.join("m")).unwrap();
+        let file = TestFile::new("w", "m.bin", data.clone(), 4);
+        let par2: Vec<TestFile> = written
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let name = p.file_name().unwrap().to_string_lossy().into_owned();
+                TestFile::new(&format!("v{i}"), &name, std::fs::read(p).unwrap(), 3)
+            })
+            .collect();
+        // Two of the volume's three articles are gone.
+        let gone = [par2[1].articles[1].0.clone(), par2[1].articles[2].0.clone()];
+        let mut all: Vec<&TestFile> = vec![&file];
+        all.extend(par2.iter());
+        let mock = mock_for(&all, &[gone[0].as_str(), gone[1].as_str()], 0).await;
+        let mut settings = test_settings(tmp.path(), vec![server_for(&mock, 2)]);
+        settings.postprocess = newskite_types::PostProcessSettings { enabled: postprocess, ..Default::default() };
+        let svc = open_service(tmp.path(), settings);
+        let job = svc.add_nzb(&write_nzb(&tmp.path().join("n"), "m.nzb", None, &all)).unwrap();
+
+        assert!(svc.start());
+        wait_idle(&svc, 30).await;
+        let done = svc.jobs().remove(0);
+        let logs: Vec<String> = svc.job_log(job.id).into_iter().map(|l| l.text).collect();
+        assert_eq!(done.state, JobState::Done, "postprocess {postprocess}: {:?}\n{logs:#?}", done.error);
+        assert_eq!(std::fs::read(job.dest_dir.join("m.bin")).unwrap(), data);
+        assert!(logs.iter().any(|l| l.contains("2 missing articles") && l.contains("all in PAR2 or sidecar files")), "{logs:#?}");
+        let st = &done.stats;
+        assert_eq!(st.articles_missing, 2);
+        let partial = job.dest_dir.join("m.vol00+08.par2.nkpart");
+        match st.outcome.as_deref() {
+            Some(o) if postprocess => {
+                assert_eq!((o.articles_unneeded, o.articles_repaired, o.failure), (2, 0, None), "{o:?}");
+                assert!(!o.repaired(), "nothing was repaired");
+                assert!(!partial.exists(), "the damaged volume goes once the data is verified");
+            }
+            o => {
+                assert_eq!(o.map(|o| o.articles_unneeded), Some(2), "{o:?}");
+                assert!(partial.exists());
+            }
+        }
+        svc.shutdown();
+    }
+}

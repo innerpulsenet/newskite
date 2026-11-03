@@ -312,8 +312,9 @@ impl Tracker {
             for (f, role) in self.files.iter().zip(&roles) {
                 match (role, &f.read) {
                     (Role::Par2, Some(read)) => {
+                        // A damaged volume reads fewer blocks than its name says were posted.
                         let n = read.get(&set.id).copied().unwrap_or(0);
-                        posted += n;
+                        posted += f.names().find_map(vol_blocks).map_or(n, |named| named.max(n));
                         available += n;
                     }
                     (Role::Par2, None) => {
@@ -462,7 +463,18 @@ mod tests {
         assert_eq!(t.outlook().available, 2);
         t.note_par2(2, &[set(1, &[("d.rar", 5000)], 2)]);
         let o = t.outlook();
-        assert_eq!((o.posted, o.available, o.exact), (2, 2, true));
+        // The name says 4 were posted; 2 were lost with the missing articles.
+        assert_eq!((o.posted, o.available, o.exact), (4, 2, true));
+    }
+
+    #[test]
+    fn a_damaged_volume_read_short_still_counts_its_named_blocks_as_posted() {
+        let mut t = Tracker::new(vec![file("d.rar", 10, 520), file("d.par2", 1, 900), file("d.vol07+08.par2", 8, 1100)], 0);
+        t.note_par2(1, &[set(1, &[("d.rar", 5000)], 0)]);
+        t.note_damaged(2, 3);
+        t.note_par2(2, &[set(1, &[("d.rar", 5000)], 5)]);
+        let o = t.outlook();
+        assert_eq!((o.posted, o.available), (8, 5), "3 blocks lost with the missing articles");
     }
 
     #[test]

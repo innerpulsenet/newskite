@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use newskite_engine::{download_with_pool, DownloadRequest, EngineError, EngineOptions, JobReport};
+use newskite_engine::{download_with_pool, DownloadRequest, EngineError, EngineOptions, JobReport, PART_EXTENSION};
 use newskite_postproc::{PostEvent, PostOptions, PostReport, PostStage, Verdict};
 use newskite_store::{Job, JobFile, JobState, StoreError};
 use newskite_types::{
@@ -395,9 +395,12 @@ async fn download_job(
     let started = Instant::now();
     let result = download_with_pool(req, inner.pool.clone(), tx, inner.progress.clone(), token).await;
     let _ = inner.store.add_job_download_ms(job.id, started.elapsed().as_millis() as u64);
+    // Missing articles per file, from `FileFailed`.
+    let mut failed_files: HashMap<String, usize> = HashMap::new();
     match tokio::time::timeout(FORWARDER_DRAIN, &mut forwarder).await {
-        Ok(Ok((fetched, missing))) => {
+        Ok(Ok((fetched, missing, failed))) => {
             let _ = inner.store.add_article_counts(fetched, missing);
+            failed_files = failed;
         }
         Ok(Err(e)) => tracing::warn!(target: "newskite_service", "event forwarder failed: {e}"),
         Err(_) => {
@@ -439,11 +442,34 @@ async fn download_job(
         Err(EngineError::MissingArticles { ids }) => {
             let p = &settings.postprocess;
             let dir = job.dest_dir.clone();
-            let par2 = p.enabled && p.repair && tokio::task::spawn_blocking(move || newskite_postproc::has_par2(&dir)).await.unwrap_or(false);
-            if par2 {
+            let (unneeded, has_par2) = tokio::task::spawn_blocking(move || {
+                let unneeded: usize = failed_files
+                    .iter()
+                    .filter(|(name, _)| newskite_postproc::is_unneeded(&dir.join(format!("{name}.{PART_EXTENSION}"))))
+                    .map(|(_, n)| n)
+                    .sum();
+                (unneeded, newskite_postproc::has_par2(&dir))
+            })
+            .await
+            .unwrap_or((0, false));
+            if unneeded == ids.len() {
+                // Only PAR2 volumes and sidecars lost articles: the data itself is whole.
+                inner.log_job(
+                    job.id,
+                    LogLevel::Warn,
+                    format!("{}: {}, all in PAR2 or sidecar files the data does not need", job.name, missing_message(&ids)),
+                );
+                let line = format!(
+                    "completed {} ({} missing article{} only in PAR2 or sidecar files)",
+                    job.name,
+                    ids.len(),
+                    if ids.len() == 1 { "" } else { "s" }
+                );
+                finish_complete(inner, &job, settings, line, ids.len() as u64, unneeded as u64).await;
+            } else if p.enabled && p.repair && has_par2 {
                 // PAR2 can often rebuild what the servers no longer have.
                 inner.log_job(job.id, LogLevel::Warn, format!("{}: {}; trying a PAR2 repair", job.name, missing_message(&ids)));
-                finish_partial(inner, &job, settings, &ids).await;
+                finish_partial(inner, &job, settings, &ids, unneeded).await;
             } else {
                 let fin = Finish::failed(FailureKind::MissingArticles).missing(ids.len());
                 fail_job(inner, &job, &missing_message(&ids), fin);
@@ -534,14 +560,15 @@ fn outcome_of(post: &PostReport, stage_ms: &HashMap<PostStage, u64>) -> JobOutco
             state: if repaired { StepState::Repaired } else { par2_state },
             detail: match (&post.par2, stats) {
                 (Verdict::Failed(r), _) => r.clone(),
-                (_, Some(s)) => format!("rebuilt {} slice{}", s.slices_rebuilt, if s.slices_rebuilt == 1 { "" } else { "s" }),
+                (_, Some(s)) => repair_detail(s),
                 (v, None) => v.to_string(),
             },
             ms: stats.map_or(ms(PostStage::Repair), |s| s.repair_ms),
         });
     }
     o.extract = Some(StepRecord { state: step_state(&post.extract), detail: post.extract.to_string(), ms: ms(PostStage::Extract) });
-    let removed = post.removed.len() + post.partials_removed.len();
+    let unneeded_removed = if post.par2.is_success() { post.unneeded.len() } else { 0 };
+    let removed = post.removed.len() + post.partials_removed.len() + unneeded_removed;
     o.cleanup = Some(StepRecord {
         state: if removed > 0 { StepState::Ok } else { StepState::Skipped },
         detail: if removed > 0 {
@@ -639,53 +666,62 @@ async fn post_process(inner: &Arc<Inner>, job: &Job, settings: &Settings) -> (Re
 
 /// Post-processing (when enabled) and the final `done`/`failed` state of a downloaded job.
 async fn finish_ok(inner: &Arc<Inner>, job: &Job, settings: &Settings, report: &JobReport) {
+    let written: u64 = report.files.iter().map(|f| f.bytes).sum();
+    let line = format!(
+        "completed {} ({} file{}, {})",
+        job.name,
+        report.files.len(),
+        if report.files.len() == 1 { "" } else { "s" },
+        format::bytes(written)
+    );
+    finish_complete(inner, job, settings, line, 0, 0).await;
+}
+
+/// Post-processing (when enabled) and the final state of a job whose data downloaded
+/// whole; `missing` articles were lost, `unneeded` of them in files the data does not need.
+async fn finish_complete(inner: &Arc<Inner>, job: &Job, settings: &Settings, line: String, missing: u64, unneeded: u64) {
     let mut fin = Finish::default();
     if settings.postprocess.enabled {
         let (result, f) = post_process(inner, job, settings).await;
+        fin = f;
+        fin.missing = missing;
+        fin.outcome.articles_unneeded = unneeded;
         if let Err(reason) = result {
-            fail_job(inner, job, &reason, f);
+            fail_job(inner, job, &reason, fin);
             return;
         }
-        fin = f;
         if inner.lock_state().removed_active {
             return;
         }
     }
-    let written: u64 = report.files.iter().map(|f| f.bytes).sum();
-    mark_done(
-        inner,
-        job,
-        format!(
-            "completed {} ({} file{}, {})",
-            job.name,
-            report.files.len(),
-            if report.files.len() == 1 { "" } else { "s" },
-            format::bytes(written)
-        ),
-        fin,
-    );
+    fin.missing = missing;
+    fin.outcome.articles_unneeded = unneeded;
+    mark_done(inner, job, line, fin);
 }
 
 /// A download with missing articles and PAR2 data: post-process it anyway. Done when PAR2
-/// rebuilt every incomplete file, else failed with both reasons.
-async fn finish_partial(inner: &Arc<Inner>, job: &Job, settings: &Settings, ids: &[String]) {
+/// rebuilt every incomplete file, else failed with both reasons. `unneeded` of the missing
+/// articles were in PAR2 or sidecar files, which need no repair.
+async fn finish_partial(inner: &Arc<Inner>, job: &Job, settings: &Settings, ids: &[String], unneeded: usize) {
     let missing = missing_message(ids);
     let (result, mut fin) = post_process(inner, job, settings).await;
     fin.missing = ids.len() as u64;
+    fin.outcome.articles_unneeded = unneeded as u64;
     match result {
         Ok(post) if post.incomplete.is_empty() => {
             if inner.lock_state().removed_active {
                 return;
             }
-            fin.outcome.articles_repaired = ids.len() as u64;
+            let repaired = ids.len().saturating_sub(unneeded);
+            fin.outcome.articles_repaired = repaired as u64;
+            let also = if unneeded > 0 { format!(" ({unneeded} more were in PAR2 or sidecar files)") } else { String::new() };
             mark_done(
                 inner,
                 job,
                 format!(
-                    "completed {}: PAR2 repaired {} missing article{}",
+                    "completed {}: PAR2 repaired {repaired} missing article{}{also}",
                     job.name,
-                    ids.len(),
-                    if ids.len() == 1 { "" } else { "s" }
+                    if repaired == 1 { "" } else { "s" }
                 ),
                 fin,
             );
@@ -702,6 +738,18 @@ async fn finish_partial(inner: &Arc<Inner>, job: &Job, settings: &Settings, ids:
             fin.outcome.failure.get_or_insert(FailureKind::MissingArticles);
             fail_job(inner, job, &format!("{missing}; {reason}"), fin)
         }
+    }
+}
+
+/// The Repair step's detail: what PAR2 rebuilt and which complete copies it moved to
+/// their real names.
+fn repair_detail(s: &newskite_postproc::Par2Stats) -> String {
+    let plural = |n: usize| if n == 1 { "" } else { "s" };
+    match (s.slices_rebuilt, s.files_renamed) {
+        (0, 0) => "rebuilt 0 slices".into(),
+        (0, n) => format!("renamed {n} misnamed file{}", plural(n)),
+        (r, 0) => format!("rebuilt {r} slice{}", plural(r)),
+        (r, n) => format!("rebuilt {r} slice{}, renamed {n} misnamed file{}", plural(r), plural(n)),
     }
 }
 
@@ -763,15 +811,17 @@ pub(crate) fn missing_message(ids: &[String]) -> String {
 }
 
 /// Rebroadcasts engine events, keeps `job_files` and `bytes_done` current and turns
-/// file-level events into log lines.
+/// file-level events into log lines. Returns the articles fetched and missing, and the
+/// missing articles of each file that had some.
 async fn forward_events(
     inner: Arc<Inner>,
     job_id: i64,
     bytes_total: u64,
     base_bytes: u64,
     mut rx: mpsc::UnboundedReceiver<EngineEvent>,
-) -> (u64, u64) {
+) -> (u64, u64, HashMap<String, usize>) {
     let (mut fetched, mut missing_n) = (0u64, 0u64);
+    let mut failed: HashMap<String, usize> = HashMap::new();
     let mut run_bytes: u64 = 0;
     let mut per_file: HashMap<String, u64> = HashMap::new();
     let mut last_persist = Instant::now();
@@ -831,6 +881,7 @@ async fn forward_events(
             }
             EngineEvent::FileFailed { name, missing } => {
                 missing_n += missing.len() as u64;
+                *failed.entry(name.clone()).or_default() += missing.len();
                 let got = per_file.get(name).copied().unwrap_or(0);
                 upsert_file(&inner, job_id, name, 0, got, "failed");
                 persist(run_bytes, &mut persist_error_logged);
@@ -863,7 +914,7 @@ async fn forward_events(
         }
         lock(&inner.articles).remove(&job_id);
     }
-    (fetched, missing_n)
+    (fetched, missing_n, failed)
 }
 
 /// Blocking: keeps the `done` rows whose file is still in `dest` with the recorded length;

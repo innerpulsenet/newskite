@@ -101,6 +101,9 @@ pub struct JobOutcome {
     pub slices_rebuilt: u64,
     /// Missing articles that PAR2 made up for.
     pub articles_repaired: u64,
+    /// Missing articles that were only in files the data does not need (PAR2 volumes,
+    /// release sidecars).
+    pub articles_unneeded: u64,
     /// Folder archives were extracted into.
     pub extracted_to: Option<PathBuf>,
     /// Files removed by cleanup.
