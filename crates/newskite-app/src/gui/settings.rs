@@ -221,15 +221,21 @@ pub fn validate(s: &Settings) -> Vec<String> {
     if s.download_dir.as_os_str().is_empty() {
         errs.push("Download folder is required.".to_owned());
     } else if !s.download_dir.is_absolute() {
-        errs.push("Download folder must be a full path (starting with / or ~).".to_owned());
+        errs.push(format!("Download folder must be a full path {FULL_PATH_HINT}."));
     }
     if s.watch_enabled && s.watch_folder.as_os_str().is_empty() {
         errs.push("Choose a watch folder or turn the watch folder off.".to_owned());
     } else if !s.watch_folder.as_os_str().is_empty() && !s.watch_folder.is_absolute() {
-        errs.push("Watch folder must be a full path (starting with / or ~).".to_owned());
+        errs.push(format!("Watch folder must be a full path {FULL_PATH_HINT}."));
     }
     errs
 }
+
+/// How a full path looks on this system, for the folder errors.
+#[cfg(not(windows))]
+const FULL_PATH_HINT: &str = "(starting with / or ~)";
+#[cfg(windows)]
+const FULL_PATH_HINT: &str = r"(starting with a drive letter, like C:\Downloads, or ~)";
 
 /// Draws the modal. Esc is handled by the app (it closes without saving).
 /// Key of the sheet's fade-in (reset by the app while it is closed).
@@ -974,8 +980,10 @@ mod tests {
 
     #[test]
     fn host_with_port_relative_folders_and_zero_connections_are_rejected() {
+        // A full path on this system (on Windows a full path starts with a drive).
+        let full = std::env::temp_dir().join("dl");
         let mut s = Settings {
-            download_dir: PathBuf::from("/tmp/dl"),
+            download_dir: full.clone(),
             ..Default::default()
         };
         s.servers[0].host = "news.example.net:563".into();
@@ -994,7 +1002,7 @@ mod tests {
 
         s.download_dir = PathBuf::from("Downloads/usenet");
         assert!(validate(&s).iter().any(|e| e.contains("full path")));
-        s.download_dir = PathBuf::from("/tmp/dl");
+        s.download_dir = full;
         s.watch_folder = PathBuf::from("nzbs");
         assert!(validate(&s).iter().any(|e| e.contains("Watch folder")));
         s.watch_folder = PathBuf::new();
