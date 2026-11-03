@@ -58,6 +58,20 @@ async fn run(args: Vec<String>) -> (i32, String) {
     (code, String::from_utf8(out).unwrap())
 }
 
+/// Opens the store a finished run used. The run cancels its service and returns at once;
+/// the service's tasks on this test's runtime drop the database lock a moment later.
+async fn open_store_after_run(db: &Path) -> Store {
+    for _ in 0..250 {
+        match Store::open(db) {
+            Err(newskite_store::StoreError::Invalid(m)) if m.contains("another Newskite instance") => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            other => return other.unwrap(),
+        }
+    }
+    panic!("the finished run still holds {}", db.display());
+}
+
 fn read_file(p: PathBuf) -> Vec<u8> {
     std::fs::read(&p).unwrap_or_else(|e| panic!("reading {}: {e}", p.display()))
 }
@@ -103,7 +117,7 @@ async fn success_with_auth_downloads_byte_exact() {
     assert_eq!(sha256(&got), sha256(&file.data));
     assert_eq!(mock.body_requests(), 8);
 
-    let store = Store::open(&tmp.path().join("db")).unwrap();
+    let store = open_store_after_run(&tmp.path().join("db")).await;
     let jobs = store.list_jobs().unwrap();
     assert_eq!(jobs.len(), 1);
     assert_eq!(jobs[0].state, JobState::Done);
@@ -121,7 +135,7 @@ async fn password_and_server_are_not_persisted() {
     assert!(!stdout.contains(PASS));
 
     let db = tmp.path().join("db");
-    let settings = Store::open(&db).unwrap().load_settings().unwrap();
+    let settings = open_store_after_run(&db).await.load_settings().unwrap();
     assert!(settings
         .servers
         .iter()
@@ -307,7 +321,7 @@ async fn interrupt_leaves_the_job_resumable() {
     assert_eq!(code, EXIT_INTERRUPTED, "stdout: {stdout}");
     assert_eq!(stdout, "queued int-job\n");
     {
-        let store = Store::open(&tmp.path().join("db")).unwrap();
+        let store = open_store_after_run(&tmp.path().join("db")).await;
         let jobs = store.list_jobs().unwrap();
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].state, JobState::Queued);
@@ -323,8 +337,8 @@ async fn interrupt_leaves_the_job_resumable() {
         sha256(&file.data)
     );
     assert_eq!(
-        Store::open(&tmp.path().join("db"))
-            .unwrap()
+        open_store_after_run(&tmp.path().join("db"))
+            .await
             .list_jobs()
             .unwrap()
             .len(),
@@ -348,8 +362,8 @@ async fn no_server_anywhere_is_a_usage_error() {
     assert_eq!(code, EXIT_USAGE);
     assert_eq!(stdout, "");
     // Nothing was queued.
-    assert!(Store::open(&tmp.path().join("db"))
-        .unwrap()
+    assert!(open_store_after_run(&tmp.path().join("db"))
+        .await
         .list_jobs()
         .unwrap()
         .is_empty());
@@ -477,7 +491,7 @@ async fn stored_backlog_is_not_run_with_the_server_override() {
     assert_eq!(stdout, "queued mine-job\ncomplete mine-job\n");
     assert_eq!(mock.body_requests(), 3, "only the CLI job's articles are fetched");
 
-    let store = Store::open(&tmp.path().join("db")).unwrap();
+    let store = open_store_after_run(&tmp.path().join("db")).await;
     let backlog = store
         .list_jobs()
         .unwrap()
