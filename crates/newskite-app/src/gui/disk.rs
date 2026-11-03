@@ -5,7 +5,7 @@ use std::path::Path;
 
 /// Bytes available to an unprivileged user on the filesystem holding `dir`, or on its
 /// nearest existing ancestor (the download folder may not exist yet). `None` when no
-/// ancestor can be read or the platform has no `statvfs`.
+/// ancestor can be read or the platform has no way to ask.
 pub fn free_bytes(dir: &Path) -> Option<u64> {
     if dir.as_os_str().is_empty() {
         return None;
@@ -35,12 +35,22 @@ fn statvfs_total(p: &Path) -> Option<u64> {
     Some(st.f_blocks.saturating_mul(st.f_frsize))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn statvfs_free(p: &Path) -> Option<u64> {
+    crate::win::disk_space(p).map(|(free, _)| free)
+}
+
+#[cfg(windows)]
+fn statvfs_total(p: &Path) -> Option<u64> {
+    crate::win::disk_space(p).map(|(_, total)| total)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn statvfs_free(_p: &Path) -> Option<u64> {
     None
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn statvfs_total(_p: &Path) -> Option<u64> {
     None
 }

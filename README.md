@@ -203,9 +203,41 @@ All packaging files are in [`packaging/`](packaging):
 | `build-appimage.sh` | Builds an AppDir and, with `appimagetool`, an `.AppImage` |
 | `install-local.sh` / `uninstall-local.sh` | Per-user install into `~/.local` without root |
 | `tests/check-packaging.sh` | Validates all of the above in a temporary directory |
+| `windows/newskite.iss` | Inno Setup script for the Windows installer |
 
 The application id is `net.innerpulse.Newskite` everywhere: desktop file name, icon name,
 AppStream id and the Wayland `app_id` / X11 `WM_CLASS` the window sets.
+
+### Release packages (GitHub)
+
+[`.github/workflows/release.yml`](.github/workflows/release.yml) builds every package on
+GitHub Actions: a Windows installer and zip (`windows-2022`), and a `.deb` and AppImage
+(`ubuntu-22.04`, so they run on glibc 2.35 and newer). Each run tests first. Pull requests
+and manual runs (Actions → Packages → Run workflow) attach the packages to the run as
+artifacts; pushing a tag that matches the workspace version publishes a GitHub Release:
+
+```sh
+git tag v0.9.0 && git push origin v0.9.0
+```
+
+### Windows
+
+Download `Newskite-<version>-windows-x64-setup.exe` from the release (or the workflow run's
+artifacts). The installer needs no administrator rights: it installs for the current user
+under `%LOCALAPPDATA%\Programs\Newskite` (its first page offers an all-users install), adds
+a Start menu entry, and opens `.nzb` files and `nzb:` links with Newskite. The `.zip` holds
+the same `newskite.exe` for running without installing. Either way the queue, settings and
+database live in `%APPDATA%\innerpulse\Newskite`, which uninstalling keeps.
+
+The packages are not code-signed, so the first run shows a SmartScreen prompt ("Windows
+protected your PC"): choose **More info → Run anyway**.
+
+`newskite.exe` is a windowed program; `newskite --headless ...` still prints to the
+terminal it is typed in, but the prompt returns at once. To wait for a headless run, use
+`start /wait newskite --headless ...` in `cmd` or `Start-Process -Wait` in PowerShell.
+
+To build the installer by hand on Windows (Rust and [Inno Setup](https://jrsoftware.org/isinfo.php) installed),
+follow the steps in the workflow's `windows` job.
 
 ### Debian package (.deb)
 
@@ -255,10 +287,14 @@ The icons are generated, not hand-drawn; see [Brand](#brand) for the command.
   engine end to end against a local NNTP server and renders the GUI offscreen; the packaged
   window still needs hands-on testing on Wayland and X11 sessions. Desktop theme detection
   reads KDE's `kdeglobals` and the XDG desktop portal.
-- **Windows and macOS:** the code is written to compile there (platform-specific code is
-  behind `cfg`, paths come from the `directories` crate), but neither target has been built
-  or tested yet, and there is no installer for them. The theme falls back to the toolkit's
-  light/dark detection on those systems.
+- **Windows 10 (1809) and 11, x64:** built and unit-tested on every release run, with an
+  installer. A second launch (a double-clicked `.nzb`) hands its files to the open window
+  over a loopback port guarded by a per-run token. The theme follows Windows' light/dark
+  setting through the toolkit, and finished-queue desktop notifications are not shown yet.
+  The GUI snapshot tests run on Linux only.
+- **macOS:** the code is written to compile there (platform-specific code is behind `cfg`,
+  paths come from the `directories` crate), but it has not been built or tested, and there
+  is no package.
 
 ## License
 
