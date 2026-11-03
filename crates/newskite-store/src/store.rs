@@ -186,6 +186,7 @@ fn create_private_dir(dir: &Path) -> Result<(), StoreError> {
 
 /// Open options that create a file with mode `0600` on Unix.
 fn private_file_options() -> std::fs::OpenOptions {
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut opts = std::fs::OpenOptions::new();
     #[cfg(unix)]
     {

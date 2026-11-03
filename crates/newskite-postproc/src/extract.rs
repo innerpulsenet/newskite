@@ -87,6 +87,7 @@ fn make_staging_dir(target: &Path) -> std::io::Result<PathBuf> {
     for _ in 0..16 {
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         let p = target.join(format!("{STAGING_PREFIX}{}-{seq}-{nanos:09}", std::process::id()));
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut b = std::fs::DirBuilder::new();
         #[cfg(unix)]
         std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);

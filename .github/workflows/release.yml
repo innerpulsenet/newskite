@@ -1,0 +1,183 @@
+# Builds the Newskite packages: a Windows installer and zip, and a Linux .deb and AppImage.
+#
+# - Pull requests and manual runs build, test and attach the packages to the run (Actions
+#   tab -> the run -> Artifacts), without publishing anything.
+# - Pushing a tag vX.Y.Z (matching the workspace version) also publishes a GitHub Release
+#   with the packages and their SHA-256 sums.
+
+name: Packages
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # The toolchain the packages are built with (the workspace MSRV is lower).
+  RUST_VERSION: "1.93.0"
+
+jobs:
+  windows:
+    name: Windows x64
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install $env:RUST_VERSION --profile minimal
+          rustup default $env:RUST_VERSION
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Version
+        id: version
+        run: |
+          $meta = cargo metadata --no-deps --format-version 1 --locked | ConvertFrom-Json
+          $v = ($meta.packages | Where-Object name -eq 'newskite').version
+          if ($env:GITHUB_REF -like 'refs/tags/v*' -and $env:GITHUB_REF_NAME -ne "v$v") {
+            throw "tag $env:GITHUB_REF_NAME does not match the workspace version $v"
+          }
+          "version=$v" >> $env:GITHUB_OUTPUT
+
+      # The GUI snapshot tests (crates/newskite-app/tests/gui.rs) compare pixels rendered
+      # on the development machine and are not run here.
+      - name: Test
+        run: |
+          cargo test --workspace --exclude newskite --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test -p newskite --lib --bins --locked
+
+      - name: Build
+        run: cargo build --release --locked -p newskite
+
+      - name: Smoke test
+        run: |
+          $p = Start-Process -FilePath target\release\newskite.exe -ArgumentList '--version' `
+            -NoNewWindow -Wait -PassThru -RedirectStandardOutput version.txt
+          $out = (Get-Content version.txt -Raw).Trim()
+          Write-Output "newskite --version: $out"
+          if ($p.ExitCode -ne 0 -or $out -ne "newskite ${{ steps.version.outputs.version }}") { exit 1 }
+
+      - name: Stage files
+        run: |
+          New-Item -ItemType Directory -Force stage, dist | Out-Null
+          Copy-Item target\release\newskite.exe stage\
+          Copy-Item README.md stage\
+          Copy-Item packaging\debian\copyright stage\copyright.txt
+          Copy-Item assets\brand\fonts\OFL.txt stage\fonts-OFL.txt
+          Compress-Archive -Path stage\* -DestinationPath "dist\Newskite-${{ steps.version.outputs.version }}-windows-x64.zip"
+
+      - name: Build installer
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup --no-progress -y
+            $iscc = (Get-ChildItem "${env:ProgramFiles(x86)}\Inno Setup *\ISCC.exe" | Select-Object -First 1).FullName
+          }
+          $ico = Get-ChildItem target\release\build\newskite-*\out\newskite.ico |
+            Sort-Object LastWriteTime | Select-Object -Last 1
+          & $iscc /Q "/DAppVersion=${{ steps.version.outputs.version }}" "/DSourceDir=$PWD\stage" `
+            "/DOutputDir=$PWD\dist" "/DIconFile=$($ico.FullName)" packaging\windows\newskite.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-ChildItem dist
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: newskite-windows-x64
+          path: dist/*
+          if-no-files-found: error
+
+  linux:
+    name: Linux x86_64
+    # The oldest supported runner: the packages need glibc 2.35 or newer.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup default "$RUST_VERSION"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Version
+        id: version
+        run: |
+          v=$(cargo metadata --no-deps --format-version 1 --locked | jq -r '.packages[] | select(.name == "newskite") | .version')
+          if [[ "$GITHUB_REF" == refs/tags/v* && "$GITHUB_REF_NAME" != "v$v" ]]; then
+            echo "tag $GITHUB_REF_NAME does not match the workspace version $v" >&2
+            exit 1
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Test
+        run: |
+          cargo test --workspace --exclude newskite --locked
+          cargo test -p newskite --lib --bins --locked
+
+      - name: Build
+        run: cargo build --release --locked -p newskite
+
+      - name: Debian package
+        run: |
+          cargo install cargo-deb --version 3.8.0 --locked
+          cargo deb -p newskite --no-build
+          mkdir -p dist
+          cp target/debian/*.deb dist/
+
+      - name: AppImage
+        env:
+          APPIMAGETOOL_URL: https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage
+          APPIMAGETOOL_SHA256: ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0
+        run: |
+          mkdir -p "$RUNNER_TEMP/tools"
+          curl -fsSL -o "$RUNNER_TEMP/tools/appimagetool" "$APPIMAGETOOL_URL"
+          echo "$APPIMAGETOOL_SHA256  $RUNNER_TEMP/tools/appimagetool" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/tools/appimagetool"
+          # The runner has no FUSE; the tool unpacks itself instead.
+          APPIMAGE_EXTRACT_AND_RUN=1 APPIMAGETOOL="$RUNNER_TEMP/tools/appimagetool" \
+            packaging/build-appimage.sh --no-build --out dist
+          rm -rf dist/Newskite.AppDir
+
+      - name: Check packaging
+        run: packaging/tests/check-packaging.sh target/release/newskite
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: newskite-linux-x86_64
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd dist
+          sha256sum -- * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "Newskite ${GITHUB_REF_NAME#v}" --generate-notes ./*
