@@ -72,7 +72,9 @@ pub struct NntpConnection { /* plain or TLS stream, buffered */ }
 impl NntpError { pub fn is_transient(&self)->bool /* Io/Timeout/Connect/Tls/Protocol */ }
 pub struct Response { pub code: u16, pub text: String }
 impl NntpConnection {
-  pub async fn connect(server:&ServerConfig, timeout:Duration) -> Result<Self,NntpError>; // greeting 200/201, AUTHINFO if username set
+  pub async fn connect(server:&ServerConfig, timeout:Duration) -> Result<Self,NntpError>; // greeting 200/201, AUTHINFO if username set;
+                                                       // the host's addresses are tried 250 ms apart in resolver order, the first to
+                                                       // connect wins (an address that does not answer costs a stagger, not the timeout)
   pub fn greeting(&self) -> &str;
   pub async fn command(&mut self, line:&str) -> Result<Response,NntpError>;   // single-line response; rejects CR/LF in line
   pub async fn body(&mut self, message_id:&str) -> Result<Vec<u8>,NntpError>; // 222 multi-line, dot-unstuffed, terminator removed, lines joined with \r\n; 430/423 -> ArticleMissing; 480 -> AuthRequired
@@ -149,8 +151,12 @@ pub async fn download_with_pool(req, pool: Arc<ConnectionPool>, events, progress
 ```
 Netcode: on the primary (first usable) server a worker sends the next segment's `BODY` as soon
 as the current article's 222 line arrives (one request ahead per connection; never before a
-file's output is decided, so a resumed complete file still costs one article); decode and part
-checks run on the blocking pool; `download()` closes its connections at the end while
+file's output is decided, so a resumed complete file still costs one article); decode, the part
+checks and the positional write run as one blocking task per segment once the file's output is
+decided (a file's first part decides it and is written in a task of its own); a fresh `.nkpart`
+is preallocated to its first part's `size=` (Linux `fallocate`, elsewhere `set_len`), so the
+parts land in one extent and a disk without room fails the job on the file's first part
+(`Io`, "cannot reserve ..."); `download()` closes its connections at the end while
 `download_with_pool` hands them to the pool (the service keeps one pool per run and closes it
 when the queue goes idle or at shutdown; a pooled connection the server closed is replaced
 silently). Connect failures (refused, TLS, 400/502 at greeting or login) put the server in a
@@ -220,7 +226,8 @@ pub struct NewBookmark { pub parent_id:Option<i64>, pub name:String, pub newsgro
 pub struct ThroughputSample { pub ts:i64 /*unix secs*/, pub bytes_up:u64, pub bytes_down:u64 /* bytes during that second */ }
 pub struct Totals { pub downloaded_bytes:u64, pub jobs_done:u64, pub jobs_pending:u64 /*queued+downloading+paused*/, pub jobs_failed:u64 }
 #[derive(thiserror::Error)] pub enum StoreError { Sqlite(rusqlite::Error), Json(serde_json::Error), Io(std::io::Error), NotFound, Invalid(String) }
-pub struct Store { /* Mutex<Connection>; Send + Sync */ }
+pub struct Store { /* Mutex<Connection> for writes, plus (file stores) a read-only Mutex<Connection> for queries: in WAL mode a
+                      query never waits for a write and sees everything committed before it; Send + Sync */ }
 impl Store {
   pub fn open(dir:&Path)->Result<Self,StoreError>;     // creates dir, newskite.sqlite3, WAL, migrations (user_version);
                                                        // single instance: exclusive advisory lock on dir/newskite.lock
@@ -250,6 +257,7 @@ impl Store {
   // throughput
   pub fn add_sample(&self,s:&ThroughputSample)->Result<(),_>; pub fn samples_since(&self,ts:i64)->Result<Vec<ThroughputSample>,_>;
   pub fn prune_samples_before(&self,ts:i64)->Result<usize,_>; pub fn add_downloaded_bytes(&self,n:u64)->Result<(),_> /* lifetime counter */;
+  pub fn record_throughput(&self,s:&ThroughputSample,add_total:bool)->Result<(),_> /* add_sample + (add_total) add_downloaded_bytes(s.bytes_down), one transaction */;
   // settings
   pub fn load_settings(&self)->Result<Settings,_> /* default().normalized() when absent */; pub fn save_settings(&self,s:&Settings)->Result<(),_>;
   pub fn settings_backups(&self)->Result<Vec<(String,String)>,_> /* unreadable documents kept by save_settings, oldest first */;
@@ -591,7 +599,8 @@ after a reorder); `next_runnable_job*` take `queued` only, in queue order; `queu
 active job is interrupted and becomes paused, the run moves on; done/failed refused);
 `start_job(id)` (paused/queued -> queued, failed retried first; starts a run limited to that
 job, or adds it to an active limited run; clears a pause); `move_job(id, JobMove::{Top, Up,
-Down, Bottom})`; `queue_order()`; `clear_history() -> usize` (removes done/failed rows, NZBs
+Down, Bottom})`; `reorder_queue(ids)` (the whole order at once, from a dragged row: ids that
+are not pending are ignored, pending jobs left out follow in their order); `queue_order()`; `clear_history() -> usize` (removes done/failed rows, NZBs
 marked seen); `Status::run_scope: Option<Vec<i64>>` (the ids an active limited run takes).
 An interrupted job is not counted as processed (no "queue finished" or auto-shutdown for a
 run that only interrupted). GUI: toolbar = masthead, Add NZB, the queue control (Start /
@@ -676,3 +685,14 @@ settings it applies for the session only and returns the load error) and
 (`statusbar::SPEED_PRESETS`: Unlimited, 50, 25, 10, 5, 1 MB/s, the current custom value,
 "Other limit…" to Settings) and shows `limit …` in place of `peak …` while one is set.
 
+Network and file pass. Engine: one blocking task per segment (decode, part check, write) once
+a file's output is decided, and `.nkpart` preallocation (see the engine section). NNTP:
+staggered connection attempts across a host's addresses (see `connect`). Store: a read-only
+second connection for queries, `record_throughput` (the sampler's tick is one transaction),
+`upsert_job_file` as one statement. Service: `reorder_queue`. GUI: a queue row can be dragged
+to a new place (`Sense::click_and_drag`; `QueueState::drag`/`row_rects`; an accent line shows
+where it lands; the drop becomes `Action::ReorderQueue(Vec<i64>)` through `queue::drop_index`
+and `queue::dropped_order`, which keep rows a filter hides next to their visible neighbors; Esc
+cancels); a row's figures (progress, speed, size, finish time) end flush against its controls,
+so they line up down the list; the selected job's log is re-read only when a line was logged
+or the selection moved, not on every progress reload.

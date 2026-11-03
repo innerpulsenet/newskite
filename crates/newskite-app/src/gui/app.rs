@@ -148,6 +148,8 @@ pub enum Action {
     PauseJob(i64),
     /// Move a job within the queue.
     MoveJob(i64, JobMove),
+    /// Put the pending jobs in this order (a row dragged to a new place).
+    ReorderQueue(Vec<i64>),
     /// Remove every finished job from the list.
     ClearHistory,
     /// Remove every finished job and delete its download folder.
@@ -421,6 +423,11 @@ pub struct NewskiteApp {
     maps_dirty: bool,
     /// Jobs the service has no article map for (not asked again until a run ends).
     no_map: HashSet<i64>,
+    /// The job whose log `Data::selected_log` holds.
+    selected_log_for: Option<i64>,
+    /// A log line arrived since that log was read: read it again on the next reload
+    /// (progress reloads alone leave the 500-line log as it is).
+    selected_log_dirty: bool,
     notifications: bool,
     /// Jobs already finished when last notified (so only new completions notify).
     finished_seen: HashSet<i64>,
@@ -515,6 +522,8 @@ impl NewskiteApp {
             last_maps_reload: Instant::now(),
             maps_dirty: true,
             no_map: HashSet::new(),
+            selected_log_for: None,
+            selected_log_dirty: true,
             notifications: config.notifications,
             finished_seen: HashSet::new(),
             last_notice: None,
@@ -559,6 +568,7 @@ impl NewskiteApp {
         self.data.settings_load_error = self.service.settings_load_error();
         self.data.logs = self.service.logs();
         self.data.status = self.service.status();
+        self.selected_log_dirty = true;
         self.reload_jobs();
         self.reload_history();
     }
@@ -655,10 +665,7 @@ impl NewskiteApp {
             Some(id) => self.service.job_files(id),
             None => Vec::new(),
         };
-        self.data.selected_log = match self.view.queue.selected {
-            Some(id) => self.service.job_log(id),
-            None => Vec::new(),
-        };
+        self.reload_selected_log();
         self.data.servers = self.service.server_health();
         let downloading: HashSet<i64> = self
             .data
@@ -680,6 +687,21 @@ impl NewskiteApp {
         // A job that is no longer finished (retried) notifies again when it finishes.
         forget_unfinished(&mut self.finished_seen, &self.data.jobs);
         self.last_jobs_reload = Instant::now();
+    }
+
+    /// Re-reads the selected job's log when the selection moved or a line was logged
+    /// since; otherwise the copy on hand is current.
+    fn reload_selected_log(&mut self) {
+        let selected = self.view.queue.selected;
+        if !self.selected_log_dirty && self.selected_log_for == selected {
+            return;
+        }
+        self.data.selected_log = match selected {
+            Some(id) => self.service.job_log(id),
+            None => Vec::new(),
+        };
+        self.selected_log_for = selected;
+        self.selected_log_dirty = false;
     }
 
     /// Drains pending UI messages.
@@ -822,7 +844,10 @@ impl NewskiteApp {
                 EngineEvent::Layout { .. } | EngineEvent::SegmentMissing { .. } | EngineEvent::FileComplete { .. } => {}
                 EngineEvent::FileStarted { .. } | EngineEvent::Log(_) | EngineEvent::Warn(_) => {}
             },
-            ServiceEvent::JobLog(_) | ServiceEvent::Error(_) => *reload_logs = true,
+            ServiceEvent::JobLog(_) | ServiceEvent::Error(_) => {
+                self.selected_log_dirty = true;
+                *reload_logs = true;
+            }
             ServiceEvent::JobsChanged | ServiceEvent::WatchImported(_) => *reload_jobs = true,
             ServiceEvent::QueueIdle => {
                 *reload_jobs = true;
@@ -938,6 +963,10 @@ impl NewskiteApp {
                 let _ = self.service.move_job(id, to);
                 self.reload_jobs();
             }
+            Action::ReorderQueue(ids) => {
+                let _ = self.service.reorder_queue(&ids);
+                self.reload_jobs();
+            }
             Action::ClearHistory => {
                 self.service.clear_history();
                 self.reload_jobs();
@@ -990,10 +1019,7 @@ impl NewskiteApp {
                         Some(id) => self.service.job_files(id),
                         None => Vec::new(),
                     };
-                    self.data.selected_log = match id {
-                        Some(id) => self.service.job_log(id),
-                        None => Vec::new(),
-                    };
+                    self.reload_selected_log();
                     // A failed job opens on its problem, others on the overview.
                     self.view.inspector.tab = super::inspector::InspectorTab::Overview;
                 }

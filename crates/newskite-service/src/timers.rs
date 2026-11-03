@@ -61,10 +61,7 @@ pub(crate) fn flush_throughput(inner: &Inner) {
     if delta == 0 {
         return;
     }
-    let result = inner
-        .store
-        .add_sample(&ThroughputSample { ts: now_secs(), bytes_up: 0, bytes_down: delta })
-        .and_then(|()| inner.store.add_downloaded_bytes(delta));
+    let result = inner.store.record_throughput(&ThroughputSample { ts: now_secs(), bytes_up: 0, bytes_down: delta }, true);
     if let Err(e) = result {
         if !inner.sampler_error_logged.swap(true, Ordering::Relaxed) {
             inner.log(LogLevel::Warn, format!("could not store throughput: {e}"));
@@ -81,10 +78,8 @@ fn sample(inner: &Inner, delta: u64, prune: bool) {
     let ts = now_secs();
     let mut result = Ok(());
     if delta > 0 || running {
-        result = inner.store.add_sample(&ThroughputSample { ts, bytes_up: 0, bytes_down: delta });
-    }
-    if delta > 0 && result.is_ok() {
-        result = inner.store.add_downloaded_bytes(delta);
+        // The sample and the lifetime total in one write.
+        result = inner.store.record_throughput(&ThroughputSample { ts, bytes_up: 0, bytes_down: delta }, delta > 0);
     }
     if prune && result.is_ok() {
         result = inner.store.prune_samples_before(ts.saturating_sub(SAMPLE_RETENTION_SECS)).map(|_| ());

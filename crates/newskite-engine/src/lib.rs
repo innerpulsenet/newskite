@@ -16,8 +16,10 @@
 //!   segment as soon as the current article's status line arrives, so the request's round
 //!   trip overlaps the current body transfer and the connection never idles between
 //!   articles. At most one request is in flight ahead per connection, so in-flight memory
-//!   stays bounded by one raw article plus one decoded part per connection. Decoding and
-//!   CRC checking run on the blocking thread pool, never on the socket tasks.
+//!   stays bounded by one raw article plus one decoded part per connection. Decoding, the
+//!   part checks and the write run on the blocking thread pool, never on the socket tasks:
+//!   as one task per segment once the file's output is decided (its first part decides it
+//!   and is written in a task of its own).
 //! * **Naming.** The output name is the yEnc `name=` of the first part decoded for a file,
 //!   sanitized, falling back to [`newskite_nzb::NzbFile::filename`]. It is always a single
 //!   path component inside `dest_dir`. Two files of one job that resolve to the same name
@@ -30,7 +32,10 @@
 //!   first accepted part. A refused part (another post's article under a reused message id,
 //!   or a hostile header) is never written; it is handled like an undecodable article.
 //! * **In-progress files** are written as `<name>.nkpart` and renamed to `<name>` only when
-//!   every segment arrived. A file with missing articles keeps its `.nkpart` and is reported
+//!   every segment arrived. A fresh `.nkpart` is preallocated to its first part's `size=`
+//!   (Linux `fallocate`, elsewhere the length is set), so parts arriving out of order land
+//!   in one extent and a disk without room for the file fails the job on its first part
+//!   ([`EngineError::Io`]) rather than its last. A file with missing articles keeps its `.nkpart` and is reported
 //!   with [`EngineEvent::FileFailed`]; the job then returns
 //!   [`EngineError::MissingArticles`] with every missing message id.
 //! * **Final size** is the yEnc header `size=` of the first accepted part (never less than the

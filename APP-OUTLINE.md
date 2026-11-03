@@ -94,7 +94,7 @@ Each feature lists: what it does, rules, and edge cases the implementation must 
 - Job states: `queued`, `downloading`, `done`, `failed`, `paused` (persisted strings). `paused`
   means **held by the user**: the job keeps its place but queue runs skip it.
 - The queue has an explicit order (a position per job); jobs can be moved to the top, up, down
-  or to the bottom. Runs download `queued` jobs in that order.
+  or to the bottom, or dragged to any place. Runs download `queued` jobs in that order.
 - Whole queue: Start (every queued job), Pause (immediate: the current job is interrupted,
   goes back to `queued` and resumes first), Resume.
 - Per job: start one job on its own (a run limited to it, or added to an active limited run;
@@ -221,13 +221,16 @@ Rules:
   `Start all` button when a run limited to single jobs leaves others queued.
 - Each row: the name, the state in words (Downloading, Queued, Held, or the post-processing
   stage), the figure (percent and the live speed with time left, or done / total, or the
-  size), the controls; then the folder (or why it is held); then a thin strip of the job's
+  size) ending flush against the controls so the figures line up down the list, the
+  controls; then the folder (or why it is held); then a thin strip of the job's
   articles (downloaded, missing outlined, waiting; held jobs in the muted tone). A job
   without an article map shows a plain progress line instead.
 - Controls per row: start/pause toggle (downloading → pause; queued in the active run → hold;
   queued outside any run or held → start on its own; failed → retry), move up, a `⋯` menu,
   remove (inline `Remove?` Yes/No). Right click opens the same menu: pause/hold/resume/download
   now, move to top/up/down/bottom, open download folder, archive password, remove.
+- Drag a row to another place in the queue: an accent line shows where it will land, and
+  Esc cancels. Rows hidden by the filter keep their places next to their visible neighbors.
 - Click selects a row (the detail pane opens). Keys on the selection: Space toggles, Delete
   asks to remove, Alt+↑/↓ move, Esc clears; ↑/↓ and Home/End walk the rows on screen (the
   chosen row scrolls into view). Ctrl+F focuses the filter.

@@ -67,6 +67,37 @@ pub struct QueueState {
     pub visible: Vec<i64>,
     /// Scroll the selected row into view next frame (it was chosen from the keyboard).
     pub reveal: bool,
+    /// The queue row being dragged to a new place, if one is.
+    pub drag: Option<i64>,
+    /// The queue rows on screen this frame, top to bottom, with their rectangles (where
+    /// a dragged row may be dropped).
+    pub row_rects: Vec<(i64, egui::Rect)>,
+}
+
+/// Where a dragged row would be dropped: the number of other rows (in `rows`, top to
+/// bottom, the dragged one left out) whose middle lies above `y`, so the drop goes before
+/// the row at that index, or after the last row when `y` is below them all.
+pub fn drop_index(rows: &[(i64, egui::Rect)], dragged: i64, y: f32) -> usize {
+    rows.iter().filter(|(id, r)| *id != dragged && r.center().y < y).count()
+}
+
+/// The queue order after dropping `dragged` at `at` (see [`drop_index`]) among `visible`,
+/// the rows on screen top to bottom: `order` with `dragged` moved before the row that was
+/// at `at`, or after the last row on screen when `at` is past them all. Rows a filter
+/// hides keep their places next to their visible neighbors. `None` when nothing moves.
+pub fn dropped_order(order: &[i64], visible: &[i64], dragged: i64, at: usize) -> Option<Vec<i64>> {
+    if !order.contains(&dragged) {
+        return None;
+    }
+    let others: Vec<i64> = visible.iter().copied().filter(|&id| id != dragged).collect();
+    let mut new: Vec<i64> = order.iter().copied().filter(|&id| id != dragged).collect();
+    let place = match others.get(at) {
+        Some(before) => new.iter().position(|id| id == before)?,
+        // Past the last row on screen; alone on screen, there is nowhere else to go.
+        None => new.iter().position(|id| Some(id) == others.last())? + 1,
+    };
+    new.insert(place, dragged);
+    (new != order).then_some(new)
 }
 
 /// A key that moves the selection through the rows on screen.
@@ -712,6 +743,29 @@ pub(crate) fn job_menu(
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn a_dropped_row_lands_before_its_target_and_hidden_rows_keep_their_place() {
+        let order = [1, 2, 3, 4, 5];
+        // Every row on screen: drop before a row, or after the last one.
+        assert_eq!(dropped_order(&order, &order, 4, 0), Some(vec![4, 1, 2, 3, 5]));
+        assert_eq!(dropped_order(&order, &order, 1, 1), Some(vec![2, 1, 3, 4, 5]), "before the second other row");
+        assert_eq!(dropped_order(&order, &order, 1, 4), Some(vec![2, 3, 4, 5, 1]), "past the end");
+        assert_eq!(dropped_order(&order, &order, 3, 2), None, "dropped where it was");
+        assert_eq!(dropped_order(&order, &order, 9, 0), None, "not in the queue");
+        // A filter hides 2 and 4: dropping 5 before 3 puts it between 2 and 3.
+        assert_eq!(dropped_order(&order, &[1, 3, 5], 5, 1), Some(vec![1, 2, 5, 3, 4]));
+        // Dropped after the last visible row (3): right behind it, before the hidden 4.
+        assert_eq!(dropped_order(&order, &[1, 3], 1, 1), Some(vec![2, 3, 1, 4, 5]));
+        assert_eq!(dropped_order(&order, &[1, 3, 5], 1, 2), Some(vec![2, 3, 4, 5, 1]), "behind the last on screen");
+        assert_eq!(dropped_order(&order, &[2], 2, 0), None, "alone on screen");
+        let r = |top: f32| (0, egui::Rect::from_min_size(egui::pos2(0.0, top), egui::vec2(10.0, 10.0)));
+        let rows: Vec<(i64, egui::Rect)> = [(1, r(0.0).1), (2, r(10.0).1), (3, r(20.0).1)].to_vec();
+        assert_eq!(drop_index(&rows, 2, 3.0), 0);
+        assert_eq!(drop_index(&rows, 2, 7.0), 1, "below the first row's middle");
+        assert_eq!(drop_index(&rows, 2, 27.0), 2, "below every other row");
+        assert_eq!(drop_index(&rows, 9, 100.0), 3);
+    }
 
     #[test]
     fn arrow_keys_walk_the_rows_on_screen() {
