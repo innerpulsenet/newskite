@@ -21,7 +21,6 @@ pub(crate) fn refuse_reason(job: &Job, download_dir: &Path, others: &[Job]) -> O
     if dir.components().filter(|c| matches!(c, Component::Normal(_))).count() < 2 {
         return Some(format!("{} is too close to the file system root", dir.display()));
     }
-    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     let real = canon(dir);
     let base = canon(download_dir);
     if real == base || base.starts_with(&real) {
@@ -39,6 +38,57 @@ pub(crate) fn refuse_reason(job: &Job, download_dir: &Path, others: &[Job]) -> O
         }
     }
     None
+}
+
+/// `p` with links resolved as far as it exists, the rest appended unchanged, so a folder
+/// that exists and one that does not (yet) compare alike.
+fn canon(p: &Path) -> PathBuf {
+    let mut rest = Vec::new();
+    let mut cur = p;
+    loop {
+        if let Ok(real) = std::fs::canonicalize(cur) {
+            let mut out = without_verbatim_prefix(real);
+            out.extend(rest.iter().rev());
+            return out;
+        }
+        match (cur.parent(), cur.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name.to_owned());
+                cur = parent;
+            }
+            _ => return p.to_path_buf(),
+        }
+    }
+}
+
+/// Windows' `canonicalize` returns `\\?\C:\...` (and `\\?\UNC\server\share\...`) paths,
+/// which never start with the same folder in its usual `C:\...` form; back to that form.
+#[cfg(windows)]
+fn without_verbatim_prefix(p: PathBuf) -> PathBuf {
+    use std::path::Prefix;
+    let mut comps = p.components();
+    let mut out = match comps.next() {
+        Some(Component::Prefix(pre)) => match pre.kind() {
+            Prefix::VerbatimDisk(d) => PathBuf::from(format!("{}:\\", char::from(d))),
+            Prefix::VerbatimUNC(server, share) => {
+                let mut s = std::ffi::OsString::from(r"\\");
+                s.push(server);
+                s.push(r"\");
+                s.push(share);
+                s.push(r"\");
+                PathBuf::from(s)
+            }
+            _ => return p,
+        },
+        _ => return p,
+    };
+    out.extend(comps.filter(|c| matches!(c, Component::Normal(_))));
+    out
+}
+
+#[cfg(not(windows))]
+fn without_verbatim_prefix(p: PathBuf) -> PathBuf {
+    p
 }
 
 fn home_dir() -> Option<PathBuf> {
@@ -119,6 +169,29 @@ mod tests {
         assert!(refuse_reason(&job(2, &base.join("a/../b")), &base, &[]).is_some());
         let inner = job(3, &base.join("a/inner"));
         assert!(refuse_reason(&a, &base, &[a.clone(), inner]).unwrap().contains("shared"));
+        // A job folder that exists holding the download folder, which does not yet.
+        let missing_base = base.join("a").join("not-yet");
+        assert!(refuse_reason(&a, &missing_base, &[]).unwrap().contains("download folder"));
+    }
+
+    #[test]
+    fn canon_extends_the_existing_part() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = std::fs::canonicalize(tmp.path()).unwrap();
+        let real = without_verbatim_prefix(real);
+        assert_eq!(canon(tmp.path()), real);
+        assert_eq!(canon(&tmp.path().join("x").join("y")), real.join("x").join("y"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn verbatim_prefixes_are_dropped() {
+        assert_eq!(without_verbatim_prefix(PathBuf::from(r"\\?\C:\a\b")), PathBuf::from(r"C:\a\b"));
+        assert_eq!(
+            without_verbatim_prefix(PathBuf::from(r"\\?\UNC\srv\share\x")),
+            PathBuf::from(r"\\srv\share\x")
+        );
+        assert_eq!(without_verbatim_prefix(PathBuf::from(r"C:\a")), PathBuf::from(r"C:\a"));
     }
 
     #[test]
