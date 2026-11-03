@@ -82,7 +82,11 @@
 //!   sanitized yEnc name, or a numbered `"<stem> (n).<ext>"` variant of it, exists with the
 //!   part's `size=` as its length and the part's bytes at the part's offset. Matching by
 //!   content keeps files whose names collide from being taken for each other and finds
-//!   outputs an earlier run saved under a numbered name. Skipped files emit only a `Log`
+//!   outputs an earlier run saved under a numbered name. Failing that, any other file of
+//!   `dest_dir` with that length and those bytes counts too (a file post-processing moved
+//!   to its real name, as with obfuscated posts, or one renamed by hand), except
+//!   `.nkpart` files and the `name.1` backups a PAR2 repair keeps next to `name`, which
+//!   may be damaged past the first part. Skipped files emit only a `Log`
 //!   line and are included in the [`JobReport`] with their on-disk size.
 //!
 //! # Events

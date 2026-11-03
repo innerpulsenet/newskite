@@ -236,3 +236,39 @@ async fn resume_does_not_skip_mismatched_content() {
     assert_eq!(report.files[0].name, "real (2).bin");
     assert_eq!(sha256(&std::fs::read(dir.path().join("real (2).bin")).unwrap()), sha256(&src.data));
 }
+
+/// An obfuscated post whose output post-processing moved to its real name: no recorded name
+/// points at it any more, but its content does, so a retry fetches one article to find it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resume_finds_a_file_renamed_since_by_its_content() {
+    let src = TestFile::new("rn", "Y9zTHX09lDgCv9Ej", random_bytes(30_000, 45), 3);
+    let server = mock(articles_of([&src]), false).await;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("The.Movie.mkv"), &src.data).unwrap();
+
+    let out = run(nzb_of(vec![src.nzb_file(None)]), dir.path(), vec![server_for(&server, false, 1)], options(1)).await;
+    let report = out.result.expect("resume succeeds");
+    assert_eq!(report.files[0].name, "The.Movie.mkv");
+    assert_eq!(report.files[0].bytes, 30_000);
+    assert_eq!(server.body_requests(), 1, "one part to identify the file, nothing more");
+    assert_eq!(listing(dir.path()), vec!["The.Movie.mkv"]);
+}
+
+/// The damaged original a PAR2 repair keeps as `name.1` starts like the file and has its
+/// length, but is never taken for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resume_never_takes_a_repair_backup_for_the_file() {
+    let src = TestFile::new("bk", "Qp4r", random_bytes(30_000, 46), 3);
+    let server = mock(articles_of([&src]), false).await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut damaged = src.data.clone();
+    damaged[25_000..].fill(0);
+    std::fs::write(dir.path().join("movie.mkv"), b"repaired copy, moved away since").unwrap();
+    std::fs::write(dir.path().join("movie.mkv.1"), &damaged).unwrap();
+
+    let out = run(nzb_of(vec![src.nzb_file(None)]), dir.path(), vec![server_for(&server, false, 1)], options(1)).await;
+    let report = out.result.expect("download succeeds");
+    assert_eq!(report.files[0].name, "Qp4r");
+    assert_eq!(server.body_requests(), 3, "downloaded again");
+    assert_eq!(sha256(&std::fs::read(dir.path().join("Qp4r")).unwrap()), sha256(&src.data));
+}

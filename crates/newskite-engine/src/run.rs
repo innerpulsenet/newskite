@@ -170,6 +170,9 @@ impl FileJob {
     }
 }
 
+/// A file in the download folder: its name and length.
+type OnDisk = (String, u64);
+
 struct Shared {
     dest_dir: PathBuf,
     servers: Vec<ServerSlot>,
@@ -197,6 +200,8 @@ struct Shared {
     /// The repair outlook (see [`crate::repair`]).
     repair: Mutex<Tracker>,
     stop_unrepairable: bool,
+    /// Complete files in `dest_dir` when the run started (see [`resume_candidates`]).
+    on_disk: Vec<OnDisk>,
 }
 
 impl Shared {
@@ -444,13 +449,14 @@ pub(crate) async fn run(
     let labels: Vec<String> = files.iter().map(|f| f.label.clone()).collect();
     let skip_files = options.skip_files.clone();
     let dir = dest_dir.clone();
-    let pre_skipped: Vec<bool> = tokio::task::spawn_blocking(move || -> io::Result<Vec<bool>> {
+    let (pre_skipped, on_disk) = tokio::task::spawn_blocking(move || -> io::Result<(Vec<bool>, Vec<OnDisk>)> {
         std::fs::create_dir_all(&dir)?;
-        Ok(labels
+        let pre = labels
             .iter()
             .zip(&unique_label)
             .map(|(l, &unique)| unique && skip_files.contains(l) && dir.join(l).is_file())
-            .collect())
+            .collect();
+        Ok((pre, resume_candidates(&dir)))
     })
     .await
     .map_err(|e| io::Error::other(format!("preparing the download folder failed: {e}")))??;
@@ -516,6 +522,7 @@ pub(crate) async fn run(
         bad_articles: AtomicUsize::new(0),
         repair: Mutex::new(tracker),
         stop_unrepairable: options.stop_unrepairable,
+        on_disk,
     });
 
     // A new job tries every server again; earlier login failures stay in last_error.
@@ -1288,11 +1295,33 @@ fn preallocate(file: &File, size: u64) -> io::Result<()> {
     }
 }
 
+/// Blocking: the regular files directly in `dir` with their lengths, by name: everything
+/// but in-progress `.nkpart` files and the damaged originals a PAR2 repair keeps as
+/// `name.1` (`.2`, ...) next to `name`, which have the right length and start but may be
+/// damaged further in.
+fn resume_candidates(dir: &Path) -> Vec<OnDisk> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut files: Vec<(String, u64)> = entries
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .filter_map(|e| Some((e.file_name().into_string().ok()?, e.metadata().ok()?.len())))
+        .filter(|(n, _)| !n.to_ascii_lowercase().ends_with(&format!(".{}", crate::PART_EXTENSION)))
+        .collect();
+    let names: HashSet<String> = files.iter().map(|(n, _)| n.clone()).collect();
+    files.retain(|(n, _)| {
+        !n.rsplit_once('.').is_some_and(|(stem, num)| !num.is_empty() && num.bytes().all(|b| b.is_ascii_digit()) && names.contains(stem))
+    });
+    files.sort();
+    files
+}
+
 /// Blocking: the `skip_files` entry (`base` or a numbered `"<stem> (n).<ext>"` variant of
 /// it, lowest `n` first) that no file of this job claimed yet and whose on-disk content is
 /// this file's: same length as the part's yEnc `size=` and the part's bytes at its offset.
 /// Matching by content (not by name alone) keeps files whose names collide from being taken
-/// for each other, and finds outputs an earlier run saved under a numbered name.
+/// for each other, and finds outputs an earlier run saved under a numbered name. Failing
+/// that, any other file of the folder with that content (see [`resume_candidates`]): a
+/// file post-processing moved to its real name (obfuscated posts), or one renamed by hand.
 fn completed_earlier(
     shared: &Shared,
     claimed: &HashSet<String>,
@@ -1302,7 +1331,9 @@ fn completed_earlier(
     let mut candidates: Vec<(u32, &String)> =
         shared.skip_files.iter().filter_map(|s| suffix_number(s, base).map(|n| (n, s))).collect();
     candidates.sort();
-    candidates.into_iter().find_map(|(_, name)| {
+    let by_name = candidates.into_iter().map(|(_, name)| name);
+    let by_content = shared.on_disk.iter().filter(|(_, len)| *len == part.size).map(|(name, _)| name);
+    by_name.chain(by_content).find_map(|name| {
         if claimed.contains(&claim_key(name)) {
             return None;
         }
@@ -1484,6 +1515,7 @@ mod tests {
             bad_articles: AtomicUsize::new(0),
             repair: Mutex::new(Tracker::new(Vec::new(), 0)),
             stop_unrepairable: false,
+            on_disk: Vec::new(),
         };
         let ids: Vec<String> = (1..=5).map(|i| format!("id{i}@x")).collect();
         fail_file(&shared, "f.bin", &ids);
@@ -1518,6 +1550,7 @@ mod tests {
             bad_articles: AtomicUsize::new(0),
             repair: Mutex::new(Tracker::new(Vec::new(), 0)),
             stop_unrepairable: false,
+            on_disk: Vec::new(),
         };
         for i in 0..60 {
             shared.log_bad_article(&format!("f.bin: article <{i}@x> could not be decoded"));
@@ -1559,6 +1592,7 @@ mod tests {
             bad_articles: AtomicUsize::new(0),
             repair: Mutex::new(Tracker::new(Vec::new(), 0)),
             stop_unrepairable: false,
+            on_disk: Vec::new(),
         };
         assert_eq!(shared.order(&[false, false, false], 0), vec![0, 1, 2]);
         assert_eq!(shared.order(&[false, false, false], 2), vec![2, 0, 1]);

@@ -541,7 +541,7 @@ fn outcome_of(post: &PostReport, stage_ms: &HashMap<PostStage, u64>) -> JobOutco
     let stats = post.par2_stats.as_ref();
     let par2_state = step_state(&post.par2);
     let repaired = post.par2 == Verdict::Repaired;
-    let repair_ran = stats.is_some_and(|s| s.slices_missing > 0 || s.repair_ms > 0) || repaired;
+    let repair_ran = stats.is_some_and(|s| s.slices_missing > 0 || s.repair_ms > 0 || s.files_renamed > 0) || repaired;
     o.verify = Some(StepRecord {
         state: match par2_state {
             StepState::Repaired => StepState::Ok,
@@ -642,6 +642,7 @@ async fn post_process(inner: &Arc<Inner>, job: &Job, settings: &Settings) -> (Re
     let secs = post_ms / 1000;
     match result {
         Ok((Ok(post), stage_ms)) => {
+            record_renames(inner, job, &post.renamed);
             let fin = Finish { outcome: outcome_of(&post, &stage_ms), post_ms, missing: 0 };
             inner.log_job(
                 job.id,
@@ -737,6 +738,20 @@ async fn finish_partial(inner: &Arc<Inner>, job: &Job, settings: &Settings, ids:
         Err(reason) => {
             fin.outcome.failure.get_or_insert(FailureKind::MissingArticles);
             fail_job(inner, job, &format!("{missing}; {reason}"), fin)
+        }
+    }
+}
+
+/// Moves the job's file rows along with files post-processing renamed, so a retry finds
+/// them under their names on disk (only files directly in the job's folder have rows).
+fn record_renames(inner: &Inner, job: &Job, renamed: &[(std::path::PathBuf, std::path::PathBuf)]) {
+    let name_in_dir = |p: &Path| {
+        (p.parent() == Some(job.dest_dir.as_path())).then(|| p.file_name().map(|n| n.to_string_lossy().into_owned())).flatten()
+    };
+    for (from, to) in renamed {
+        let (Some(from), Some(to)) = (name_in_dir(from), name_in_dir(to)) else { continue };
+        if let Err(e) = inner.store.rename_job_file(job.id, &from, &to) {
+            inner.log_job(job.id, LogLevel::Warn, format!("could not record that {from} is now {to}: {e}"));
         }
     }
 }

@@ -614,6 +614,25 @@ impl Store {
     }
 
     /// All file rows of a job, by name. Empty for unknown jobs.
+    /// Renames a job's file row (post-processing moved the file); a row already under
+    /// `to` is replaced. Returns whether a row was renamed.
+    pub fn rename_job_file(&self, job_id: i64, from: &str, to: &str) -> Result<bool, StoreError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM job_files WHERE job_id = ?1 AND name = ?2)",
+            params![job_id, from],
+            |r| r.get(0),
+        )?;
+        if !exists || from == to {
+            return Ok(false);
+        }
+        tx.execute("DELETE FROM job_files WHERE job_id = ?1 AND name = ?2", params![job_id, to])?;
+        tx.execute("UPDATE job_files SET name = ?3 WHERE job_id = ?1 AND name = ?2", params![job_id, from, to])?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     pub fn job_files(&self, job_id: i64) -> Result<Vec<JobFile>, StoreError> {
         let conn = self.read();
         let mut stmt = conn.prepare(

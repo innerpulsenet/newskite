@@ -929,3 +929,44 @@ async fn articles_lost_only_in_par2_volumes_do_not_fail_the_job() {
         svc.shutdown();
     }
 }
+
+/// An obfuscated post: PAR2 moves the data to its real name, and the job's file rows move
+/// with it, so a later retry finds the file under the name it has on disk.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn file_rows_follow_the_names_par2_restores() {
+    let tmp = TempDir::new().unwrap();
+    let data = common::random_bytes(40 * 1024, 80);
+    let src = tmp.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("m.bin"), &data).unwrap();
+    let written = newskite_par2::create(&src, &["m.bin"], 2048, 4, &src.join("m")).unwrap();
+    let file = TestFile::new("o", "Q7xZk2Lp", data.clone(), 4);
+    let par2: Vec<TestFile> = written
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let name = p.file_name().unwrap().to_string_lossy().into_owned();
+            TestFile::new(&format!("o{i}"), &name, std::fs::read(p).unwrap(), 1)
+        })
+        .collect();
+    let mut all: Vec<&TestFile> = vec![&file];
+    all.extend(par2.iter());
+    let mock = mock_for(&all, &[], 0).await;
+    let mut settings = test_settings(tmp.path(), vec![server_for(&mock, 2)]);
+    settings.postprocess = newskite_types::PostProcessSettings { remove_leftovers: false, ..Default::default() };
+    let svc = open_service(tmp.path(), settings);
+    let job = svc.add_nzb(&write_nzb(&tmp.path().join("n"), "m.nzb", None, &all)).unwrap();
+
+    assert!(svc.start());
+    wait_idle(&svc, 30).await;
+    let done = svc.jobs().remove(0);
+    assert_eq!(done.state, JobState::Done, "{:?}", done.error);
+    assert_eq!(std::fs::read(job.dest_dir.join("m.bin")).unwrap(), data);
+    let rows = svc.job_files(job.id);
+    let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+    assert!(names.contains(&"m.bin") && !names.contains(&"Q7xZk2Lp"), "{names:?}");
+    assert_eq!(rows.iter().find(|r| r.name == "m.bin").map(|r| (r.state.as_str(), r.bytes_done)), Some(("done", 40 * 1024)));
+    let o = done.stats.outcome.as_deref().unwrap();
+    assert!(!o.repaired(), "renaming is not a repair: {o:?}");
+    assert_eq!(o.repair.as_ref().map(|r| r.detail.as_str()), Some("renamed 1 misnamed file"));
+}
