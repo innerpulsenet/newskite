@@ -15,6 +15,10 @@ tracing.workspace = true
 tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
 tokio-util.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# fallocate for the in-progress output files (safe API).
+rustix = { version = "1.1.2", default-features = false, features = ["fs", "std"] }
+
 [dev-dependencies]
 newskite-nntp = { workspace = true, features = ["testkit"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

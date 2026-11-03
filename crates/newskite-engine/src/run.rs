@@ -767,27 +767,30 @@ async fn process_segment(shared: &Arc<Shared>, held: &mut Option<Held>, st: &mut
                         _ = shared.limiter.acquire(raw.len()) => {}
                     }
                 }
+                // Once the file's output is decided, its handle goes along so decode,
+                // check and write run as one blocking task (see `Decoded`).
+                let handle = open_handle(file);
                 let checked = {
                     // Decode and verify on the blocking pool so a slow decode never
                     // stalls another connection's socket task.
                     let shared = shared.clone();
                     tokio::task::spawn_blocking(move || {
-                        yenc::decode(&raw).map_err(|e| format!("could not be decoded: {e}")).and_then(|part| {
-                            shared.files[fi]
-                                .check_part(&part)
-                                .map(|()| part)
-                                .map_err(|why| format!("does not belong to this file: {why}"))
-                        })
+                        let part = yenc::decode(&raw).map_err(|e| format!("could not be decoded: {e}"))?;
+                        shared.files[fi]
+                            .check_part(&part)
+                            .map_err(|why| format!("does not belong to this file: {why}"))?;
+                        let written = handle.map(|h| write_all_at(&h, &part.data, part.begin.saturating_sub(1)));
+                        Ok::<_, String>(Decoded { part, written })
                     })
                     .await
                 };
                 match checked {
-                    Ok(Ok(part)) => {
+                    Ok(Ok(decoded)) => {
                         shared.progress.health(&shared.servers[server].address, |h| {
                             h.articles += 1;
                             h.bytes += received;
                         });
-                        return store_part(shared, fi, si, part).await;
+                        return store_part(shared, fi, si, decoded).await;
                     }
                     Ok(Err(why)) => {
                         shared.note_error(server, &why);
@@ -979,9 +982,28 @@ async fn record_missing(shared: &Arc<Shared>, fi: usize, si: usize, reason: Opti
     finish_segment(shared, fi, si, None).await
 }
 
-/// Writes a decoded part into its file (deciding the output on the first part).
-async fn store_part(shared: &Arc<Shared>, fi: usize, si: usize, part: YencPart) -> Flow {
+/// A part decoded and checked on the blocking pool. `written` is the outcome of writing
+/// it there, when the file's output was already decided (the steady state: one blocking
+/// task per segment); `None` means the first part of a file, which decides the output
+/// and is written by [`store_part`] in a task of its own.
+struct Decoded {
+    part: YencPart,
+    written: Option<io::Result<()>>,
+}
+
+/// The open `.nkpart` handle of a file whose output is decided and not skipped.
+fn open_handle(file: &FileJob) -> Option<Arc<File>> {
+    let out = file.output.get()?;
+    if out.skipped {
+        return None;
+    }
+    lock(&out.file).clone()
+}
+
+/// Stores a decoded part in its file (deciding the output on the first part).
+async fn store_part(shared: &Arc<Shared>, fi: usize, si: usize, decoded: Decoded) -> Flow {
     let file = &shared.files[fi];
+    let Decoded { part, written } = decoded;
     let part = Arc::new(part);
     let init = {
         let shared = shared.clone();
@@ -1001,15 +1023,20 @@ async fn store_part(shared: &Arc<Shared>, fi: usize, si: usize, part: YencPart) 
     if part.crc_ok == Some(false) {
         file.crc_errors.fetch_add(1, Ordering::Relaxed);
     }
-    let Some(handle) = lock(&out.file).clone() else {
-        shared.fail(EngineError::Io(io::Error::other(format!("{}: output file is closed", out.name))));
-        return Flow::Stop;
-    };
     let len = part.data.len() as u64;
     let end = part.end;
-    // decode() guarantees begin >= 1.
-    let offset = part.begin.saturating_sub(1);
-    let written = tokio::task::spawn_blocking(move || write_all_at(&handle, &part.data, offset)).await;
+    let written = match written {
+        Some(w) => Ok(w),
+        None => {
+            let Some(handle) = lock(&out.file).clone() else {
+                shared.fail(EngineError::Io(io::Error::other(format!("{}: output file is closed", out.name))));
+                return Flow::Stop;
+            };
+            // decode() guarantees begin >= 1.
+            let offset = part.begin.saturating_sub(1);
+            tokio::task::spawn_blocking(move || write_all_at(&handle, &part.data, offset)).await
+        }
+    };
     match written {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
@@ -1103,11 +1130,38 @@ fn resolve_output(shared: &Shared, fi: usize, first: Option<&YencPart>, create: 
     let part = part_path(&final_path);
     let handle = if create {
         let f = OpenOptions::new().create(true).write(true).truncate(true).open(&part)?;
+        if let Some(size) = first.map(|p| p.size).filter(|&s| s > 0) {
+            preallocate(&f, size).map_err(|e| {
+                io::Error::new(e.kind(), format!("{name}: cannot reserve {} on disk: {e}", format::bytes(size)))
+            })?;
+        }
         Some(Arc::new(f))
     } else {
         None
     };
     Ok(Output { name, final_path, part_path: part, file: Mutex::new(handle), skipped: false })
+}
+
+/// Blocking: reserves `size` bytes for a fresh `.nkpart`, so the parts that arrive out of
+/// order land in one extent instead of growing the file piecemeal, and a disk without
+/// room for the file is noticed on its first part rather than its last. Allocated for
+/// real where the file system can (Linux `fallocate`); elsewhere, or when it refuses, the
+/// length is set (a sparse file). Only a full disk is an error.
+fn preallocate(file: &File, size: u64) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    match rustix::fs::fallocate(file, rustix::fs::FallocateFlags::empty(), 0, size) {
+        Ok(()) => return Ok(()),
+        Err(rustix::io::Errno::NOSPC) => return Err(io::Error::from(rustix::io::Errno::NOSPC)),
+        Err(e) => tracing::debug!(target: "newskite_engine", error = %e, "fallocate unsupported here; setting the length"),
+    }
+    match file.set_len(size) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::StorageFull => Err(e),
+        Err(e) => {
+            tracing::debug!(target: "newskite_engine", error = %e, "could not set the part file's length");
+            Ok(())
+        }
+    }
 }
 
 /// Blocking: the `skip_files` entry (`base` or a numbered `"<stem> (n).<ext>"` variant of

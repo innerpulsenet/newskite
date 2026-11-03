@@ -14,8 +14,9 @@ use super::articles;
 use super::docks;
 use super::fonts;
 use super::queue::{
-    controls_cell, empty_queue, filter_box, finished_subline, history_actions, home_relative, job_menu,
-    live_subline, matches_filter, no_match, now_unix, queue_summary, result_qualifier, search_field, EMPTY_HISTORY,
+    controls_cell, drop_index, dropped_order, empty_queue, filter_box, finished_subline, history_actions,
+    home_relative, job_menu, live_subline, matches_filter, no_match, now_unix, queue_summary, result_qualifier,
+    search_field, EMPTY_HISTORY,
 };
 use super::theme::Palette;
 use super::toolbar::{open_nzb_row, queue_control};
@@ -57,6 +58,8 @@ impl ListFilter {
 const CONTROLS_W: f32 = 178.0;
 /// Width of the controls box while an archive password is typed in the row.
 const PASSWORD_EDIT_W: f32 = 320.0;
+/// Gap between a row's figures and its controls box.
+const FIGURE_GAP: f32 = 12.0;
 /// A row's padding.
 const ROW_PAD: Margin = Margin { left: 18, right: 12, top: 12, bottom: 12 };
 /// Seconds the just-imported job's name stays in the accent before settling.
@@ -333,7 +336,10 @@ fn list(ui: &mut Ui, pal: &Palette, data: &Data, jobs: &[&Job], view: &mut ViewS
     if !view.queue.flashes.is_empty() {
         ui.ctx().request_repaint_after(super::motion::FRAME);
     }
-    egui::Frame::new()
+    if kind == RowKind::Queue {
+        view.queue.row_rects.clear();
+    }
+    let frame = egui::Frame::new()
         .fill(pal.raised)
         .stroke(egui::Stroke::new(1.0, pal.border))
         .corner_radius(egui::CornerRadius::same(12))
@@ -346,6 +352,48 @@ fn list(ui: &mut Ui, pal: &Palette, data: &Data, jobs: &[&Job], view: &mut ViewS
                 row(ui, pal, data, job, view, actions, kind, i == last);
             }
         });
+    if kind == RowKind::Queue {
+        drag_overlay(ui, pal, data, view, actions, frame.response.rect);
+    }
+}
+
+/// While a queue row is dragged: the accent line where it would land, the grabbing
+/// cursor, and, when the button is let go, the new order (or nothing, dropped where it
+/// was or outside the list). Esc cancels the drag.
+fn drag_overlay(ui: &mut Ui, pal: &Palette, data: &Data, view: &mut ViewState, actions: &mut Vec<Action>, list: Rect) {
+    let Some(dragged) = view.queue.drag else { return };
+    let (pointer, released, cancel) = ui.input(|i| {
+        (i.pointer.latest_pos(), i.pointer.primary_released() || !i.pointer.primary_down(), i.key_pressed(egui::Key::Escape))
+    });
+    let rows = &view.queue.row_rects;
+    let at = pointer.map(|p| drop_index(rows, dragged, p.y));
+    if cancel || released {
+        if let (Some(at), false) = (at, cancel) {
+            let visible: Vec<i64> = rows.iter().map(|(id, _)| *id).collect();
+            if let Some(order) = dropped_order(&data.queue_order, &visible, dragged, at) {
+                actions.push(Action::ReorderQueue(order));
+            }
+        }
+        view.queue.drag = None;
+        return;
+    }
+    ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+    // The line goes above the row the drop lands before, or under the last row.
+    let others: Vec<Rect> = rows.iter().filter(|(id, _)| *id != dragged).map(|(_, r)| *r).collect();
+    let y = match (at, others.get(at.unwrap_or(0)), others.last()) {
+        (Some(_), Some(r), _) => Some(r.top()),
+        (Some(_), None, Some(last)) => Some(last.bottom()),
+        _ => None,
+    };
+    if let Some(y) = y {
+        let y = y.clamp(list.top() + 1.0, list.bottom() - 1.0);
+        let painter = ui.painter();
+        let x = list.x_range().shrink(10.0);
+        painter.hline(x, y, egui::Stroke::new(2.0, pal.accent));
+        painter.circle_filled(egui::pos2(x.min, y), 3.5, pal.accent);
+        painter.circle_filled(egui::pos2(x.max, y), 3.5, pal.accent);
+    }
+    ui.ctx().request_repaint();
 }
 
 /// The state word of a row and its color: what the job is doing, in plain words.
@@ -380,7 +428,13 @@ fn row(
     // its height is the one the row had last frame.
     let h = ui.ctx().data(|d| d.get_temp::<f32>(id)).unwrap_or(80.0);
     let rect = Rect::from_min_size(ui.cursor().min, Vec2::new(width, h));
-    let resp = ui.interact(rect, id, Sense::click());
+    // Queue rows can also be dragged to a new place in the queue.
+    let sense = if kind == RowKind::Queue { Sense::click_and_drag() } else { Sense::click() };
+    let resp = ui.interact(rect, id, sense);
+    if kind == RowKind::Queue && resp.drag_started() && view.queue.drag.is_none() {
+        view.queue.drag = Some(job.id);
+    }
+    let dragging = view.queue.drag == Some(job.id);
     let slot = ui.painter().add(Shape::Noop);
     let held = job.state == JobState::Paused;
     let now = ui.input(|i| i.time);
@@ -411,6 +465,9 @@ fn row(
         });
     });
     let real = inner.response.rect;
+    if kind == RowKind::Queue {
+        view.queue.row_rects.push((job.id, real));
+    }
     if selected && view.queue.reveal {
         ui.scroll_to_rect(real, None);
         view.queue.reveal = false;
@@ -430,6 +487,11 @@ fn row(
         // Half the soft accent: secondary text on it keeps 4.5:1; the rail marks it.
         shapes.push(Shape::rect_filled(real, 0.0, Palette::fade(pal.accent_soft, 0.5 * sel)));
     }
+    if dragging {
+        // The row in hand: lifted on the soft accent and outlined, wherever it will land.
+        shapes.push(Shape::rect_filled(real, 0.0, Palette::fade(pal.accent_soft, 0.4)));
+        shapes.push(Shape::rect_stroke(real.shrink(0.5), 0.0, egui::Stroke::new(1.0, pal.accent), egui::StrokeKind::Inside));
+    }
     if hover > 0.0 {
         shapes.push(Shape::rect_filled(real, 0.0, Palette::fade(pal.hover, hover * if selected { 0.5 } else { 1.0 })));
     }
@@ -448,7 +510,7 @@ fn row(
     }
     ui.painter().set(slot, Shape::Vec(shapes));
 
-    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+    let resp = if dragging { resp } else { resp.on_hover_cursor(egui::CursorIcon::PointingHand) };
     if kind == RowKind::Finished && resp.double_clicked() {
         actions.push(Action::OpenJobFolder(job.id));
     } else if resp.clicked() {
@@ -524,9 +586,10 @@ fn first_line(
     let mono = fonts::mono_id(12.0);
     let word_font = fonts::semibold_id(13.0);
     let measure = |t: &str, f: &egui::FontId| ui.painter().layout_no_wrap(t.to_owned(), f.clone(), pal.text).size().x;
-    let mid_w = measure(&word, &word_font)
-        + figures.iter().map(|(t, _)| measure(t, &mono) + 12.0).sum::<f32>()
-        + 16.0;
+    // The figures end flush against the controls, so sizes and speeds line up down the
+    // list whatever the names and state words before them take.
+    let figures_w = figures.iter().map(|(t, _)| measure(t, &mono) + 12.0).sum::<f32>();
+    let mid_w = measure(&word, &word_font) + figures_w + 16.0 + FIGURE_GAP;
     let name_w = (w - controls_w - mid_w - 8.0).max(90.0);
     ui.horizontal(|ui| {
         ui.set_min_height(24.0);
@@ -554,6 +617,10 @@ fn first_line(
         } else if job.state == JobState::Queued && !data.in_run(job) {
             r.on_hover_text("Waiting for Start");
         }
+        let room = ui.available_width() - controls_w - figures_w - FIGURE_GAP;
+        if room > 0.0 {
+            ui.add_space(room);
+        }
         for (text, tip) in figures {
             ui.add_space(12.0);
             let r = ui.add(egui::Label::new(RichText::new(text).font(mono.clone()).color(quiet)).selectable(false));
@@ -561,11 +628,9 @@ fn first_line(
                 r.on_hover_text(tip);
             }
         }
-        // The controls sit at the right end, in a box of their own.
-        let room = ui.available_width() - controls_w;
-        if room > 0.0 {
-            ui.add_space(room);
-        }
+        // The controls sit at the right end, in a box of their own; the gap keeps an
+        // inline confirmation (which fills the box) off the figures.
+        ui.add_space(FIGURE_GAP);
         ui.allocate_ui_with_layout(Vec2::new(controls_w.min(ui.available_width()), 24.0), Layout::left_to_right(Align::Center), |ui| {
             // Laid out left to right after a spacer, so the buttons end flush right (an
             // inline confirmation takes the whole box).

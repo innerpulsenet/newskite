@@ -338,6 +338,19 @@ async fn move_job_reorders_the_queue_and_clear_history_keeps_pending_jobs() {
 
     svc.pause_job(b.id).unwrap();
     assert_eq!(svc.queue_order(), vec![c.id, b.id, a.id], "held jobs keep their place");
+
+    // A whole order at once (a dragged row): unknown ids are ignored, pending jobs left
+    // out keep their relative order after the listed ones, and a no-op changes nothing.
+    let mut events = svc.subscribe();
+    svc.reorder_queue(&[a.id, 999, b.id, c.id]).unwrap();
+    assert_eq!(svc.queue_order(), vec![a.id, b.id, c.id]);
+    assert_eq!(events.try_recv(), Ok(ServiceEvent::JobsChanged));
+    svc.reorder_queue(&[c.id]).unwrap();
+    assert_eq!(svc.queue_order(), vec![c.id, a.id, b.id]);
+    let mut events = svc.subscribe();
+    svc.reorder_queue(&[c.id, a.id, b.id]).unwrap();
+    assert!(events.try_recv().is_err(), "an unchanged order emits nothing");
+
     assert_eq!(svc.clear_history(), 0);
     assert_eq!(svc.jobs().len(), 3);
 }

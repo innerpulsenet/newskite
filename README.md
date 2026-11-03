@@ -12,7 +12,7 @@ Newskite is a desktop Usenet (NZB) download client written in Rust. You give it 
 it downloads the listed articles from your news server (NNTP, usually over TLS), decodes the
 yEnc payloads, writes the original files to disk byte for byte, then verifies, repairs and
 extracts them without any external program. It keeps a resumable, reorderable queue
-where every job can be started, paused or moved on its own, a download history, per-file
+where every job can be started, paused or moved on its own (drag a row to reorder), a download history, per-file
 progress, a live map of every article (downloaded, missing, waiting) with a strip of it under each job, a filterable log and a
 throughput graph in the status bar, and it follows the desktop's light
 or dark color scheme (KDE Plasma first).

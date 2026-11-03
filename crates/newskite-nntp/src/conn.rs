@@ -1,6 +1,8 @@
 //! The NNTP connection: handshake, authentication, commands and multi-line bodies.
 
 use std::fmt;
+use std::io;
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use newskite_types::ServerConfig;
@@ -30,6 +32,8 @@ const BODY_INITIAL: usize = 64 * 1024;
 const BODY_SLACK: usize = 8 * 1024;
 /// Upper bound for the polite `QUIT` exchange.
 const QUIT_TIMEOUT: Duration = Duration::from_secs(2);
+/// Gap between connection attempts to a host's addresses (see [`connect_any`]).
+const CONNECT_STAGGER: Duration = Duration::from_millis(250);
 /// Mask shown in place of credentials in logs and transcripts.
 const MASK: &str = "***";
 
@@ -126,8 +130,11 @@ impl NntpConnection {
     /// Connects to `server`, reads the greeting (200/201) and, when a username is
     /// configured, authenticates with `AUTHINFO USER`/`PASS`.
     ///
-    /// `timeout` bounds the whole sequence: TCP connect, TLS handshake, greeting and
-    /// authentication. Exceeding it yields [`NntpError::Timeout`].
+    /// A host with several addresses is tried a quarter second apart, in the resolver's
+    /// order, and the first address to connect wins; one that does not answer therefore
+    /// costs that quarter second, not the whole timeout. `timeout` bounds the whole
+    /// sequence: resolving, TCP connect, TLS handshake, greeting and authentication.
+    /// Exceeding it yields [`NntpError::Timeout`].
     pub async fn connect(server: &ServerConfig, timeout: Duration) -> Result<Self, NntpError> {
         Self::connect_inner(server, timeout, false).await
     }
@@ -139,9 +146,7 @@ impl NntpConnection {
         }
         let fut = async {
             let address = format!("{host}:{}", server.port);
-            let tcp = TcpStream::connect((host, server.port))
-                .await
-                .map_err(|e| NntpError::Connect(format!("{address}: {e}")))?;
+            let tcp = connect_host(host, server.port).await.map_err(|e| NntpError::Connect(format!("{address}: {e}")))?;
             if let Err(e) = tcp.set_nodelay(true) {
                 tracing::debug!(error = %e, "could not set TCP_NODELAY");
             }
@@ -738,6 +743,49 @@ fn check_limit(have: usize, add: usize) -> Result<(), NntpError> {
     Ok(())
 }
 
+/// Resolves `host` and connects to the first of its addresses that answers.
+async fn connect_host(host: &str, port: u16) -> io::Result<TcpStream> {
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port)).await?.collect();
+    connect_any(addrs).await
+}
+
+/// Connects to the first of `addrs` that answers. The attempts start [`CONNECT_STAGGER`]
+/// apart, in the resolver's order, and run side by side from then on, so a host whose
+/// first address does not answer (an IPv6 address on a network without an IPv6 route, a
+/// dead mirror) costs a quarter second, not the whole connect timeout, before the next
+/// one is tried; an address that fails outright is followed by the next at once. The
+/// first socket to connect wins and the other attempts are dropped. With no address, or
+/// when every attempt failed, the last error is returned.
+async fn connect_any(addrs: Vec<SocketAddr>) -> io::Result<TcpStream> {
+    let mut pending = addrs.into_iter().peekable();
+    let mut attempts = tokio::task::JoinSet::new();
+    let mut last_err: Option<io::Error> = None;
+    loop {
+        if let Some(addr) = pending.next() {
+            attempts.spawn(TcpStream::connect(addr));
+        }
+        if attempts.is_empty() {
+            break;
+        }
+        let next = if pending.peek().is_some() {
+            match tokio::time::timeout(CONNECT_STAGGER, attempts.join_next()).await {
+                Ok(joined) => joined,
+                // The stagger passed without an answer: start the next address too.
+                Err(_) => continue,
+            }
+        } else {
+            attempts.join_next().await
+        };
+        match next {
+            Some(Ok(Ok(tcp))) => return Ok(tcp),
+            Some(Ok(Err(e))) => last_err = Some(e),
+            Some(Err(e)) => last_err = Some(io::Error::other(e)),
+            None => break,
+        }
+    }
+    Err(last_err.unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no address found for the host")))
+}
+
 /// Settings "Test" action: connects, authenticates (if a username is set) and issues
 /// `DATE`, returning a transcript of the exchange, one line per step:
 ///
@@ -959,6 +1007,38 @@ mod tests {
             best = best.min(t.elapsed().as_secs_f64());
         }
         println!("unstuff: {:.0} MB/s", (wire.len() * reps) as f64 / best / 1e6);
+    }
+
+    /// An address in the documentation range (192.0.2.0/24) stands in for one that does
+    /// not answer: it is black-holed on the Internet, and unreachable on a machine
+    /// without a route. Either way the next address is tried after the stagger, not
+    /// after the connect timeout.
+    #[tokio::test]
+    async fn connect_any_moves_on_from_an_address_that_does_not_answer() {
+        use tokio::io::AsyncWriteExt;
+        let dead: SocketAddr = "192.0.2.1:9".parse().unwrap();
+        let live = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let good = live.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut s, _)) = live.accept().await {
+                let _ = s.write_all(b"200 hi\r\n").await;
+            }
+        });
+        // An address that fails at once (nothing listens there) is followed by the next
+        // without waiting out the stagger.
+        let closed = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap()
+        };
+        let started = std::time::Instant::now();
+        let tcp = tokio::time::timeout(Duration::from_secs(5), connect_any(vec![closed, dead, good]))
+            .await
+            .expect("connected before the timeout")
+            .expect("one address answered");
+        assert_eq!(tcp.peer_addr().unwrap(), good);
+        assert!(started.elapsed() < Duration::from_secs(3), "{:?}", started.elapsed());
+        assert!(connect_any(Vec::new()).await.is_err(), "no address is an error");
+        assert!(connect_any(vec![closed]).await.is_err(), "a refused address is an error");
     }
 
     #[test]

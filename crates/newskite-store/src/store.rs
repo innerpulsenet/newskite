@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use newskite_types::Settings;
 use rusqlite::types::Type;
-use rusqlite::{params, Connection, OptionalExtension, Row};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row};
 
 use crate::model::{Bookmark, Job, JobFile, JobLogLine, JobState, JobStats, NewBookmark, NewJob, ThroughputSample, Totals};
 use crate::schema;
@@ -51,11 +51,19 @@ const BOOKMARK_COLUMNS: &str = "id, parent_id, name, newsgroup, color, expanded,
 
 /// Thread-safe handle to the Newskite database.
 ///
-/// All methods take `&self`; the connection is guarded by a [`Mutex`], so a `Store` can be
-/// shared between threads (`Arc<Store>`). Methods that address a row by id return
-/// [`StoreError::NotFound`] when that row does not exist, unless documented otherwise.
+/// All methods take `&self`; each connection is guarded by a [`Mutex`], so a `Store` can
+/// be shared between threads (`Arc<Store>`). A file store has two connections: every
+/// write goes through one, and the queries go through a second, read-only one. The
+/// database runs in WAL mode, where a reader never waits for the writer, so a thread
+/// that only reads (the window, between frames) is never held up by a queue run's
+/// writes, and a write never waits for a long read. Every query sees everything
+/// committed before it started. An in-memory store has one connection for both. Methods
+/// that address a row by id return [`StoreError::NotFound`] when that row does not
+/// exist, unless documented otherwise.
 pub struct Store {
     conn: Mutex<Connection>,
+    /// The read-only connection of a file store (see the type docs).
+    reader: Option<Mutex<Connection>>,
     path: Option<PathBuf>,
     /// The locked [`LOCK_FILE_NAME`] (file stores only). Dropping the store closes it,
     /// which releases the lock.
@@ -257,7 +265,13 @@ impl Store {
         let path = dir.join(DB_FILE_NAME);
         make_db_files_private(&path)?;
         let conn = Connection::open(&path)?;
-        Self::init(conn, Some(path), lock)
+        let mut store = Self::init(conn, Some(path.clone()), lock)?;
+        // Opened after the migrations, so it sees the finished schema. Read-only: it can
+        // never hold a write lock, and a query that strays into writing fails instead.
+        let reader = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+        reader.busy_timeout(BUSY_TIMEOUT)?;
+        store.reader = Some(Mutex::new(reader));
+        Ok(store)
     }
 
     /// Open a private in-memory database (tests, `--headless` dry runs).
@@ -274,7 +288,7 @@ impl Store {
         let _mode: String = conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         schema::migrate(&mut conn)?;
-        Ok(Self { conn: Mutex::new(conn), path, _lock: lock })
+        Ok(Self { conn: Mutex::new(conn), reader: None, path, _lock: lock })
     }
 
     /// Path of the database file, or `None` for an in-memory store.
@@ -287,6 +301,15 @@ impl Store {
     /// back on drop), so the guard is recovered instead of propagating the panic.
     fn conn(&self) -> MutexGuard<'_, Connection> {
         self.conn.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The connection for a query: the read-only one of a file store (so the query never
+    /// waits for a write), else the only one.
+    fn read(&self) -> MutexGuard<'_, Connection> {
+        match &self.reader {
+            Some(r) => r.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+            None => self.conn(),
+        }
     }
 
     // -----------------------------------------------------------------------------------
@@ -330,12 +353,12 @@ impl Store {
 
     /// Fetch one job by id.
     pub fn get_job(&self, id: i64) -> Result<Option<Job>, StoreError> {
-        Self::get_job_locked(&self.conn(), id)
+        Self::get_job_locked(&self.read(), id)
     }
 
     /// All jobs, id ascending (queue and history).
     pub fn list_jobs(&self) -> Result<Vec<Job>, StoreError> {
-        let conn = self.conn();
+        let conn = self.read();
         let mut stmt = conn.prepare(&format!("SELECT {JOB_COLUMNS} FROM jobs ORDER BY id ASC"))?;
         let rows = stmt.query_map([], job_from_row)?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -344,7 +367,7 @@ impl Store {
     /// The most recently inserted job (highest id) whose source NZB path equals `p`, if any.
     /// Comparison is on the stored UTF-8 form of the path, without canonicalization.
     pub fn job_by_source(&self, p: &Path) -> Result<Option<Job>, StoreError> {
-        let conn = self.conn();
+        let conn = self.read();
         Ok(conn
             .query_row(
                 &format!("SELECT {JOB_COLUMNS} FROM jobs WHERE source_path = ?1 ORDER BY id DESC LIMIT 1"),
@@ -359,7 +382,7 @@ impl Store {
     /// path, not only the newest one, so it is the right check for "is this NZB already in
     /// the queue". Comparison is on the stored UTF-8 form of the path.
     pub fn pending_job_by_source(&self, p: &Path) -> Result<Option<Job>, StoreError> {
-        let conn = self.conn();
+        let conn = self.read();
         Ok(conn
             .query_row(
                 &format!(
@@ -454,7 +477,7 @@ impl Store {
 
     /// A job's log, oldest first.
     pub fn job_log(&self, job_id: i64) -> Result<Vec<JobLogLine>, StoreError> {
-        let conn = self.conn();
+        let conn = self.read();
         let mut stmt = conn.prepare(
             "SELECT ts, level, text FROM (SELECT id, ts, level, text FROM job_log WHERE job_id = ?1 ORDER BY id DESC LIMIT ?2) ORDER BY id ASC",
         )?;
@@ -505,7 +528,7 @@ impl Store {
     /// the user and skipped), in queue order: `position`, then oldest `created_at`, ties
     /// broken by id.
     pub fn next_runnable_job(&self) -> Result<Option<Job>, StoreError> {
-        let conn = self.conn();
+        let conn = self.read();
         Ok(conn
             .query_row(
                 &format!(
@@ -526,7 +549,7 @@ impl Store {
             return Ok(None);
         }
         let placeholders = vec!["?"; ids.len()].join(", ");
-        let conn = self.conn();
+        let conn = self.read();
         Ok(conn
             .query_row(
                 &format!(
@@ -542,7 +565,7 @@ impl Store {
 
     /// Ids of the pending jobs (`queued`, `downloading`, `paused`) in queue order.
     pub fn queue_order(&self) -> Result<Vec<i64>, StoreError> {
-        let conn = self.conn();
+        let conn = self.read();
         let mut stmt = conn.prepare(&format!(
             "SELECT id FROM jobs WHERE state IN ('queued', 'downloading', 'paused') ORDER BY {QUEUE_ORDER}"
         ))?;
@@ -576,24 +599,23 @@ impl Store {
     /// Insert or replace the per-file row `(f.job_id, f.name)`.
     /// Returns [`StoreError::NotFound`] if the job does not exist.
     pub fn upsert_job_file(&self, f: &JobFile) -> Result<(), StoreError> {
-        let conn = self.conn();
-        if Self::get_job_locked(&conn, f.job_id)?.is_none() {
-            return Err(StoreError::NotFound);
-        }
-        conn.execute(
-            "INSERT INTO job_files (job_id, name, bytes_total, bytes_done, state) VALUES (?1, ?2, ?3, ?4, ?5)
+        // One statement: the row is written only while its job exists, and a missing job
+        // shows as nothing changed.
+        let n = self.conn().execute(
+            "INSERT INTO job_files (job_id, name, bytes_total, bytes_done, state)
+             SELECT ?1, ?2, ?3, ?4, ?5 WHERE EXISTS (SELECT 1 FROM jobs WHERE id = ?1)
              ON CONFLICT (job_id, name) DO UPDATE SET
                  bytes_total = excluded.bytes_total,
                  bytes_done  = excluded.bytes_done,
                  state       = excluded.state",
             params![f.job_id, f.name, to_db(f.bytes_total), to_db(f.bytes_done), f.state],
         )?;
-        Ok(())
+        require_changed(n)
     }
 
     /// All file rows of a job, by name. Empty for unknown jobs.
     pub fn job_files(&self, job_id: i64) -> Result<Vec<JobFile>, StoreError> {
-        let conn = self.conn();
+        let conn = self.read();
         let mut stmt = conn.prepare(
             "SELECT job_id, name, bytes_total, bytes_done, state FROM job_files WHERE job_id = ?1 ORDER BY name",
         )?;
@@ -618,7 +640,7 @@ impl Store {
 
     /// The saved article map of a job, if one was saved.
     pub fn article_map(&self, job_id: i64) -> Result<Option<String>, StoreError> {
-        let conn = self.conn();
+        let conn = self.read();
         Ok(conn
             .query_row("SELECT map FROM article_maps WHERE job_id = ?1", [job_id], |r| r.get(0))
             .optional()?)
@@ -632,7 +654,7 @@ impl Store {
     /// siblings sorted by `order` then id.
     pub fn list_bookmarks(&self) -> Result<Vec<Bookmark>, StoreError> {
         let all: Vec<Bookmark> = {
-            let conn = self.conn();
+            let conn = self.read();
             let mut stmt =
                 conn.prepare(&format!("SELECT {BOOKMARK_COLUMNS} FROM bookmarks ORDER BY ord ASC, id ASC"))?;
             let rows = stmt.query_map([], bookmark_from_row)?;
@@ -760,7 +782,11 @@ impl Store {
     /// Record bytes for one second. If a sample for `s.ts` already exists, the byte counts
     /// are added to it (saturating at `i64::MAX`).
     pub fn add_sample(&self, s: &ThroughputSample) -> Result<(), StoreError> {
-        self.conn().execute(
+        Self::add_sample_in(&self.conn(), s)
+    }
+
+    fn add_sample_in(conn: &Connection, s: &ThroughputSample) -> Result<(), StoreError> {
+        conn.execute(
             "INSERT INTO throughput (ts, bytes_up, bytes_down) VALUES (?1, ?2, ?3)
              ON CONFLICT (ts) DO UPDATE SET
                  bytes_up = CASE WHEN bytes_up > 9223372036854775807 - excluded.bytes_up
@@ -772,9 +798,22 @@ impl Store {
         Ok(())
     }
 
+    /// [`Store::add_sample`] and, when `add_total`, [`Store::add_downloaded_bytes`] with
+    /// `s.bytes_down`, in one transaction: the sampler's whole tick is one write.
+    pub fn record_throughput(&self, s: &ThroughputSample, add_total: bool) -> Result<(), StoreError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        Self::add_sample_in(&tx, s)?;
+        if add_total {
+            Self::add_downloaded_bytes_in(&tx, s.bytes_down)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Samples with `ts >= ts`, oldest first.
     pub fn samples_since(&self, ts: i64) -> Result<Vec<ThroughputSample>, StoreError> {
-        let conn = self.conn();
+        let conn = self.read();
         let mut stmt =
             conn.prepare("SELECT ts, bytes_up, bytes_down FROM throughput WHERE ts >= ?1 ORDER BY ts ASC")?;
         let rows = stmt.query_map([ts], |r| {
@@ -790,7 +829,11 @@ impl Store {
 
     /// Add `n` to the lifetime downloaded-bytes counter (saturating at `i64::MAX`).
     pub fn add_downloaded_bytes(&self, n: u64) -> Result<(), StoreError> {
-        self.conn().execute(
+        Self::add_downloaded_bytes_in(&self.conn(), n)
+    }
+
+    fn add_downloaded_bytes_in(conn: &Connection, n: u64) -> Result<(), StoreError> {
+        conn.execute(
             "INSERT INTO counters (key, value) VALUES (?1, ?2)
              ON CONFLICT (key) DO UPDATE SET
                  value = CASE WHEN value > 9223372036854775807 - excluded.value
@@ -811,7 +854,7 @@ impl Store {
     /// [`StoreError::Json`] rather than silently discarding the user's server list.
     pub fn load_settings(&self) -> Result<Settings, StoreError> {
         let raw: Option<String> = self
-            .conn()
+            .read()
             .query_row("SELECT value FROM settings WHERE key = ?1", [SETTINGS_KEY], |r| r.get(0))
             .optional()?;
         match raw {
@@ -869,7 +912,7 @@ impl Store {
     /// Unreadable settings documents kept by [`Store::save_settings`], as `(key, raw text)`
     /// pairs, oldest first. The text may contain passwords; never log it.
     pub fn settings_backups(&self) -> Result<Vec<(String, String)>, StoreError> {
-        let conn = self.conn();
+        let conn = self.read();
         let mut stmt = conn.prepare(
             "SELECT key, value FROM settings WHERE substr(key, 1, ?1) = ?2 ORDER BY length(key), key",
         )?;
@@ -900,7 +943,7 @@ impl Store {
     /// `true` when [`Store::mark_source_seen`] recorded `p` with exactly this fingerprint.
     pub fn source_seen(&self, p: &Path, size: u64, mtime: i64) -> Result<bool, StoreError> {
         Ok(self
-            .conn()
+            .read()
             .query_row(
                 "SELECT 1 FROM seen_sources WHERE source_path = ?1 AND size = ?2 AND mtime = ?3",
                 params![path_to_db(p), to_db(size), mtime],
@@ -916,7 +959,7 @@ impl Store {
 
     /// Lifetime downloaded bytes plus job counts by state.
     pub fn totals(&self) -> Result<Totals, StoreError> {
-        let conn = self.conn();
+        let conn = self.read();
         let (done, pending, failed): (i64, i64, i64) = conn.query_row(
             "SELECT COALESCE(SUM(state = 'done'), 0),
                     COALESCE(SUM(state IN ('queued', 'downloading', 'paused')), 0),

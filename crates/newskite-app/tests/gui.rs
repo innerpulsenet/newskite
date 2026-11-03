@@ -647,6 +647,14 @@ fn queue_rows_hold_resume_and_reorder() {
         .push_action(Action::MoveJob(archive, JobMove::Top));
     h.run_steps(2);
     assert_eq!(app(&h).data.queue_order, vec![archive, movie]);
+    // A dropped row hands the whole order over at once.
+    h.state_mut().as_mut().expect("app").push_action(Action::ReorderQueue(vec![movie, archive]));
+    h.run_steps(2);
+    assert_eq!(app(&h).data.queue_order, vec![movie, archive]);
+    assert_eq!(app(&h).view.queue.row_rects.iter().map(|(id, _)| *id).collect::<Vec<_>>(), vec![movie, archive], "rows on screen, top to bottom");
+    h.state_mut().as_mut().expect("app").push_action(Action::ReorderQueue(vec![archive, movie]));
+    h.run_steps(2);
+    assert_eq!(app(&h).data.queue_order, vec![archive, movie]);
 
     // Keyboard: select, then Space resumes the held job (no server, so it stays queued).
     h.state_mut()

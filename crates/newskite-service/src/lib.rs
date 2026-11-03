@@ -26,7 +26,8 @@
 //!   (partial files are left on disk).
 //! * **Per-job control.** [`Service::pause_job`] holds one job (interrupting it if it is
 //!   downloading; completed files are kept), [`Service::start_job`] downloads one job without
-//!   starting the rest of the queue (or adds it to the active run), and
+//!   starting the rest of the queue (or adds it to the active run), [`Service::move_job`]
+//!   and [`Service::reorder_queue`] change the queue order, and
 //!   [`Service::clear_history`] removes finished jobs from the list.
 //! * **Deleting files.** [`Service::delete_job_files`] removes a finished job from the list
 //!   and deletes its download folder; [`Service::clear_history_and_files`] does that for
@@ -872,6 +873,38 @@ impl Service {
             }
             Err(e) => {
                 self.inner.log(LogLevel::Error, format!("could not move job {id}: {e}"));
+                Err(e)
+            }
+        }
+    }
+
+    /// Puts the pending jobs in the order of `ids` (the queue as the user dragged it).
+    /// Ids that are not pending are ignored; pending jobs missing from `ids` keep their
+    /// relative order after the listed ones, so a list made from a filtered view still
+    /// produces a whole order. Nothing happens when the order does not change.
+    pub fn reorder_queue(&self, ids: &[i64]) -> Result<(), ServiceError> {
+        let result = (|| {
+            let current = self.inner.store.queue_order()?;
+            let mut seen = HashSet::new();
+            let mut order: Vec<i64> =
+                ids.iter().copied().filter(|id| current.contains(id) && seen.insert(*id)).collect();
+            let rest: Vec<i64> = current.iter().copied().filter(|id| !order.contains(id)).collect();
+            order.extend(rest);
+            if order == current {
+                return Ok(false);
+            }
+            self.inner.store.set_queue_order(&order)?;
+            Ok(true)
+        })();
+        match result {
+            Ok(changed) => {
+                if changed {
+                    self.inner.emit(ServiceEvent::JobsChanged);
+                }
+                Ok(())
+            }
+            Err(e) => {
+                self.inner.log(LogLevel::Error, format!("could not reorder the queue: {e}"));
                 Err(e)
             }
         }
