@@ -114,6 +114,8 @@ pub struct Par2Stats {
     pub recovery_available: usize,
     /// Slices rebuilt by the repair.
     pub slices_rebuilt: usize,
+    /// Complete copies found under other names and moved to their real names.
+    pub files_renamed: usize,
     /// Bytes protected.
     pub data_bytes: u64,
     /// Wall-clock time spent verifying and repairing, in milliseconds.
@@ -173,8 +175,10 @@ pub(crate) struct Par2Outcome {
 pub(crate) type Progress<'a> = &'a mut dyn FnMut(crate::PostStage, Option<f32>, String);
 
 /// Verify (and if allowed, repair) every PAR2 set in `dir`, natively. `files` are the
-/// regular files of the folder; `partials` the engine's incomplete `.nkpart` files, used
-/// as extra slice sources. When no recovery set parses, the step is skipped.
+/// regular files of the folder; `partials` the engine's incomplete `.nkpart` files. A
+/// partial PAR2 volume still holds intact packets (each recovery block is checked against
+/// its MD5 before use), so it is read like a complete one; the other partials are extra
+/// slice sources. When no recovery set parses, the step is skipped.
 pub(crate) fn run(
     dir: &Path,
     files: &[PathBuf],
@@ -184,7 +188,9 @@ pub(crate) fn run(
     progress: Progress,
 ) -> Par2Outcome {
     use newskite_par2::{Event, FileStatus, Stage};
-    let par2_paths: Vec<PathBuf> = files.iter().filter(|f| newskite_par2::has_magic(f)).cloned().collect();
+    let (partial_par2, partial_data): (Vec<PathBuf>, Vec<PathBuf>) = partials.iter().cloned().partition(|p| crate::is_par2_partial(p));
+    let mut par2_paths: Vec<PathBuf> = files.iter().filter(|f| newskite_par2::has_magic(f)).cloned().collect();
+    par2_paths.extend(partial_par2);
     if par2_paths.is_empty() {
         return Par2Outcome { verdict: Some(Verdict::Skipped(crate::NO_PAR2.into())), ..Default::default() };
     }
@@ -199,7 +205,7 @@ pub(crate) fn run(
         return Par2Outcome { verdict: Some(Verdict::Skipped("PAR2 files unreadable".into())), ..Default::default() };
     }
     let mut others: Vec<PathBuf> = files.iter().filter(|f| !newskite_par2::has_magic(f)).cloned().collect();
-    others.extend(partials.iter().cloned());
+    others.extend(partial_data);
 
     let mut out = Par2Outcome::default();
     let mut stats = Par2Stats { sets: sets.len(), ..Default::default() };
@@ -332,8 +338,10 @@ pub(crate) fn run(
         stats.repair_ms += started.elapsed().as_millis() as u64;
         match result {
             Ok(r) => {
-                repaired_any = true;
+                // Moving complete copies to their real names is not a repair.
+                repaired_any |= !r.rebuilt.is_empty();
                 stats.slices_rebuilt += r.slices_rebuilt;
+                stats.files_renamed += r.renamed.len();
                 out.backups.extend(r.backups);
                 out.good_targets.extend(ver.files.iter().filter_map(|f| f.target.clone()));
                 log(format!(

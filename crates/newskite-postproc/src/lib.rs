@@ -12,9 +12,13 @@
 //!    other names (obfuscated posts) are renamed back, good slices are collected from
 //!    other files, and the engine's incomplete `.nkpart` files (articles missing) serve
 //!    as slice sources too, so a download with missing articles can still be completed.
+//!    Partial PAR2 volumes are read for their intact packets like complete ones.
 //!    After a successful PAR2 step, a `.nkpart` file is deleted when it supplied slices
-//!    or its final name is now a correct protected file; the rest are reported in
-//!    [`PostReport::incomplete`]. Per-file results are logged and summed in
+//!    or its final name is now a correct protected file. Partial PAR2 volumes and release
+//!    sidecars are never payload ([`PostReport::unneeded`]): they do not make the download
+//!    incomplete, and are deleted once PAR2 verified or repaired the data. The rest are
+//!    reported in [`PostReport::incomplete`]. Moving complete copies to their real names
+//!    (obfuscated posts) is not a repair: the verdict stays [`Verdict::Ok`]. Per-file results are logged and summed in
 //!    [`PostReport::par2_stats`]; progress goes to [`PostEvent::Stage`]. When no
 //!    recovery set parses (main packet missing or corrupt), the step is
 //!    [`Verdict::Skipped`] (`PAR2 files unreadable`) and extraction still runs, checking
@@ -190,6 +194,9 @@ pub struct PostReport {
     pub partials_removed: Vec<PathBuf>,
     /// Incomplete `.nkpart` files that are still incomplete (not covered by PAR2).
     pub incomplete: Vec<PathBuf>,
+    /// Incomplete `.nkpart` files of PAR2 volumes and release sidecars: not payload, so
+    /// never in `incomplete`. Deleted when PAR2 verified or repaired the data (else kept).
+    pub unneeded: Vec<PathBuf>,
 }
 
 /// Post-processing stage, for progress display.
@@ -280,9 +287,32 @@ fn list_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
     Ok(v)
 }
 
-/// True when `dir` directly holds a file with PAR2 packets (any name).
+/// True when `dir` directly holds a file with PAR2 packets (any name), complete or a
+/// partial download.
 pub fn has_par2(dir: &Path) -> bool {
     list_files(dir).map(|v| v.iter().any(|f| newskite_par2::has_magic(f))).unwrap_or(false)
+        || list_partials(dir).map(|v| v.iter().any(|p| is_par2_partial(p))).unwrap_or(false)
+}
+
+/// The name a partial file gets once complete: `x.par2.nkpart` → `x.par2`.
+fn final_name(partial: &Path) -> PathBuf {
+    match partial.extension() {
+        Some(e) if e.eq_ignore_ascii_case("nkpart") => partial.with_extension(""),
+        _ => partial.to_path_buf(),
+    }
+}
+
+/// True for a partial download of a PAR2 file: PAR2 packets at its start, or a `.par2`
+/// name.
+pub(crate) fn is_par2_partial(partial: &Path) -> bool {
+    newskite_par2::has_magic(partial) || detect::is_par2(&final_name(partial))
+}
+
+/// True when the file at `path` (a download or its `.nkpart`) is not payload: a PAR2 file
+/// (by its packets or name) or a release sidecar (`.sfv`, `.nfo`, ...). Losing articles of
+/// such a file loses no data.
+pub fn is_unneeded(path: &Path) -> bool {
+    is_par2_partial(path) || is_sidecar(&final_name(path))
 }
 
 /// Engine partial files (`*.nkpart`) directly in `dir`; sorted.
@@ -363,14 +393,23 @@ fn run_all(
         par2_stats: outcome.stats,
         partials_removed: Vec::new(),
         incomplete: Vec::new(),
+        unneeded: Vec::new(),
     };
 
-    // Partial files that PAR2 made redundant go; the others are still incomplete.
+    // Partial files that PAR2 made redundant go; partial PAR2 volumes and sidecars are not
+    // payload (they go once the data is known good); the others are still incomplete.
     for p in partials {
         let final_path = p.with_extension("");
-        let superseded = report.par2.is_success()
-            && (outcome.partials_used.contains(&p) || outcome.good_targets.contains(&final_path));
-        if superseded {
+        let verified = report.par2.is_success();
+        let superseded = verified && (outcome.partials_used.contains(&p) || outcome.good_targets.contains(&final_path));
+        if !superseded && is_unneeded(&p) {
+            if verified {
+                if let Err(e) = std::fs::remove_file(&p) {
+                    log(format!("par2: could not remove {}: {e}", p.display()));
+                }
+            }
+            report.unneeded.push(p);
+        } else if superseded {
             match std::fs::remove_file(&p) {
                 Ok(()) => report.partials_removed.push(p),
                 Err(e) => {
@@ -384,6 +423,13 @@ fn run_all(
     }
     if !report.partials_removed.is_empty() {
         log(format!("par2: {} incomplete download file(s) are complete now", report.partials_removed.len()));
+    }
+    if !report.unneeded.is_empty() {
+        log(format!(
+            "par2: {} incomplete PAR2 or sidecar file(s) are not needed for the data{}",
+            report.unneeded.len(),
+            if report.par2.is_success() { "; removed" } else { "" }
+        ));
     }
     if !report.incomplete.is_empty() {
         log(format!(

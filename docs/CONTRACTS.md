@@ -716,3 +716,16 @@ recovery block: damaged, spare, a limit tick, short, lost; a verdict chip; `≤`
 bound) and a queue row's compact reading while a job has damage; `Data::outlooks` (from
 `Repair` events and the map refresh) and `Data::outlook(job)`; Settings › Post-processing has
 "Stop downloads that can't be repaired".
+
+Unneeded files are not lost data (fix). Post-processing reads partial PAR2 volumes (`.nkpart`
+with PAR2 packets or a `.par2` name) for their intact packets like complete ones, and
+`has_par2` counts them. Partial PAR2 volumes and release sidecars are never payload:
+`PostReport::unneeded` lists them (deleted once PAR2 verified or repaired the data, else
+kept), and they are never in `PostReport::incomplete`. `newskite_postproc::is_unneeded(path)`
+says the same of any download or partial. Moving complete copies to their real names is not
+a repair: the PAR2 verdict stays `Ok` and `Par2Stats::files_renamed` counts them (the Repair
+step reads "renamed N misnamed files"). Service: `forward_events` also returns each failed
+file's missing-article count; when every missing article is in an unneeded file the job
+completes (post-processed when enabled) with `JobOutcome::articles_unneeded`, and a PAR2
+repair counts only the data articles as `articles_repaired`. The repair outlook's `posted`
+for a read, damaged volume is the larger of the blocks read and its `.volNN+MM` count.

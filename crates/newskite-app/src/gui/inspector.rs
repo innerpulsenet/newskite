@@ -158,6 +158,20 @@ pub fn timeline(job: &Job, post: Option<&PostProgress>, done: u64, speed: u64, n
             };
             Step::new("Download", Mark::Failed, d).at(dl_time)
         }
+        // Every missing article was in a PAR2 volume or sidecar: the data arrived whole.
+        JobState::Done | JobState::Failed
+            if st.articles_missing > 0 && outcome.is_some_and(|o| o.articles_unneeded >= st.articles_missing) =>
+        {
+            Step::new(
+                "Download",
+                Mark::Done,
+                format!(
+                    "{} of {} articles missing, all in PAR2 or sidecar files the data does not need{avg}",
+                    st.articles_missing, st.articles_total
+                ),
+            )
+            .at(dl_time)
+        }
         JobState::Done | JobState::Failed if st.articles_missing > 0 => Step::new(
             "Download",
             Mark::Warn,
@@ -920,6 +934,23 @@ mod tests {
         assert_eq!(v[3].time.as_deref(), Some("1s"));
         assert_eq!(v[6].detail, "Complete · PAR2 repaired the damage");
         assert_eq!(v[6].time.as_deref(), Some("1 min ago"));
+    }
+
+    #[test]
+    fn articles_lost_only_in_par2_files_do_not_read_as_damage() {
+        let stats = JobStats {
+            started_at: Some(10),
+            finished_at: Some(50),
+            download_ms: 30_000,
+            articles_total: 2463,
+            articles_missing: 58,
+            outcome: Some(Box::new(JobOutcome { articles_unneeded: 58, ..Default::default() })),
+            ..Default::default()
+        };
+        let v = timeline(&job(JobState::Done, stats), None, 1000, 0, 110);
+        assert_eq!(v[1].mark, Mark::Done);
+        assert!(v[1].detail.starts_with("58 of 2463 articles missing, all in PAR2 or sidecar files"), "{}", v[1].detail);
+        assert_eq!(v[6].detail, "Complete");
     }
 
     #[test]

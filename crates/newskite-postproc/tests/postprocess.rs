@@ -1029,7 +1029,10 @@ fn fully_obfuscated_release_is_renamed_by_par2_then_extracted() {
     }
 
     let (r, logs) = run(&f.dl, "Release", &PostOptions::default());
-    assert_eq!(r.par2, Verdict::Repaired, "{logs:#?}");
+    // Renaming complete copies back is not a repair.
+    assert_eq!(r.par2, Verdict::Ok, "{logs:#?}");
+    let s = r.par2_stats.as_ref().unwrap();
+    assert_eq!((s.slices_rebuilt, s.files_renamed), (0, volumes.len()));
     assert_eq!(r.extract, Verdict::Ok, "{logs:#?}");
     // Every volume was renamed back to its real name (then cleanup removed it).
     for v in &volumes {
@@ -1075,7 +1078,7 @@ fn obfuscated_target_in_subfolder_is_renamed_into_it() {
     fs::remove_dir(f.dl.join("Sample")).unwrap();
 
     let (r, logs) = run(&f.dl, "job", &PostOptions::default());
-    assert_eq!(r.par2, Verdict::Repaired, "{logs:#?}");
+    assert_eq!(r.par2, Verdict::Ok, "{logs:#?}");
     assert_eq!(fs::read(f.dl.join("main.bin")).unwrap(), main);
     assert_eq!(fs::read(f.dl.join("Sample").join("s.mkv")).unwrap(), sample);
 }
