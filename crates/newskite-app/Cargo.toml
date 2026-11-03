@@ -45,6 +45,10 @@ notify-rust = { version = "4.11", default-features = false, features = ["z"] }
 # (pure Rust, the same client the theme watcher uses); no helper programs.
 zbus = { version = "5.19", default-features = false, features = ["async-io", "blocking-api"] }
 
+[target.'cfg(windows)'.dependencies]
+# Free disk space, the parent console for --headless, and raising the open window.
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_System_Console", "Win32_UI_WindowsAndMessaging"] }
+
 [target.'cfg(any(windows, target_os = "macos"))'.dependencies]
 # The platform dialogs and launchers where there is no D-Bus.
 rfd = "0.17"
@@ -58,6 +62,9 @@ resvg = { version = "0.45.1", default-features = false }
 newskite-store.workspace = true
 # Writes an unreadable settings row for the settings-notice test.
 rusqlite = { version = "0.41.1", features = ["bundled"] }
+
+[build-dependencies]
+embed-resource = "3.0.12"
 
 # Debian package metadata for cargo-deb (`cargo deb -p newskite`). Asset sources are relative
 # to this crate; `target/release/...` is rewritten by cargo-deb to the real target dir.

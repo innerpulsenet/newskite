@@ -6,5 +6,7 @@ pub mod desktop;
 pub mod gui;
 pub mod handoff;
 pub mod launch;
+#[cfg(windows)]
+pub mod win;
 
 pub use gui::{AppConfig, NewskiteApp, ThemeMode};
