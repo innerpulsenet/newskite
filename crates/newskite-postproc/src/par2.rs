@@ -14,8 +14,8 @@ use std::time::Instant;
 /// Files are found by packet magic and grouped by recovery-set id. A group joins an
 /// already-named `.par2` file of the same set when there is one; otherwise its smallest
 /// file becomes `newskite-<id>.par2` and the rest `.volNNN+01.par2` volumes. Never
-/// overwrites an existing file. Returns the number of files renamed.
-pub(crate) fn name_obfuscated_par2(dir: &Path, files: &[PathBuf], log: &mut dyn FnMut(String)) -> usize {
+/// overwrites an existing file. Returns the files renamed: (from, to).
+pub(crate) fn name_obfuscated_par2(dir: &Path, files: &[PathBuf], log: &mut dyn FnMut(String)) -> Vec<(PathBuf, PathBuf)> {
     let mut named: BTreeMap<[u8; 16], String> = BTreeMap::new();
     let mut groups: BTreeMap<[u8; 16], Vec<(u64, PathBuf)>> = BTreeMap::new();
     for f in files {
@@ -30,7 +30,7 @@ pub(crate) fn name_obfuscated_par2(dir: &Path, files: &[PathBuf], log: &mut dyn 
             groups.entry(id).or_default().push((size, f.clone()));
         }
     }
-    let mut renamed = 0;
+    let mut renamed = Vec::new();
     for (id, mut members) in groups {
         members.sort();
         let (base, mut need_main) = match named.get(&id) {
@@ -64,7 +64,7 @@ pub(crate) fn name_obfuscated_par2(dir: &Path, files: &[PathBuf], log: &mut dyn 
                         target.file_name().unwrap_or_default().to_string_lossy()
                     ));
                     need_main = false;
-                    renamed += 1;
+                    renamed.push((src.clone(), target.clone()));
                 }
                 Err(e) => log(format!(
                     "par2: could not name PAR2 file {}: {e}",
@@ -169,6 +169,8 @@ pub(crate) struct Par2Outcome {
     pub partials_used: Vec<PathBuf>,
     /// Protected files that are correct now.
     pub good_targets: Vec<PathBuf>,
+    /// Complete copies moved to their real names: (from, to).
+    pub renamed: Vec<(PathBuf, PathBuf)>,
 }
 
 /// Progress callback: stage, fraction done (when known), detail line.
@@ -342,6 +344,7 @@ pub(crate) fn run(
                 repaired_any |= !r.rebuilt.is_empty();
                 stats.slices_rebuilt += r.slices_rebuilt;
                 stats.files_renamed += r.renamed.len();
+                out.renamed.extend(r.renamed.iter().cloned());
                 out.backups.extend(r.backups);
                 out.good_targets.extend(ver.files.iter().filter_map(|f| f.target.clone()));
                 log(format!(

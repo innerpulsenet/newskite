@@ -794,3 +794,19 @@ fn article_maps_save_replace_and_go_with_their_job() {
     s.remove_job(job.id).unwrap();
     assert_eq!(s.article_map(job.id).unwrap(), None);
 }
+
+#[test]
+fn job_file_rows_follow_a_rename() {
+    let store = mem();
+    let job = store.insert_job(&new_job("j")).unwrap();
+    for (name, state) in [("Y9zT", "done"), ("movie.mkv", "failed")] {
+        store
+            .upsert_job_file(&JobFile { job_id: job.id, name: name.into(), bytes_total: 5, bytes_done: 5, state: state.into() })
+            .unwrap();
+    }
+    assert!(store.rename_job_file(job.id, "Y9zT", "movie.mkv").unwrap());
+    let rows = store.job_files(job.id).unwrap();
+    assert_eq!(rows.len(), 1, "the row under the new name is replaced");
+    assert_eq!((rows[0].name.as_str(), rows[0].state.as_str()), ("movie.mkv", "done"));
+    assert!(!store.rename_job_file(job.id, "absent", "x").unwrap());
+}

@@ -197,6 +197,9 @@ pub struct PostReport {
     /// Incomplete `.nkpart` files of PAR2 volumes and release sidecars: not payload, so
     /// never in `incomplete`. Deleted when PAR2 verified or repaired the data (else kept).
     pub unneeded: Vec<PathBuf>,
+    /// Files moved to other names: obfuscated PAR2 files named by their packets, and
+    /// complete copies PAR2 moved to their real names. (from, to).
+    pub renamed: Vec<(PathBuf, PathBuf)>,
 }
 
 /// Post-processing stage, for progress display.
@@ -376,13 +379,15 @@ fn run_all(
 
     // 1. PAR2
     let mut files = list_files(&dir)?;
-    if par2::name_obfuscated_par2(&dir, &files, log) > 0 {
+    let mut renamed = par2::name_obfuscated_par2(&dir, &files, log);
+    if !renamed.is_empty() {
         files = list_files(&dir)?;
     }
     let partials = list_partials(&dir)?;
     let outcome = par2::run(&dir, &files, &partials, opts.repair, log, progress);
     let par2_verdict = outcome.verdict.unwrap_or_else(|| Verdict::Skipped(NO_PAR2.into()));
     let backups = outcome.backups;
+    renamed.extend(outcome.renamed.iter().cloned());
     log(format!("par2: {par2_verdict}"));
 
     let mut report = PostReport {
@@ -394,6 +399,7 @@ fn run_all(
         partials_removed: Vec::new(),
         incomplete: Vec::new(),
         unneeded: Vec::new(),
+        renamed,
     };
 
     // Partial files that PAR2 made redundant go; partial PAR2 volumes and sidecars are not

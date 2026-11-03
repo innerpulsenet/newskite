@@ -729,3 +729,12 @@ file's missing-article count; when every missing article is in an unneeded file 
 completes (post-processed when enabled) with `JobOutcome::articles_unneeded`, and a PAR2
 repair counts only the data articles as `articles_repaired`. The repair outlook's `posted`
 for a read, damaged volume is the larger of the blocks read and its `.volNN+MM` count.
+
+Retry finds renamed files (fix). `PostReport::renamed` lists every file post-processing moved
+(obfuscated PAR2 files named by their packets, complete copies PAR2 moved to their real
+names); the service moves the job's file rows along (`Store::rename_job_file`, replacing a
+row already under the new name), so a retry finds them by name. Engine resume also matches by
+content beyond `skip_files`: any regular file directly in `dest_dir` whose length and bytes at
+the first decoded part's offset match (one article fetched), except `.nkpart` files and PAR2
+repair backups (`name.N` next to `name`). The Repair step is recorded whenever files were
+renamed, however fast.
