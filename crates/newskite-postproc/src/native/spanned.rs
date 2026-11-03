@@ -563,6 +563,7 @@ mod tests {
         assert_eq!((u16le(end, 10), u32le(end, 12), u32le(end, 16)), (u16::MAX, 200, u32::MAX));
     }
 
+    #[cfg(unix)]
     fn crc32(data: &[u8]) -> u32 {
         let mut crc = 0xFFFF_FFFFu32;
         for &b in data {
