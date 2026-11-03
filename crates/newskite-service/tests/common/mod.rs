@@ -153,6 +153,7 @@ pub fn test_settings(root: &Path, servers: Vec<ServerConfig>) -> Settings {
         max_connections: 4,
         speed_limit_kbps: 0,
         retries: 1,
+        stop_unrepairable: true,
         auto_shutdown: false,
         auto_shutdown_countdown_secs: 60,
         postprocess: newskite_types::PostProcessSettings { enabled: false, ..Default::default() },

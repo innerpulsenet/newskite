@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 pub enum FailureKind {
     /// Articles no server had (and PAR2 could not make up for them).
     MissingArticles,
+    /// Stopped early: more data was missing than the job's PAR2 recovery data can rebuild.
+    Unrepairable,
     /// The server refused the login.
     Auth,
     /// Connections kept failing.
@@ -32,6 +34,7 @@ impl FailureKind {
     pub fn label(self) -> &'static str {
         match self {
             FailureKind::MissingArticles => "missing articles",
+            FailureKind::Unrepairable => "can't be repaired",
             FailureKind::Auth => "login refused",
             FailureKind::Connection => "connection",
             FailureKind::Disk => "disk error",
@@ -48,6 +51,9 @@ impl FailureKind {
         match self {
             FailureKind::MissingArticles => {
                 "The servers no longer have some articles. Add a backup server, or find another NZB with more recovery data."
+            }
+            FailureKind::Unrepairable => {
+                "More is missing than the recovery data can rebuild, so the download was stopped. Add a backup server on another provider, or find another NZB of this release."
             }
             FailureKind::Auth => "Check the user name and password in Settings › Servers, then retry.",
             FailureKind::Connection => "Check the network and the server address, then retry.",
@@ -99,12 +105,56 @@ pub struct JobOutcome {
     pub extracted_to: Option<PathBuf>,
     /// Files removed by cleanup.
     pub files_removed: u64,
+    /// The last repair outlook of the download (see [`RepairOutlook`]).
+    pub repair_outlook: Option<RepairOutlook>,
 }
 
 impl JobOutcome {
     /// PAR2 rebuilt data for this job.
     pub fn repaired(&self) -> bool {
         self.repair.as_ref().is_some_and(|r| r.state == StepState::Repaired) || self.slices_rebuilt > 0
+    }
+}
+
+/// What the job's PAR2 recovery data can still make up for, measured while downloading.
+///
+/// Every damaged input slice (a missing or corrupt article lands in one or two) needs one
+/// recovery block. `needed` counts the slices damaged so far, from the articles' offsets;
+/// `available` is the most recovery blocks that can still arrive intact. While PAR2 files
+/// are downloading or unidentified it is an upper bound, so `needed > available` means the
+/// repair will fail whatever arrives later.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RepairOutlook {
+    /// A PAR2 recovery set was read; the block figures are 0 until then.
+    pub known: bool,
+    /// Every file is identified and none is PAR2: nothing can be repaired.
+    pub no_par2: bool,
+    /// Input slices the set protects.
+    pub blocks: u64,
+    /// Damaged slices so far.
+    pub needed: u64,
+    /// Recovery blocks posted with the job (estimated from sizes until every PAR2 file is read).
+    pub posted: u64,
+    /// Most recovery blocks that can still arrive intact.
+    pub available: u64,
+    /// Every PAR2 file was read and every file identified: `posted` and `available` are counts.
+    pub exact: bool,
+}
+
+impl RepairOutlook {
+    /// The damage already exceeds what the recovery data could ever rebuild.
+    pub fn hopeless(&self) -> bool {
+        self.known && self.needed > self.available
+    }
+
+    /// Fraction of the recovery data the damage uses up (above 1 when hopeless).
+    pub fn used(&self) -> f32 {
+        match self.available {
+            0 if self.needed == 0 => 0.0,
+            0 => f32::INFINITY,
+            a => self.needed as f32 / a as f32,
+        }
     }
 }
 

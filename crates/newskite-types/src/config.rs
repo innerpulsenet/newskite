@@ -88,6 +88,8 @@ pub struct Settings {
     pub speed_limit_kbps: u64,
     /// Retries per segment for transient errors, walking servers in priority order.
     pub retries: u32,
+    /// Stop a download as soon as more is missing than its PAR2 recovery data can rebuild.
+    pub stop_unrepairable: bool,
     /// Shut the machine down when the queue empties (with a cancellable countdown).
     pub auto_shutdown: bool,
     pub auto_shutdown_countdown_secs: u32,
@@ -106,6 +108,7 @@ impl Default for Settings {
             max_connections: 20,
             speed_limit_kbps: 0,
             retries: 2,
+            stop_unrepairable: true,
             auto_shutdown: false,
             auto_shutdown_countdown_secs: 60,
             postprocess: PostProcessSettings::default(),
@@ -214,6 +217,7 @@ mod tests {
         let partial: Settings = serde_json::from_str(r#"{"max_connections": 4}"#).unwrap();
         assert_eq!(partial.max_connections, 4);
         assert_eq!(partial.retries, 2);
+        assert!(partial.stop_unrepairable);
     }
 
     #[test]

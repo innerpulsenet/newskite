@@ -256,6 +256,9 @@ pub struct Data {
     pub settings_load_error: Option<String>,
     /// Article maps of the jobs on show (the downloading ones and the selection).
     pub article_maps: HashMap<i64, newskite_service::ArticleMap>,
+    /// Repair outlooks read from the service with the article maps (live for downloading
+    /// jobs); finished jobs also carry theirs in their outcome (see [`Data::outlook`]).
+    pub outlooks: HashMap<i64, newskite_service::RepairOutlook>,
     /// The job the Articles dock shows: the one downloading, else the selection.
     pub activity_job: Option<i64>,
     /// Every job's article map folded into strip buckets (see `articles::STRIP_BUCKETS`),
@@ -266,6 +269,12 @@ pub struct Data {
 }
 
 impl Data {
+    /// The repair outlook to show for `job`: as last read from the service, else as saved
+    /// with its outcome.
+    pub fn outlook(&self, job: &Job) -> Option<newskite_service::RepairOutlook> {
+        self.outlooks.get(&job.id).copied().or_else(|| job.stats.outcome.as_ref().and_then(|o| o.repair_outlook))
+    }
+
     /// `bytes_done` to display for `job`: never above the total, never NaN-producing.
     pub fn shown_done(&self, job: &Job) -> u64 {
         let base = if job.state == JobState::Downloading {
@@ -611,6 +620,7 @@ impl NewskiteApp {
         let full: HashSet<i64> = downloading.iter().copied().chain(selected).collect();
         let ids: HashSet<i64> = self.data.jobs.iter().map(|j| j.id).collect();
         self.data.article_maps.retain(|id, _| full.contains(id));
+        self.data.outlooks.retain(|id, _| full.contains(id));
         self.data.strips.retain(|id, _| ids.contains(id));
         if self.maps_dirty {
             self.no_map.clear();
@@ -631,6 +641,10 @@ impl NewskiteApp {
                     self.data.strips.insert(id, m.cells(super::articles::STRIP_BUCKETS).1);
                     if full.contains(&id) {
                         self.data.article_maps.insert(id, m);
+                        // None keeps what `Repair` events delivered.
+                        if let Some(o) = self.service.repair_outlook(id) {
+                            self.data.outlooks.insert(id, o);
+                        }
                     }
                     self.no_map.remove(&id);
                 }
@@ -840,6 +854,9 @@ impl NewskiteApp {
                     *reload_jobs = true
                 }
                 EngineEvent::FileDone { .. } => *reload_jobs = true,
+                EngineEvent::Repair(o) => {
+                    self.data.outlooks.insert(job_id, o);
+                }
                 // Article maps are read from the service on their own cadence.
                 EngineEvent::Layout { .. } | EngineEvent::SegmentMissing { .. } | EngineEvent::FileComplete { .. } => {}
                 EngineEvent::FileStarted { .. } | EngineEvent::Log(_) | EngineEvent::Warn(_) => {}

@@ -60,6 +60,17 @@
 //!   server has failed authentication the job stops with [`EngineError::AuthFailed`].
 //! * **CRC mismatches** are counted per file ([`FileReport::crc_errors`]) but the data is
 //!   kept, since PAR2 may repair it.
+//! * **Order.** The smallest PAR2 file that is not a `.volNN+MM` volume (the index) is
+//!   fetched first, then the first article of every other file, then the rest in NZB order.
+//!   The index describes the recovery set and each first article identifies its file (yEnc
+//!   name and size, PAR2 header, MD5 of the first 16 KiB), even when the names are
+//!   obfuscated, so the repair outlook is known from the start.
+//! * **Repair outlook.** Missing and CRC-failed articles are weighed against the recovery
+//!   blocks that can still arrive (see the `repair` module and
+//!   [`newskite_types::RepairOutlook`]); every change is sent as `Repair`. With
+//!   [`EngineOptions::stop_unrepairable`] the job stops with [`EngineError::Unrepairable`]
+//!   as soon as the damage exceeds what the recovery data can rebuild, rather than at the
+//!   end of a download that can only fail; its files stay for a later retry.
 //! * **Speed limit**: a token bucket shared by all workers (bursts of one segment), following
 //!   a [`SpeedLimit`] that can be changed while the job runs.
 //! * **Cancellation** stops all workers promptly and returns [`EngineError::Cancelled`];
@@ -84,7 +95,8 @@
 //! it reaches `total`; `file` and `index` place the segment), a `SegmentMissing` for each
 //! article no server could supply, then either `FileDone` (after the rename) or
 //! `FileFailed`. A file found complete on disk by its content once the run started emits
-//! `FileComplete` instead. All events of a file carry the same
+//! `FileComplete` instead. `Repair` follows every change of the repair outlook (the first
+//! one before any file event). All events of a file carry the same
 //! resolved name. `Log` lines report job start, server fail-over, retries, completed files,
 //! CRC problems and missing-article summaries. Passwords never appear in any event.
 //!
@@ -98,6 +110,7 @@ mod limiter;
 mod naming;
 mod pool;
 mod pwrite;
+mod repair;
 mod run;
 
 use std::collections::HashSet;
@@ -139,6 +152,8 @@ pub struct EngineOptions {
     /// Output file names already completed by an earlier run (resume), as reported in
     /// `FileDone`/[`FileReport::name`]. See the crate docs for how files are matched.
     pub skip_files: HashSet<String>,
+    /// Stop with [`EngineError::Unrepairable`] once more is damaged than PAR2 can rebuild.
+    pub stop_unrepairable: bool,
 }
 
 impl Default for EngineOptions {
@@ -149,6 +164,7 @@ impl Default for EngineOptions {
             speed_limit: SpeedLimit::default(),
             connect_timeout: Duration::from_secs(30),
             skip_files: HashSet::new(),
+            stop_unrepairable: false,
         }
     }
 }
@@ -220,6 +236,16 @@ pub enum EngineError {
     MissingArticles {
         /// Every missing message id, in file then segment order.
         ids: Vec<String>,
+    },
+    /// Stopped early: the damaged slices outnumber the recovery blocks that could arrive.
+    #[error("{missing} missing article(s) need at least {needed} recovery block(s), but at most {available} can arrive")]
+    Unrepairable {
+        /// Damaged input slices so far.
+        needed: u64,
+        /// Most recovery blocks that could still arrive intact.
+        available: u64,
+        /// Missing articles so far.
+        missing: usize,
     },
     /// Local file-system failure.
     #[error("I/O error: {0}")]

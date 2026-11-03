@@ -696,3 +696,23 @@ and `queue::dropped_order`, which keep rows a filter hides next to their visible
 cancels); a row's figures (progress, speed, size, finish time) end flush against its controls,
 so they line up down the list; the selected job's log is re-read only when a line was logged
 or the selection moved, not on every progress reload.
+
+Repair outlook and early stop (additive). Engine: the queue fetches the PAR2 index first, then
+the first article of every file, then the rest (see the engine's **Order**). A tracker
+(`repair`) identifies files (`.par2` names, PAR2 magic, protected names, or length plus MD5 of
+the first 16 KiB for obfuscated posts), counts the slices that missing and CRC-failed articles
+damage (exact from article offsets; never an overcount) and bounds the recovery blocks that can
+still arrive (read from finished PAR2 files; `.volNN+MM` counts and intact bytes for the rest;
+unidentified files count as possible PAR2). New pub items: `RepairOutlook` (`known`,
+`no_par2`, `blocks`, `needed`, `posted`, `available`, `exact`; `hopeless()`, `used()`),
+`EngineEvent::Repair(RepairOutlook)` on every change, `EngineOptions::stop_unrepairable`
+(default false in the engine) and `EngineError::Unrepairable { needed, available, missing }`
+once `needed > available`. Service: `Settings::stop_unrepairable` (default true) feeds the
+option; an Unrepairable job fails at once with `FailureKind::Unrepairable` ("can't be
+repaired"; Retry and Retry on backup offered) and skips post-processing; the last outlook is
+saved as `JobOutcome::repair_outlook`; `Service::repair_outlook(job_id)` reads it live, then
+from the outcome. GUI: `gui::repair` draws the inspector's Repair budget (one cell per
+recovery block: damaged, spare, a limit tick, short, lost; a verdict chip; `≤` marks an upper
+bound) and a queue row's compact reading while a job has damage; `Data::outlooks` (from
+`Repair` events and the map refresh) and `Data::outlook(job)`; Settings › Post-processing has
+"Stop downloads that can't be repaired".
