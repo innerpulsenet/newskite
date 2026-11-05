@@ -32,6 +32,29 @@ You need an account with a news provider.
 The product specification is in [APP-OUTLINE.md](APP-OUTLINE.md) and the public API of every
 crate is in [docs/CONTRACTS.md](docs/CONTRACTS.md).
 
+## Screenshots
+
+These are the app's GUI snapshot tests (`crates/newskite-app/tests/snapshots/`), rendered
+with sample jobs and the placeholder server `news.example.net`, so the names and figures are
+test data, not a real download.
+
+The queue, following the desktop's dark or light color scheme:
+
+<picture>
+  <source media="(prefers-color-scheme: light)" srcset="crates/newskite-app/tests/snapshots/populated-light.png">
+  <source media="(prefers-color-scheme: dark)" srcset="crates/newskite-app/tests/snapshots/populated-dark.png">
+  <img alt="The Newskite queue with two waiting jobs, one failed and one finished, each with a strip of its article map" src="crates/newskite-app/tests/snapshots/populated-dark.png" width="800">
+</picture>
+
+A damaged download in progress: the inspector shows each step of the job and how many
+PAR2 recovery blocks the repair needs against how many are available.
+
+<img alt="The inspector beside the queue, showing a job's lifecycle steps and its repair budget" src="crates/newskite-app/tests/snapshots/repair-live-dark.png" width="800">
+
+The article map and per-file progress of a queued job:
+
+<img alt="The inspector showing the article map of a job, its files with progress, and its size and folder" src="crates/newskite-app/tests/snapshots/inspector-files-dark.png" width="800">
+
 ## Architecture
 
 The workspace is split into small crates with one job each. Arrows point from a crate to the
@@ -298,8 +321,9 @@ The icons are generated, not hand-drawn; see [Brand](#brand) for the command.
 
 ## License
 
-Licensed under either of the MIT license or the Apache License, Version 2.0, at your option
-(`MIT OR Apache-2.0`, as declared in `Cargo.toml`).
+Licensed under either of the [MIT license](LICENSE-MIT) or the
+[Apache License, Version 2.0](LICENSE-APACHE), at your option (`MIT OR Apache-2.0`, as
+declared in `Cargo.toml`).
 
 The binary also includes the UnRAR library by Alexander Roshal, which reads RAR archives
 under its own freeware license: it may be redistributed freely, but its code may not be used
