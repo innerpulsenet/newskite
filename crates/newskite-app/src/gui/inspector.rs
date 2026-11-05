@@ -29,8 +29,6 @@ use super::widgets::{compact_button, icon_button, kit_button, progress_ring, sec
 pub const PANEL_DEFAULT_W: f32 = 400.0;
 /// Narrowest the side panel may be dragged.
 pub const PANEL_MIN_W: f32 = 340.0;
-/// Window width from which the inspector is a side panel.
-pub const SIDE_PANEL_MIN_WINDOW: f32 = 1100.0;
 
 /// Which inspector tab is showing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -318,8 +316,7 @@ pub fn show(ui: &mut Ui, pal: &Palette, data: &Data, job: &Job, state: &mut Insp
 
 fn header(ui: &mut Ui, pal: &Palette, data: &Data, job: &Job, reduced: bool, actions: &mut Vec<Action>) {
     ui.horizontal(|ui| {
-        let (word, color) = super::center::state_word(pal, data, job);
-        ui.label(RichText::new(word).font(fonts::semibold_id(13.0)).color(color));
+        super::center::state_chip(ui, pal, data, job, reduced);
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             if icon_button(ui, pal, Icon::Close, pal.muted, "Close (Esc)").clicked() {
                 actions.push(Action::Select(None));
