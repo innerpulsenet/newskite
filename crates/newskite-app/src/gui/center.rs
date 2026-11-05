@@ -20,7 +20,12 @@ use super::queue::{
 };
 use super::theme::Palette;
 use super::toolbar::{open_nzb_row, queue_control};
-use super::widgets::{kit_button, section_title, segmented, tool_button, ButtonKind, Icon, ToolState};
+use super::brand;
+use super::motion::Beat;
+use super::widgets::{
+    job_status, kit_button, section_title, segmented, status_chip_live, status_chip_width, tool_button, ButtonKind, Icon,
+    Status, ToolState,
+};
 
 /// Which queued jobs the list shows.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -411,6 +416,31 @@ pub fn state_word(pal: &Palette, data: &Data, job: &Job) -> (String, egui::Color
     }
 }
 
+/// The chip status of a job: its post-processing stage while one runs (repair needs
+/// attention, the others are live), else its state's.
+pub fn state_status(data: &Data, job: &Job) -> Status {
+    match data.status.post.as_ref().filter(|p| p.job_id == job.id) {
+        Some(p) if p.stage == newskite_service::PostStage::Repair => Status::Warn,
+        Some(_) => Status::Live,
+        None => job_status(job.state),
+    }
+}
+
+/// The job's state as a chip: [`state_word`] on its status tint, the live dot breathing
+/// while this job's bytes move.
+pub fn state_chip(ui: &mut Ui, pal: &Palette, data: &Data, job: &Job, reduced_motion: bool) -> egui::Response {
+    let (word, _) = state_word(pal, data, job);
+    let status = state_status(data, job);
+    let moving = job.state == JobState::Downloading && data.status.running && data.speed() > 0;
+    let breath = if moving {
+        let beat = Beat::new(ui.ctx(), true, reduced_motion, brand::PERIOD_BUSY);
+        beat.moving.then(|| beat.breath())
+    } else {
+        None
+    };
+    status_chip_live(ui, pal, status, &word, breath)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn row(
     ui: &mut Ui,
@@ -538,8 +568,7 @@ fn first_line(
     now: f64,
     quiet: egui::Color32,
 ) {
-    let (word, word_color) = state_word(pal, data, job);
-    let word_color = if word_color == pal.muted { quiet } else { word_color };
+    let (word, _) = state_word(pal, data, job);
     let done = data.shown_done(job);
     // The figure: progress and speed while queued or downloading; size and the finish
     // time once finished.
@@ -551,7 +580,18 @@ fn first_line(
                     figures.push((format!("{}%", m / 10), None));
                 }
             } else if let Some(live) = live_subline(job, done, data.speed()) {
-                figures.push((format!("{}%", format::percent(done, job.bytes_total)), None));
+                // The bytes stay in view while they move, before the speed and time left.
+                let progress = if job.bytes_total > 0 {
+                    format!(
+                        "{}%  ·  {} / {}",
+                        format::percent(done, job.bytes_total),
+                        format::bytes(done),
+                        format::bytes(job.bytes_total)
+                    )
+                } else {
+                    format::bytes(done)
+                };
+                figures.push((progress, None));
                 figures.push((live, None));
             } else if done > 0 {
                 figures.push((
@@ -584,12 +624,11 @@ fn first_line(
         CONTROLS_W
     };
     let mono = fonts::mono_id(12.0);
-    let word_font = fonts::semibold_id(13.0);
     let measure = |t: &str, f: &egui::FontId| ui.painter().layout_no_wrap(t.to_owned(), f.clone(), pal.text).size().x;
     // The figures end flush against the controls, so sizes and speeds line up down the
     // list whatever the names and state words before them take.
     let figures_w = figures.iter().map(|(t, _)| measure(t, &mono) + 12.0).sum::<f32>();
-    let mid_w = measure(&word, &word_font) + figures_w + 16.0 + FIGURE_GAP;
+    let mid_w = status_chip_width(ui, &word) + figures_w + 16.0 + FIGURE_GAP;
     let name_w = (w - controls_w - mid_w - 8.0).max(90.0);
     ui.horizontal(|ui| {
         ui.set_min_height(24.0);
@@ -611,7 +650,7 @@ fn first_line(
             .on_hover_text(job.source_path.display().to_string());
         });
         ui.add_space(12.0);
-        let r = ui.add(egui::Label::new(RichText::new(&word).font(word_font.clone()).color(word_color)).selectable(false));
+        let r = state_chip(ui, pal, data, job, view.reduced_motion);
         if job.state == JobState::Paused {
             r.on_hover_text("Held: queue runs skip it until you start it");
         } else if job.state == JobState::Queued && !data.in_run(job) {

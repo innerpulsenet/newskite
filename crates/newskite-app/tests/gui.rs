@@ -1029,7 +1029,8 @@ fn downloading_row_shows_eta_and_finish_flash() {
     h.run_steps(1);
     // 100 MB left at 1 MB/s → 100 s.
     h.get_by_label("1.0 MB/s · 1:40 left");
-    h.get_by_label("50%");
+    // The bytes stay in the row while they move.
+    h.get_by_label("50%  ·  100 MB / 200 MB");
     h.get_by_label("Articles of Live.Download.Now: 50% downloaded");
     assert_no_bad_numbers(&h);
     snapshot(&mut h, "downloading-dark");
