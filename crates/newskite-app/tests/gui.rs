@@ -1610,9 +1610,9 @@ fn server_cards_name_the_primary_and_can_promote_a_backup() {
         .iter()
         .map(|s| s.host.clone())
         .collect();
-    assert_eq!(hosts, ["news.backup-provider.example", "newshosting.tweaknews.example"]);
+    assert_eq!(hosts, ["news.backup-provider.example", "news.primary-provider.example"]);
     // Saved only with the sheet: the service still has the old order.
-    assert_eq!(fx.service.settings().servers[0].host, "newshosting.tweaknews.example");
+    assert_eq!(fx.service.settings().servers[0].host, "news.primary-provider.example");
 }
 
 #[test]
@@ -1682,7 +1682,7 @@ fn toasts_and_server_health_render() {
 fn seed_failover(store: &Store, dir: &Path) {
     seed_populated(store, dir);
     let mut settings = store.load_settings().expect("load");
-    settings.servers[0].host = "newshosting.tweaknews.example".into();
+    settings.servers[0].host = "news.primary-provider.example".into();
     settings.servers[0].connections = 20;
     settings.servers.push(ServerConfig {
         host: "news.backup-provider.example".into(),
@@ -1717,7 +1717,7 @@ fn feed_failover(h: &mut Harness<'_, Option<NewskiteApp>>) -> i64 {
         last_error: None,
     };
     a.data.servers = vec![
-        health("newshosting.tweaknews.example:563", 24_310, 179),
+        health("news.primary-provider.example:563", 24_310, 179),
         health("news.backup-provider.example:563", 179, 179),
     ];
     // A fixed local time, so the clocks in the snapshots do not follow the time of day.
@@ -1728,13 +1728,13 @@ fn feed_failover(h: &mut Harness<'_, Option<NewskiteApp>>) -> i64 {
         text: text.into(),
         job_id: job.then_some(failed),
     };
-    let ids = "<1454628461.28666.1@reader.easyusenet.example>, <1454628461.31340.2@reader.easyusenet.example>, \
-               <1454628461.33416.3@reader.easyusenet.example>, ...";
+    let ids = "<1454628461.28666.1@reader.newsposter.example>, <1454628461.31340.2@reader.newsposter.example>, \
+               <1454628461.33416.3@reader.newsposter.example>, ...";
     // Newest first.
     a.data.logs = vec![
-        line(9, LogLevel::Error, "failed Linux.Audio.Samples.Pack: 66 missing articles: 1454628461.28666.1@reader.easyusenet.example, 1454628461.31340.2@reader.easyusenet.example, 1454628461.33416.3@reader.easyusenet.example, 1454628461.35102.4@reader.easyusenet.example, 1454628461.37744.5@reader.easyusenet.example, ... (+61 more)", true),
+        line(9, LogLevel::Error, "failed Linux.Audio.Samples.Pack: 66 missing articles: 1454628461.28666.1@reader.newsposter.example, 1454628461.31340.2@reader.newsposter.example, 1454628461.33416.3@reader.newsposter.example, 1454628461.35102.4@reader.newsposter.example, 1454628461.37744.5@reader.newsposter.example, ... (+61 more)", true),
         line(8, LogLevel::Warn, &format!("Linux.Audio.Samples.Pack.r01: 66 missing article(s): {ids}"), true),
-        line(6, LogLevel::Info, "Article <1454628461.28666.1@reader.easyusenet.example> not on newshosting.tweaknews.example:563; trying news.backup-provider.example:563", true),
+        line(6, LogLevel::Info, "Article <1454628461.28666.1@reader.newsposter.example> not on news.primary-provider.example:563; trying news.backup-provider.example:563", true),
         line(1, LogLevel::Info, "started Linux.Audio.Samples.Pack", true),
     ];
     failed
@@ -1757,8 +1757,8 @@ fn assert_disjoint(h: &Harness<'_, Option<NewskiteApp>>, labels: &[&str]) {
 fn failover_strip_wide_log_and_backup_retry_render() {
     let fx = Fixture::new(seed_failover);
     let strip_labels = [
-        "newshosting.tweaknews.example:563",
-        "newshosting.tweaknews.example",
+        "news.primary-provider.example:563",
+        "news.primary-provider.example",
         "news.backup-provider.example:563",
         "news.backup-provider.example",
         "+1 backup",
@@ -1779,8 +1779,8 @@ fn failover_strip_wide_log_and_backup_retry_render() {
         h.run_steps(2);
         // The strip: primary always named, connections and retry-all on the same line, apart.
         assert!(
-            h.query_by_label("newshosting.tweaknews.example:563").is_some()
-                || h.query_by_label("newshosting.tweaknews.example").is_some(),
+            h.query_by_label("news.primary-provider.example:563").is_some()
+                || h.query_by_label("news.primary-provider.example").is_some(),
             "{name}: primary named"
         );
         h.get_by_label("20 / 20");
@@ -1806,7 +1806,7 @@ fn failover_strip_wide_log_and_backup_retry_render() {
     h.run_steps(2);
     h.get_all_by_label("▸ Show first ids").next().expect("disclosure").click();
     h.run_steps(2);
-    h.get_by_label("<1454628461.31340.2@reader.easyusenet.example>");
+    h.get_by_label("<1454628461.31340.2@reader.newsposter.example>");
     h.get_by_label("5 of 66 ids are listed in this message");
     {
         let a = h.state_mut().as_mut().expect("app");
