@@ -1,6 +1,6 @@
 //! Settings sheet (outline §6.5, F8): a modal editing a cloned [`Settings`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -64,6 +64,8 @@ pub struct SettingsDraft {
     pub row_ids: Vec<u64>,
     /// Test state per row id.
     pub tests: HashMap<u64, TestState>,
+    /// Rows whose password shows in clear (hidden again when the sheet reopens).
+    pub shown_passwords: HashSet<u64>,
     /// Download folder as text.
     pub download_dir: String,
     /// Watch folder as text.
@@ -87,6 +89,7 @@ impl SettingsDraft {
             settings,
             row_ids,
             tests: HashMap::new(),
+            shown_passwords: HashSet::new(),
             save_error: None,
             appearance: Appearance::default(),
             load_error: None,
@@ -586,10 +589,22 @@ fn connection_section(
                     ui.label("Username");
                     ui.add_sized([220.0, 22.0], TextEdit::singleline(&mut srv.username));
                     ui.label("Password");
-                    ui.add_sized(
-                        [160.0, 22.0],
-                        TextEdit::singleline(&mut srv.password).password(true),
-                    );
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        let shown = draft.shown_passwords.contains(&row_id);
+                        ui.add_sized(
+                            [160.0, 22.0],
+                            TextEdit::singleline(&mut srv.password).password(!shown),
+                        );
+                        let label = if shown { "Hide" } else { "Show" };
+                        if compact_button(ui, pal, ButtonKind::Text, label, true)
+                            .on_hover_text(if shown { "Hide the password" } else { "Show the password to check it" })
+                            .clicked()
+                            && !draft.shown_passwords.remove(&row_id)
+                        {
+                            draft.shown_passwords.insert(row_id);
+                        }
+                    });
                     ui.end_row();
                     ui.label("Connections");
                     ui.add(DragValue::new(&mut srv.connections).range(1..=100));

@@ -181,7 +181,7 @@ pub fn activity_reading(data: &Data) -> String {
 pub const SPEED_PRESETS: [u64; 6] = [0, 50 * 1024, 25 * 1024, 10 * 1024, 5 * 1024, 1024];
 
 /// The status bar's speed menu: the presets (the one in force checked), the current
-/// limit when it is none of them, and the way to Settings for another.
+/// limit when it is none of them, and a field for any other in MB/s.
 fn speed_menu(ui: &mut Ui, pal: &Palette, data: &Data, actions: &mut Vec<Action>) {
     ui.set_min_width(170.0);
     ui.label(RichText::new("Speed limit").small().color(pal.muted));
@@ -199,10 +199,45 @@ fn speed_menu(ui: &mut Ui, pal: &Palette, data: &Data, actions: &mut Vec<Action>
         let _ = ui.add(egui::Button::selectable(true, label(current)));
     }
     ui.separator();
-    if ui.button("Other limit…").clicked() {
-        actions.push(Action::OpenSettings);
+    ui.label(RichText::new("Other limit").small().color(pal.muted));
+    // The draft lives in memory while the menu is open; it starts at the limit in force.
+    let id = egui::Id::new("speed-menu-other");
+    let mut mbps: f64 = ui
+        .data(|d| d.get_temp(id))
+        .unwrap_or_else(|| if current == 0 { 20.0 } else { current as f64 / 1024.0 });
+    let mut apply = false;
+    ui.horizontal(|ui| {
+        // Menus draw their widgets frameless; the field and its button keep a frame here
+        // so they read as editable.
+        let v = &mut ui.style_mut().visuals;
+        v.button_frame = true;
+        v.widgets.inactive.bg_stroke = Stroke::new(1.0, pal.border_strong);
+        v.widgets.inactive.weak_bg_fill = pal.well;
+        v.widgets.inactive.bg_fill = pal.well;
+        let r = ui.add(
+            egui::DragValue::new(&mut mbps)
+                .range(0.1..=10_000.0)
+                .speed(0.5)
+                .max_decimals(1)
+                .suffix(" MB/s"),
+        );
+        apply = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        apply |= ui.button("Set").clicked();
+    });
+    ui.data_mut(|d| d.insert_temp(id, mbps));
+    if apply {
+        let kbps = custom_limit_kbps(mbps);
+        if kbps != current {
+            actions.push(Action::SetSpeedLimit(kbps));
+        }
+        ui.data_mut(|d| d.remove::<f64>(id));
         ui.close();
     }
+}
+
+/// A limit typed in MB/s as KiB/s (the unit the setting keeps), never below 1 KiB/s.
+pub fn custom_limit_kbps(mbps: f64) -> u64 {
+    (mbps * 1024.0).round().max(1.0) as u64
 }
 
 /// The servers' health this session, for the left reading's hover: one block per usable
@@ -253,7 +288,7 @@ fn server_health_tip(ui: &mut Ui, pal: &Palette, data: &Data) {
 
 /// Width of the status bar's sparkline.
 const SPARK_W: f32 = 120.0;
-/// Width of the throughput graph shown when hovering the sparkline.
+/// Width of the throughput graph shown from the sparkline.
 const GRAPH_POPUP_W: f32 = 340.0;
 
 /// The series the sparkline draws: the live window when it has a trace, else the stored
@@ -414,7 +449,10 @@ pub fn show(
             .add(egui::Label::new(RichText::new(reading).font(mono.clone()).color(if moving { pal.text } else { pal.muted })).sense(Sense::click()).selectable(false))
             .on_hover_cursor(egui::CursorIcon::PointingHand)
             .on_hover_text(tip);
-        egui::Popup::menu(&r).show(|ui| speed_menu(ui, pal, data, actions));
+        // Clicks inside stay in the menu, so the limit field can be edited.
+        egui::Popup::menu(&r)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .show(|ui| speed_menu(ui, pal, data, actions));
         ui.add_space(6.0);
         sparkline(ui, pal, data, reduced_motion);
 
@@ -446,9 +484,10 @@ pub fn show(
 }
 
 /// The throughput sparkline: the live window (or the stored history) as a soft area
-/// under a thin line, scaled to its own peak. Hovering it shows the full graph.
+/// under a thin line, scaled to its own peak. Hovering it previews the full graph; a
+/// click pins the graph open, where its crosshair and hour cells can be pointed at.
 fn sparkline(ui: &mut Ui, pal: &Palette, data: &Data, reduced_motion: bool) {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(SPARK_W, 16.0), Sense::hover());
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(SPARK_W, 16.0), Sense::click());
     let values = spark_values(data);
     if ui.is_rect_visible(rect) {
         let painter = ui.painter_at(rect.expand(1.0));
@@ -490,19 +529,43 @@ fn sparkline(ui: &mut Ui, pal: &Palette, data: &Data, reduced_motion: bool) {
             data.live.len()
         )
     };
-    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Image, true, &summary));
-    resp.on_hover_ui(|ui| {
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &summary));
+    let graph = |ui: &mut Ui| {
         ui.set_width(GRAPH_POPUP_W);
         ui.allocate_ui(Vec2::new(GRAPH_POPUP_W, 190.0), |ui| {
             ui.set_min_height(190.0);
             super::docks::throughput_graph(ui, pal, data, reduced_motion);
         });
-    });
+    };
+    // A tooltip closes as the pointer leaves the sparkline, so the preview only shows the
+    // graph; the pinned popup is the one to point into.
+    let pinned = egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&resp));
+    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+    let resp = if pinned {
+        resp
+    } else {
+        resp.on_hover_ui(|ui| {
+            graph(ui);
+            ui.label(RichText::new("Click to pin and inspect").small().color(pal.muted));
+        })
+    };
+    egui::Popup::from_toggle_button_response(&resp)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .align(egui::RectAlign::TOP_END)
+        .show(graph);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn custom_limit_is_kept_in_kib() {
+        assert_eq!(custom_limit_kbps(20.0), 20 * 1024);
+        assert_eq!(custom_limit_kbps(2.5), 2560);
+        // Never rounds down to 0, which would mean unlimited.
+        assert_eq!(custom_limit_kbps(0.0001), 1);
+    }
 
     #[test]
     fn pill_priorities() {
