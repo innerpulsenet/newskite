@@ -738,3 +738,18 @@ content beyond `skip_files`: any regular file directly in `dest_dir` whose lengt
 the first decoded part's offset match (one article fetched), except `.nkpart` files and PAR2
 repair backups (`name.N` next to `name`). The Repair step is recorded whenever files were
 renamed, however fast.
+
+Carbon look (1.0.0; additive except where noted). `brand_tokens::INK` is now the kit's carbon
+set (was the warm ink, which is `brand_tokens::WARM` / `warm()` / `WARM_NAME`); `BrandSet`
+gained `metal: Option<MetalSet>` (`plate`, `line`, `key`, `steel`, `brushed`), and
+`BrandSet::tokens()` maps a set with materials to plate / surface 1 / ground. `Appearance`
+gained `Warm` (`"innerpulse-warm"`) and `UNCHOSEN` (= `Ink`); `Appearance::ALL` has four
+entries and `appearance::load` returns `UNCHOSEN`, not `FollowDesktop`, for a missing or
+unreadable file (**behavior change**: a window wears carbon until its user chooses).
+`Palette` gained `metal: Option<theme::Metal>` (`plate`, `key`, `steel`, `brushed`, `frost`,
+`lcd_glass`, `lcd_lit`, and the light/shade helpers), `Palette::panel` and `Palette::radius`.
+New module `gui::metal`: `plate`, `groove_h/v`, `well`, `glass_top`, `frost`, `KeyState`,
+`key_body`, `key_text`, `key_face`, `steel_svg`, `engraved`, `LampShape`, `lamp`, `edge_light`,
+`cap`, `lcd_back`, `lcd_glass`, `lcd_digits`, `lcd_digits_width`, `lcd_tag`. New in
+`gui::widgets`: `sunk`, `frosted`, `frost_sheen`; in `gui::sidebar`: `lcd_speed`. Themes
+without materials (desktop schemes, paper) paint exactly as before.

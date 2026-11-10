@@ -87,7 +87,7 @@ listed in an NZB file from an NNTP server over TLS, decodes them, writes the ori
 files to disk, then verifies and repairs them with PAR2 and extracts RAR, 7z and ZIP \
 archives (including split and spanned volumes and passwords) with built-in code; no \
 external tools are needed. It keeps a resumable, reorderable queue with per-job \
-pause and start, a download history and live throughput statistics, follows the desktop light or dark color scheme, and includes a \
+pause and start, a download history and live throughput statistics, wears the innerpulse carbon look or follows the desktop light or dark color scheme, and includes a \
 headless command-line mode (newskite --headless) that drives the same queue engine. \
 Server passwords are stored unencrypted in the local database."""
 assets = [
