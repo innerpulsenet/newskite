@@ -74,7 +74,7 @@ pub fn show(ui: &mut Ui, pal: &Palette, data: &Data, view: &ViewState, rail: boo
             count_warn: true,
             current: view.tab == Tab::Log,
             tip: if problems > 0 {
-                format!("Messages, newest first; {problems} warning(s) or error(s)")
+                format!("Messages, newest first; {problems} need{} a look (warnings and errors)", if problems == 1 { "s" } else { "" })
             } else {
                 "Messages, newest first".into()
             },

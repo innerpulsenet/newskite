@@ -60,6 +60,8 @@ pub enum Icon {
     Alert,
     /// Circled i (kit `info`).
     Info,
+    /// Half-filled circle (kit `theme`), for Appearance.
+    Theme,
     /// Box with an arrow out (kit `external`).
     External,
     /// Status glyph: check (kit `status-ok`, 12 grid).
@@ -74,7 +76,7 @@ pub enum Icon {
 
 impl Icon {
     /// Every icon (for registration and tests).
-    pub const ALL: [Icon; 27] = [
+    pub const ALL: [Icon; 28] = [
         Icon::Search,
         Icon::Scan,
         Icon::More,
@@ -97,6 +99,7 @@ impl Icon {
         Icon::ChevronRight,
         Icon::Alert,
         Icon::Info,
+        Icon::Theme,
         Icon::External,
         Icon::StatusOk,
         Icon::StatusWarn,
@@ -129,6 +132,7 @@ impl Icon {
             Icon::ChevronRight => "bytes://newskite/icon/chevron-right.svg",
             Icon::Alert => "bytes://newskite/icon/alert.svg",
             Icon::Info => "bytes://newskite/icon/info.svg",
+            Icon::Theme => "bytes://newskite/icon/theme.svg",
             Icon::External => "bytes://newskite/icon/external.svg",
             Icon::StatusOk => "bytes://newskite/icon/status-ok.svg",
             Icon::StatusWarn => "bytes://newskite/icon/status-warn.svg",
@@ -174,6 +178,7 @@ impl Icon {
             Icon::ChevronRight => kit!("chevron-right"),
             Icon::Alert => kit!("alert"),
             Icon::Info => kit!("info"),
+            Icon::Theme => kit!("theme"),
             Icon::External => kit!("external"),
             Icon::StatusOk => kit!("status-ok"),
             Icon::StatusWarn => kit!("status-warn"),
