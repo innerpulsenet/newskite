@@ -216,8 +216,27 @@ mod imp {
         open::that_detached(path).map_err(|e| e.to_string())
     }
 
+    /// The file selected in its folder: Explorer's `/select`, Finder's `open -R`.
+    #[cfg(windows)]
     pub fn show_item(path: &Path) -> Result<(), String> {
-        show_folder(path.parent().unwrap_or(path))
+        use std::os::windows::process::CommandExt;
+        // Explorer does not take the verbatim form (`\\?\C:\…`).
+        let text = path.display().to_string();
+        let text = match text.strip_prefix(r"\\?\") {
+            Some(rest) if rest.as_bytes().get(1) == Some(&b':') => rest.to_owned(),
+            _ => text,
+        };
+        // Its exit code says nothing (it is 1 on success too): starting it is the result.
+        std::process::Command::new("explorer.exe")
+            .raw_arg(format!("/select,\"{text}\""))
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn show_item(path: &Path) -> Result<(), String> {
+        std::process::Command::new("open").arg("-R").arg(path).spawn().map(|_| ()).map_err(|e| e.to_string())
     }
 }
 

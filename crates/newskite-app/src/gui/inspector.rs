@@ -386,6 +386,9 @@ fn tabs(ui: &mut Ui, pal: &Palette, data: &Data, job: &Job, state: &mut Inspecto
             if on {
                 current = Some(r);
             }
+            if resp.has_focus() {
+                super::widgets::focus_ring(ui, pal, r.expand2(Vec2::new(4.0, 2.0)), 4);
+            }
             if let Some(c) = dot {
                 ui.painter().circle_filled(Pos2::new(r.right() + 5.0, r.top() + 3.0), 2.5, c);
             }
@@ -510,7 +513,19 @@ fn overview(
     }
     place(ui, pal, "NZB", &job.source_path, Some(Action::RevealPath(job.source_path.clone())), actions);
     if job.password.is_some() {
-        ui.label(RichText::new("An archive password is set for this job.").small().color(pal.muted));
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            ui.label(RichText::new("An archive password is set for this job.").small().color(pal.muted));
+            if job.state != JobState::Done
+                && ui
+                    .add(egui::Label::new(RichText::new("Change…").small().color(pal.accent_fg)).sense(Sense::click()))
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .on_hover_text("Type another password in the job's row")
+                    .clicked()
+            {
+                actions.push(Action::EditPassword(job.id));
+            }
+        });
     }
 }
 
@@ -613,9 +628,7 @@ fn problem(ui: &mut Ui, pal: &Palette, data: &Data, job: &Job, state: &mut Inspe
             {
                 actions.push(Action::OpenSettings);
             }
-            if kit_button(ui, pal, ButtonKind::Text, None, "Copy error", true).clicked() {
-                ui.ctx().copy_text(reason.clone());
-            }
+            super::widgets::copy_button(ui, pal, "job-error", "Copy error", true, || reason.clone());
         });
     });
 }
@@ -751,17 +764,13 @@ fn files(ui: &mut Ui, pal: &Palette, data: &Data) {
     }
     let mut sorted: Vec<_> = files.iter().collect();
     // Problems first, then in progress, then done; by name within each.
-    sorted.sort_by_key(|f| {
-        (
-            match f.state.as_str() {
-                "failed" => 0,
-                "downloading" => 1,
-                "done" => 3,
-                _ => 2,
-            },
-            f.name.clone(),
-        )
-    });
+    let rank = |f: &newskite_service::JobFile| match f.state.as_str() {
+        "failed" => 0,
+        "downloading" => 1,
+        "done" => 3,
+        _ => 2,
+    };
+    sorted.sort_by(|a, b| rank(a).cmp(&rank(b)).then_with(|| a.name.cmp(&b.name)));
     let done = files.iter().filter(|f| f.state == "done").count();
     let failed = files.iter().filter(|f| f.state == "failed").count();
     let mut summary = format!("{done} of {} done", files.len());
@@ -805,14 +814,13 @@ fn files(ui: &mut Ui, pal: &Palette, data: &Data) {
 fn log(ui: &mut Ui, pal: &Palette, data: &Data, actions: &mut Vec<Action>) {
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
-        let text: String = data
-            .selected_log
-            .iter()
-            .map(|l| format!("{} {:5} {}\n", format::timestamp_utc(l.ts), l.level, l.text))
-            .collect();
-        if kit_button(ui, pal, ButtonKind::Text, None, "Copy log", !text.is_empty()).clicked() {
-            ui.ctx().copy_text(text);
-        }
+        // The text is put together on the click, not on every frame.
+        super::widgets::copy_button(ui, pal, "job-log", "Copy log", !data.selected_log.is_empty(), || {
+            data.selected_log
+                .iter()
+                .map(|l| format!("{} {:5} {}\n", format::timestamp_utc(l.ts), l.level, l.text))
+                .collect()
+        });
         if kit_button(ui, pal, ButtonKind::Text, Some(Icon::External), "Open log file", true)
             .on_hover_text("The full application log, in the data folder")
             .clicked()

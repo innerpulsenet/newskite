@@ -35,10 +35,16 @@ pub const LIVE_WINDOW_SECS: usize = 600;
 pub const HISTORY_SECS: u64 = 24 * 3600;
 /// How often the stored throughput history is re-read (also after each queue run).
 pub const HISTORY_REFRESH: Duration = Duration::from_secs(60);
-/// Theme watcher poll interval.
+/// Theme watcher poll interval (on its own thread; the window is only woken by a change).
 const THEME_POLL: Duration = Duration::from_secs(1);
-/// How often the reduced-motion preference is re-read (when not fixed by the config).
-const MOTION_POLL: Duration = Duration::from_secs(5);
+/// Theme polls between two reads of the reduced-motion preference.
+const MOTION_EVERY: u32 = 5;
+/// How often an idle window redraws anyway, so relative times ("5 min ago") and the
+/// periodic history refresh move on.
+const IDLE_TICK: Duration = Duration::from_secs(30);
+/// Longest the article maps of jobs that are not on show may hold up one frame; the
+/// rest are read on the following frames.
+const MAPS_BUDGET: Duration = Duration::from_millis(4);
 
 /// Where the theme comes from.
 pub enum ThemeMode {
@@ -124,6 +130,21 @@ pub enum UiMsg {
     },
     /// A manual watch-folder scan (run off the UI thread) finished.
     WatchScanned,
+    /// Background work (deleting folders, asking the file manager) finished: jobs and
+    /// the log may have changed.
+    Refresh,
+    /// The stored throughput history and the disk's free and total bytes, read off the
+    /// UI thread.
+    History {
+        /// The last [`HISTORY_SECS`] of samples.
+        samples: Vec<ThroughputSample>,
+        /// Free and total bytes of the download folder's filesystem.
+        disk: Option<(u64, u64)>,
+    },
+    /// The desktop's theme changed.
+    ThemeChanged(Box<Theme>),
+    /// The desktop's reduced-motion preference changed.
+    MotionChanged(bool),
 }
 
 /// Something the user asked for this frame; applied after the UI pass so panels only
@@ -191,8 +212,10 @@ pub enum Action {
     OpenSettings,
     /// Persist the settings draft.
     SaveSettings(Box<Settings>),
-    /// Close the settings modal without saving.
+    /// Close the settings modal without saving (a sheet with unsaved changes asks first).
     CloseSettings,
+    /// Close the settings modal and drop its unsaved changes.
+    DiscardSettings,
     /// Test a server from the settings modal.
     TestServer(u64, Box<newskite_types::ServerConfig>),
     /// Open the download folder in the file manager.
@@ -203,8 +226,6 @@ pub enum Action {
     SetTab(Tab),
     /// Reveal (and focus) the Open NZB field.
     ShowOpenNzb,
-    /// Write an info line to the message log (harmless placeholder actions).
-    Note(String),
     /// Show the About dialog.
     OpenAbout,
     /// Close the About dialog.
@@ -240,8 +261,12 @@ pub struct Data {
     pub settings: Settings,
     /// Queue status (re-read each frame).
     pub status: Status,
-    /// Stored throughput history loaded at start.
+    /// Stored throughput history loaded at start (set with [`Data::set_history`]).
     pub history: Vec<ThroughputSample>,
+    /// The fastest stored second in [`Self::history`].
+    pub history_peak: u64,
+    /// [`Self::history`] in the sparkline's cells (see [`statusbar`]), as of its last read.
+    pub history_cells: Vec<f32>,
     /// Live throughput series `(unix secs, bytes/s)`, oldest first.
     pub live: VecDeque<(i64, u64)>,
     /// Smoothed `bytes_done` of downloading jobs (DB value + live segment bytes).
@@ -269,6 +294,25 @@ pub struct Data {
 }
 
 impl Data {
+    /// Replaces the stored throughput history and what is derived from it.
+    pub fn set_history(&mut self, samples: Vec<ThroughputSample>) {
+        self.history_peak = samples.iter().map(|s| s.bytes_down).max().unwrap_or(0);
+        let raw: Vec<(i64, u64)> = samples.iter().map(|s| (s.ts, s.bytes_down)).collect();
+        self.history_cells =
+            if raw.is_empty() { Vec::new() } else { docks::history_buckets(&raw, now_secs(), HISTORY_SECS as i64, statusbar::SPARK_CELLS) };
+        self.history = samples;
+    }
+
+    /// How many jobs are finished (done or failed).
+    pub fn finished_count(&self) -> usize {
+        self.jobs.iter().filter(|j| !j.state.is_pending()).count()
+    }
+
+    /// Whether any job is queued, downloading or held.
+    pub fn has_pending(&self) -> bool {
+        self.jobs.iter().any(|j| j.state.is_pending())
+    }
+
     /// The repair outlook to show for `job`: as last read from the service, else as saved
     /// with its outcome.
     pub fn outlook(&self, job: &Job) -> Option<newskite_service::RepairOutlook> {
@@ -387,11 +431,8 @@ pub struct OpenNzbState {
     pub error: Option<String>,
     /// Imports still running in the background.
     pub importing: usize,
-}
-
-enum ThemeState {
-    Watch(Box<ThemeWatcher>),
-    Fixed,
+    /// The path field had the keyboard when last drawn.
+    pub has_focus: bool,
 }
 
 /// The Newskite main window.
@@ -401,17 +442,20 @@ pub struct NewskiteApp {
     ctx: egui::Context,
     rx: mpsc::Receiver<UiMsg>,
     tx: mpsc::Sender<UiMsg>,
-    theme_state: ThemeState,
-    last_theme_poll: Instant,
+    /// Dropped with the window: the theme thread stops when it is gone.
+    _alive: Arc<()>,
     /// The desktop's theme (or the fixed one), before the Appearance choice.
     desktop_theme: Theme,
     /// Settings › Appearance.
     pub appearance: Appearance,
     appearance_file: Option<PathBuf>,
-    /// Reduced motion is in effect (the mark rests).
+    /// Reduced motion is in effect (the mark rests): the desktop asks for it, or the
+    /// user does in Settings › Appearance.
     pub reduced_motion: bool,
-    fixed_motion: Option<bool>,
-    last_motion_poll: Instant,
+    /// What the desktop (or the launch configuration) asks for.
+    desktop_reduced_motion: bool,
+    /// Settings › Appearance › Reduce motion.
+    pub reduce_motion_pref: bool,
     masthead_clock: MarkClock,
     about_clock: MarkClock,
     /// The theme being worn (the desktop's, or an innerpulse theme).
@@ -428,8 +472,8 @@ pub struct NewskiteApp {
     jobs_dirty: bool,
     /// When the article maps of downloading jobs were last read.
     last_maps_reload: Instant,
-    /// A run ended or jobs changed: saved article maps may be new.
-    maps_dirty: bool,
+    /// Jobs whose saved article map may be new (they just finished).
+    maps_stale: HashSet<i64>,
     /// Jobs the service has no article map for (not asked again until a run ends).
     no_map: HashSet<i64>,
     /// The job whose log `Data::selected_log` holds.
@@ -448,6 +492,8 @@ pub struct NewskiteApp {
     /// Frequent events folded by the forwarder thread (see [`super::events`]).
     pending: SharedPending,
     last_history_reload: Instant,
+    /// A background history read is on its way.
+    history_loading: bool,
 }
 
 fn now_secs() -> i64 {
@@ -464,14 +510,15 @@ impl NewskiteApp {
         // `pending` by the forwarder, which keeps memory bounded while the UI is away.
         let (tx, rx) = mpsc::channel();
         let pending: SharedPending = Arc::new(Mutex::new(Pending::default()));
-        let (theme_state, desktop_theme) = match config.theme {
+        let alive = Arc::new(());
+        let (watcher, desktop_theme) = match config.theme {
             ThemeMode::Desktop => {
                 let hint = ctx.system_theme().map(|t| t == egui::Theme::Dark);
                 let watcher = ThemeWatcher::with_hint(hint);
                 let theme = watcher.current().clone();
-                (ThemeState::Watch(Box::new(watcher)), theme)
+                (Some(watcher), theme)
             }
-            ThemeMode::Fixed(t) => (ThemeState::Fixed, t),
+            ThemeMode::Fixed(t) => (None, t),
         };
         let appearance = config
             .appearance_file
@@ -482,10 +529,18 @@ impl NewskiteApp {
         fonts::install(&ctx);
         icons::install(&ctx);
         let palette = theme::apply(&ctx, &theme);
-        let reduced_motion = config.reduced_motion.unwrap_or_else(motion::reduced_motion);
+        let desktop_reduced_motion = config.reduced_motion.unwrap_or_else(motion::reduced_motion);
+        let reduce_motion_pref = config.appearance_file.as_deref().is_some_and(appearance::load_reduce_motion);
+        let reduced_motion = desktop_reduced_motion || reduce_motion_pref;
 
         if config.forward_events {
             spawn_forwarder(&service, tx.clone(), pending.clone(), ctx.clone());
+        }
+        // The desktop's theme and motion preference are watched off the UI thread, so an
+        // idle window is not redrawn just to poll them.
+        let watch_motion = config.reduced_motion.is_none();
+        if watcher.is_some() || (watch_motion && config.forward_events) {
+            spawn_desktop_watch(watcher, watch_motion.then_some(desktop_reduced_motion), tx.clone(), ctx.clone(), Arc::downgrade(&alive));
         }
 
         let mut app = Self {
@@ -494,14 +549,13 @@ impl NewskiteApp {
             ctx,
             rx,
             tx,
-            theme_state,
-            last_theme_poll: Instant::now(),
+            _alive: alive,
             desktop_theme,
             appearance,
             appearance_file: config.appearance_file,
             reduced_motion,
-            fixed_motion: config.reduced_motion,
-            last_motion_poll: Instant::now(),
+            desktop_reduced_motion,
+            reduce_motion_pref,
             masthead_clock: MarkClock::new(),
             about_clock: MarkClock::new(),
             theme,
@@ -529,7 +583,7 @@ impl NewskiteApp {
             last_jobs_reload: Instant::now(),
             jobs_dirty: false,
             last_maps_reload: Instant::now(),
-            maps_dirty: true,
+            maps_stale: HashSet::new(),
             no_map: HashSet::new(),
             selected_log_for: None,
             selected_log_dirty: true,
@@ -539,6 +593,7 @@ impl NewskiteApp {
             toast_seq: 0,
             pending,
             last_history_reload: Instant::now(),
+            history_loading: false,
         };
         app.reload_all();
         app.finished_seen = app.finished_ids();
@@ -579,15 +634,56 @@ impl NewskiteApp {
         self.data.status = self.service.status();
         self.selected_log_dirty = true;
         self.reload_jobs();
+        // Finishes may have been missed: every saved article map is read again.
+        self.maps_stale.extend(self.data.jobs.iter().map(|j| j.id));
         self.reload_history();
     }
 
-    /// Re-reads the stored throughput history (the last [`HISTORY_SECS`]).
+    /// Re-reads the stored throughput history (the last [`HISTORY_SECS`]) and the disk's
+    /// space, on the calling thread (start-up and tests; see [`Self::refresh_history`]).
     pub fn reload_history(&mut self) {
-        self.data.history = self.service.throughput_history(HISTORY_SECS);
-        self.data.disk_free = disk::free_bytes(&self.data.settings.download_dir);
-        self.data.disk_total = disk::total_bytes(&self.data.settings.download_dir);
+        let samples = self.service.throughput_history(HISTORY_SECS);
+        self.data.set_history(samples);
+        self.set_disk(disk::space(&self.data.settings.download_dir));
         self.last_history_reload = Instant::now();
+    }
+
+    fn set_disk(&mut self, space: Option<(u64, u64)>) {
+        self.data.disk_free = space.map(|(free, _)| free);
+        self.data.disk_total = space.map(|(_, total)| total);
+    }
+
+    /// [`Self::reload_history`] off the UI thread (a day of samples is a large read, and
+    /// the download folder may be on a slow mount); the result arrives as
+    /// [`UiMsg::History`].
+    fn refresh_history(&mut self) {
+        self.last_history_reload = Instant::now();
+        if self.history_loading {
+            return;
+        }
+        self.history_loading = true;
+        let svc = self.service.clone();
+        let dir = self.data.settings.download_dir.clone();
+        let tx = self.tx.clone();
+        let ctx = self.ctx.clone();
+        self.rt.spawn_blocking(move || {
+            let samples = svc.throughput_history(HISTORY_SECS);
+            let _ = tx.send(UiMsg::History { samples, disk: disk::space(&dir) });
+            ctx.request_repaint();
+        });
+    }
+
+    /// Runs `work` on a blocking worker (deleting folders, asking the file manager: both
+    /// can take seconds), then has the UI re-read jobs and the log.
+    fn in_background(&self, work: impl FnOnce(&Service) + Send + 'static) {
+        let svc = self.service.clone();
+        let tx = self.tx.clone();
+        let ctx = self.ctx.clone();
+        self.rt.spawn_blocking(move || {
+            work(&svc);
+            let _ = tx.send(UiMsg::Refresh);
+            ctx.request_repaint();
+        });
     }
 
     /// Requeues `ids` with the fail-over servers asked first and downloads them. The
@@ -610,8 +706,10 @@ impl NewskiteApp {
 
     /// Keeps the article maps the window draws: every job's strip, and the full map of
     /// the downloading jobs and the selection. Downloading jobs are read every
-    /// [`MAPS_REFRESH`] (their maps change constantly); the others once, and again after a
-    /// run ends. Jobs without a map are remembered, so they are not asked for every frame.
+    /// [`MAPS_REFRESH`] (their maps change constantly); the others once, and again when
+    /// they finish. Jobs without a map are remembered, so they are not asked for every
+    /// frame. Maps that are not on show are read for at most [`MAPS_BUDGET`] per frame, so
+    /// a long history never holds up the window.
     fn refresh_article_maps(&mut self) {
         let downloading: Vec<i64> =
             self.data.jobs.iter().filter(|j| j.state == JobState::Downloading).map(|j| j.id).collect();
@@ -622,24 +720,35 @@ impl NewskiteApp {
         self.data.article_maps.retain(|id, _| full.contains(id));
         self.data.outlooks.retain(|id, _| full.contains(id));
         self.data.strips.retain(|id, _| ids.contains(id));
-        if self.maps_dirty {
-            self.no_map.clear();
-        }
-        self.no_map.retain(|id| ids.contains(id));
+        self.maps_stale.retain(|id| ids.contains(id));
+        self.no_map.retain(|id| ids.contains(id) && !self.maps_stale.contains(id));
         let live_due = !downloading.is_empty() && self.last_maps_reload.elapsed() >= MAPS_REFRESH;
-        for &id in &ids {
-            if self.no_map.contains(&id) && !downloading.contains(&id) {
+        let started = Instant::now();
+        let mut more = false;
+        // The jobs on show first (never deferred), then the rest in list order.
+        let order = self.data.jobs.iter().map(|j| j.id).filter(|id| full.contains(id));
+        let rest = self.data.jobs.iter().map(|j| j.id).filter(|id| !full.contains(id));
+        let order: Vec<i64> = order.chain(rest).collect();
+        for id in order {
+            let live = downloading.contains(&id);
+            if self.no_map.contains(&id) && !live {
                 continue;
             }
-            let missing = !self.data.strips.contains_key(&id) || (full.contains(&id) && !self.data.article_maps.contains_key(&id));
-            let due = self.maps_dirty || missing || (live_due && downloading.contains(&id));
+            let on_show = full.contains(&id);
+            let missing = !self.data.strips.contains_key(&id) || (on_show && !self.data.article_maps.contains_key(&id));
+            let due = self.maps_stale.contains(&id) || missing || (live_due && live);
             if !due {
                 continue;
             }
+            if !on_show && started.elapsed() >= MAPS_BUDGET {
+                more = true;
+                break;
+            }
+            self.maps_stale.remove(&id);
             match self.service.article_map(id) {
                 Some(m) => {
                     self.data.strips.insert(id, m.cells(super::articles::STRIP_BUCKETS).1);
-                    if full.contains(&id) {
+                    if on_show {
                         self.data.article_maps.insert(id, m);
                         // None keeps what `Repair` events delivered.
                         if let Some(o) = self.service.repair_outlook(id) {
@@ -655,11 +764,12 @@ impl NewskiteApp {
                 }
             }
         }
-        if live_due || self.maps_dirty {
+        if live_due {
             self.last_maps_reload = Instant::now();
         }
-        self.maps_dirty = false;
-        if !downloading.is_empty() {
+        if more {
+            self.ctx.request_repaint();
+        } else if !downloading.is_empty() {
             self.ctx.request_repaint_after(MAPS_REFRESH);
         }
     }
@@ -821,6 +931,24 @@ impl NewskiteApp {
                     reload_jobs = true;
                     reload_logs = true;
                 }
+                UiMsg::Refresh => {
+                    reload_jobs = true;
+                    reload_logs = true;
+                }
+                UiMsg::History { samples, disk } => {
+                    self.history_loading = false;
+                    self.data.set_history(samples);
+                    self.set_disk(disk);
+                }
+                UiMsg::ThemeChanged(t) => {
+                    tracing::info!(source = ?t.source, dark = t.dark, "desktop theme changed");
+                    self.desktop_theme = *t;
+                    self.retheme();
+                }
+                UiMsg::MotionChanged(reduced) => {
+                    self.desktop_reduced_motion = reduced;
+                    self.reduced_motion = reduced || self.reduce_motion_pref;
+                }
             }
         }
         if reload_jobs || self.jobs_dirty {
@@ -870,7 +998,7 @@ impl NewskiteApp {
                 *reload_jobs = true;
                 self.reload_jobs();
                 self.notify_finished();
-                self.reload_history();
+                self.refresh_history();
             }
             ServiceEvent::Paused | ServiceEvent::Resumed => {}
             // Normally folded (and stamped on arrival) by the forwarder; a sample sent
@@ -882,7 +1010,7 @@ impl NewskiteApp {
             ServiceEvent::ShutdownCanceled => self.data.shutdown_secs = None,
             ServiceEvent::PostProgress(p) => self.data.status.post = Some(p),
             ServiceEvent::JobFinished { job_id, name, ok, detail } => {
-                self.maps_dirty = true;
+                self.maps_stale.insert(job_id);
                 self.toast_seq += 1;
                 self.data.toasts.push(super::toast::Toast {
                     id: self.toast_seq,
@@ -989,19 +1117,18 @@ impl NewskiteApp {
                 self.reload_jobs();
                 self.data.logs = self.service.logs();
             }
-            Action::ClearHistoryAndFiles => {
-                self.service.clear_history_and_files();
-                self.reload_jobs();
-                self.data.logs = self.service.logs();
-            }
+            // Deleting folders can take a while (gigabytes, slow disks): off the UI thread.
+            Action::ClearHistoryAndFiles => self.in_background(|svc| {
+                svc.clear_history_and_files();
+            }),
             Action::DeleteJobFiles(id) => {
-                let _ = self.service.delete_job_files(id);
                 if self.view.queue.selected == Some(id) {
                     self.view.queue.selected = None;
                     self.data.selected_files.clear();
                 }
-                self.reload_jobs();
-                self.data.logs = self.service.logs();
+                self.in_background(move |svc| {
+                    let _ = svc.delete_job_files(id);
+                });
             }
             Action::OpenJobFolder(id) => self.open_job_folder(id),
             Action::SetSpeedLimit(kbps) => {
@@ -1009,12 +1136,9 @@ impl NewskiteApp {
                 self.data.settings = self.service.settings();
                 self.data.logs = self.service.logs();
             }
-            Action::OpenPath(p) => self.open_path(&p),
-            Action::RevealPath(p) => self.reveal_path(&p),
-            Action::OpenLogFile => {
-                let p = self.service.log_file_path();
-                self.open_path(&p);
-            }
+            Action::OpenPath(p) => self.in_background(move |svc| open_path(svc, &p)),
+            Action::RevealPath(p) => self.in_background(move |svc| reveal_path(svc, &p)),
+            Action::OpenLogFile => self.in_background(|svc| open_path(svc, &svc.log_file_path())),
             Action::EditPassword(id) => {
                 self.view.queue.password_edit = Some((id, String::new()));
                 // The inline editor lives in the job's row.
@@ -1087,7 +1211,7 @@ impl NewskiteApp {
                     self.data.settings = self.service.settings();
                     self.data.settings_load_error = self.service.settings_load_error();
                     let mut draft = SettingsDraft::new(self.data.settings.clone());
-                    draft.appearance = self.appearance;
+                    draft.open_with_appearance(self.appearance, self.reduce_motion_pref);
                     draft.load_error = self.data.settings_load_error.clone();
                     self.view.settings = Some(draft);
                 }
@@ -1097,8 +1221,8 @@ impl NewskiteApp {
                     self.data.settings = self.service.settings();
                     self.data.settings_load_error = self.service.settings_load_error();
                     // The sheet's appearance is applied with the save, never before it.
-                    if let Some(a) = self.view.settings.take().map(|d| d.appearance) {
-                        self.set_appearance(a);
+                    if let Some((a, reduce)) = self.view.settings.take().map(|d| (d.appearance, d.reduce_motion)) {
+                        self.set_look(a, reduce);
                     }
                     self.data.logs = self.service.logs();
                 }
@@ -1110,7 +1234,12 @@ impl NewskiteApp {
                         .log(LogLevel::Error, format!("saving settings failed: {e}"));
                 }
             },
-            Action::CloseSettings => self.view.settings = None,
+            // A sheet with unsaved changes asks before it closes.
+            Action::CloseSettings => match self.view.settings.as_mut() {
+                Some(d) if d.dirty() => d.confirm_discard = true,
+                _ => self.view.settings = None,
+            },
+            Action::DiscardSettings => self.view.settings = None,
             Action::TestServer(row_id, server) => {
                 let svc = self.service.clone();
                 let tx = self.tx.clone();
@@ -1131,10 +1260,6 @@ impl NewskiteApp {
                 self.view.open_nzb.visible = true;
                 self.view.open_nzb.focus = true;
             }
-            Action::Note(text) => {
-                self.service.log(LogLevel::Info, text);
-                self.data.logs = self.service.logs();
-            }
             Action::OpenAbout => {
                 if self.view.settings.is_none() && !self.view.about_open {
                     self.view.about_open = true;
@@ -1142,15 +1267,11 @@ impl NewskiteApp {
                 }
             }
             Action::CloseAbout => self.view.about_open = false,
-            Action::OpenUrl(url) => {
+            Action::OpenUrl(url) => self.in_background(move |svc| {
                 if let Err(e) = crate::desktop::open_url(&url) {
-                    self.service.log(
-                        LogLevel::Error,
-                        format!("cannot open {url} in the browser: {e}"),
-                    );
-                    self.data.logs = self.service.logs();
+                    svc.log(LogLevel::Error, format!("cannot open {url} in the browser: {e}"));
                 }
-            }
+            }),
             Action::SetAppearance(a) => self.set_appearance(a),
         }
     }
@@ -1158,11 +1279,18 @@ impl NewskiteApp {
     /// Wears the theme for `a` and stores the choice (a write failure is logged; the
     /// choice still applies for this session).
     pub fn set_appearance(&mut self, a: Appearance) {
-        if a != self.appearance {
+        self.set_look(a, self.reduce_motion_pref);
+    }
+
+    /// [`Self::set_appearance`] together with the Reduce motion switch.
+    pub fn set_look(&mut self, a: Appearance, reduce_motion: bool) {
+        if a != self.appearance || reduce_motion != self.reduce_motion_pref {
             self.appearance = a;
+            self.reduce_motion_pref = reduce_motion;
+            self.reduced_motion = self.desktop_reduced_motion || reduce_motion;
             self.retheme();
             if let Some(path) = &self.appearance_file {
-                if let Err(e) = appearance::save(path, a) {
+                if let Err(e) = appearance::save(path, a, reduce_motion) {
                     self.service.log(
                         LogLevel::Error,
                         format!("cannot save the appearance to {}: {e}", path.display()),
@@ -1236,90 +1364,29 @@ impl NewskiteApp {
     }
 
     fn open_job_folder(&mut self, id: i64) {
-        let Some(dir) = self
-            .data
-            .jobs
-            .iter()
-            .find(|j| j.id == id)
-            .map(|j| j.dest_dir.clone())
-        else {
+        let Some(dir) = self.data.jobs.iter().find(|j| j.id == id).map(|j| j.dest_dir.clone()) else {
             return;
         };
-        // Before the first file is written the folder may not exist: show its parent.
-        let target = if dir.is_dir() {
-            dir
-        } else {
-            dir.parent().map(PathBuf::from).unwrap_or(dir)
-        };
-        if let Err(e) = crate::desktop::show_folder(&target) {
-            self.service.log(
-                LogLevel::Error,
-                format!("cannot open {} in the file manager: {e}", target.display()),
-            );
-            self.data.logs = self.service.logs();
-        }
-    }
-
-    fn reveal_path(&mut self, p: &std::path::Path) {
-        let shown = if p.is_file() {
-            crate::desktop::show_item(p)
-        } else {
-            match p.parent().filter(|d| d.is_dir()) {
-                Some(dir) => crate::desktop::show_folder(dir),
-                None => Err("it is no longer there".to_owned()),
+        self.in_background(move |svc| {
+            // Before the first file is written the folder may not exist: show its parent.
+            let target = if dir.is_dir() { dir } else { dir.parent().map(PathBuf::from).unwrap_or(dir) };
+            if let Err(e) = crate::desktop::show_folder(&target) {
+                svc.log(LogLevel::Error, format!("cannot open {} in the file manager: {e}", target.display()));
             }
-        };
-        if let Err(e) = shown {
-            self.service.log(LogLevel::Error, format!("cannot show {} in the file manager: {e}", p.display()));
-            self.data.logs = self.service.logs();
-        }
-    }
-
-    fn open_path(&mut self, p: &std::path::Path) {
-        let opened = if p.is_dir() { crate::desktop::show_folder(p) } else { crate::desktop::open_file(p) };
-        if let Err(e) = opened {
-            self.service.log(LogLevel::Error, format!("cannot open {}: {e}", p.display()));
-            self.data.logs = self.service.logs();
-        }
+        });
     }
 
     fn open_download_folder(&mut self) {
         let dir = self.data.settings.download_dir.clone();
-        if dir.as_os_str().is_empty() {
-            self.service
-                .log(LogLevel::Warn, "no download folder configured");
-        } else if let Err(e) = std::fs::create_dir_all(&dir) {
-            self.service.log(
-                LogLevel::Error,
-                format!("cannot create download folder {}: {e}", dir.display()),
-            );
-        } else if let Err(e) = crate::desktop::show_folder(&dir) {
-            self.service.log(
-                LogLevel::Error,
-                format!("cannot open {} in the file manager: {e}", dir.display()),
-            );
-        }
-        self.data.logs = self.service.logs();
-    }
-
-    /// Polls the theme watcher (at most once per second) and re-themes on change.
-    fn poll_theme(&mut self, ctx: &egui::Context) {
-        if self.last_theme_poll.elapsed() < THEME_POLL {
-            return;
-        }
-        self.last_theme_poll = Instant::now();
-        if let ThemeState::Watch(w) = &mut self.theme_state {
-            w.set_prefers_dark_hint(ctx.system_theme().map(|t| t == egui::Theme::Dark));
-            if let Some(t) = w.poll_changed() {
-                tracing::info!(source = ?t.source, dark = t.dark, "desktop theme changed");
-                self.desktop_theme = t;
-                self.retheme();
+        self.in_background(move |svc| {
+            if dir.as_os_str().is_empty() {
+                svc.log(LogLevel::Warn, "no download folder configured");
+            } else if let Err(e) = std::fs::create_dir_all(&dir) {
+                svc.log(LogLevel::Error, format!("cannot create download folder {}: {e}", dir.display()));
+            } else if let Err(e) = crate::desktop::show_folder(&dir) {
+                svc.log(LogLevel::Error, format!("cannot open {} in the file manager: {e}", dir.display()));
             }
-        }
-        if self.fixed_motion.is_none() && self.last_motion_poll.elapsed() >= MOTION_POLL {
-            self.last_motion_poll = Instant::now();
-            self.reduced_motion = motion::reduced_motion();
-        }
+        });
     }
 
     /// The masthead's working tempo: a beat every 1.2 s while bytes move, every 2.4 s
@@ -1376,6 +1443,7 @@ impl NewskiteApp {
         });
         let typing = ctx.memory(|m| m.focused().is_some());
         let modal = self.view.settings.is_some() || self.view.about_open;
+        let mut refused: Vec<String> = Vec::new();
         if !typing && !modal {
             let pasted: Vec<String> = ctx.input(|i| {
                 i.events
@@ -1392,12 +1460,22 @@ impl NewskiteApp {
                 if line.is_empty() || line.starts_with('#') {
                     continue;
                 }
-                if let Ok(p) = crate::launch::path_from_text(line) {
-                    paths.push(p);
+                match crate::launch::path_from_text(line) {
+                    Ok(p) => paths.push(p),
+                    // A pasted link Newskite cannot fetch is said, not swallowed; other
+                    // text on the clipboard is none of its business.
+                    Err(why) if line.contains("://") => refused.push(format!("cannot open {line}: {why}")),
+                    Err(_) => {}
                 }
             }
         }
         if paths.is_empty() {
+            if let Some(why) = refused.into_iter().next() {
+                self.service.log(LogLevel::Warn, why.clone());
+                self.data.logs = self.service.logs();
+                self.view.open_nzb.visible = true;
+                self.view.open_nzb.error = Some(why);
+            }
             return;
         }
         let (nzbs, skipped) = expand_drop(&paths);
@@ -1428,44 +1506,82 @@ impl NewskiteApp {
         let open = KeyboardShortcut::new(Modifiers::COMMAND, Key::O);
         let prefs = KeyboardShortcut::new(Modifiers::COMMAND, Key::Comma);
         let find = KeyboardShortcut::new(Modifiers::COMMAND, Key::F);
-        let (o, p, f, esc) = ctx.input_mut(|i| {
+        let save = KeyboardShortcut::new(Modifiers::COMMAND, Key::S);
+        let tabs = [(Key::Num1, Tab::Queue), (Key::Num2, Tab::History), (Key::Num3, Tab::Log)];
+        let modal = self.view.settings.is_some() || self.view.about_open;
+        let (o, p, f, s, tab, esc) = ctx.input_mut(|i| {
             (
                 i.consume_shortcut(&open),
                 i.consume_shortcut(&prefs),
                 i.consume_shortcut(&find),
+                i.consume_shortcut(&save),
+                tabs.into_iter().find(|(k, _)| i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, *k))).map(|(_, t)| t),
                 i.key_pressed(Key::Escape),
             )
         });
-        if o {
-            self.actions.push(Action::BrowseNzb);
+        // The window's own shortcuts rest while a dialog is open over it.
+        if !modal {
+            if o {
+                self.actions.push(Action::BrowseNzb);
+            }
+            if p {
+                self.actions.push(Action::OpenSettings);
+            }
+            if f {
+                self.view.queue.focus_filter = true;
+            }
+            if let Some(t) = tab {
+                self.actions.push(Action::SetTab(t));
+            }
+        } else if s {
+            if let Some(d) = self.view.settings.as_mut() {
+                d.save_requested = true;
+            }
         }
-        if p {
-            self.actions.push(Action::OpenSettings);
-        }
-        if f {
-            self.view.queue.focus_filter = true;
-        }
+        // Esc closes one thing: the topmost transient state, in this order.
+        let typing = ctx.memory(|m| m.focused().is_some()) && ctx.wants_keyboard_input();
         if esc {
-            if self.view.settings.is_some() {
-                self.actions.push(Action::CloseSettings);
+            let q = &mut self.view.queue;
+            if let Some(d) = self.view.settings.as_mut() {
+                // Esc backs out of the discard question before it closes the sheet.
+                if d.confirm_discard {
+                    d.confirm_discard = false;
+                } else {
+                    self.actions.push(Action::CloseSettings);
+                }
             } else if self.view.about_open {
                 self.actions.push(Action::CloseAbout);
-            } else if self.view.open_nzb.visible {
+            } else if q.drag.is_some() {
+                // The list drops the row where it was.
+            } else if q.password_edit.is_some() {
+                q.password_edit = None;
+            } else if q.confirm_remove.is_some() || q.confirm_delete.is_some() {
+                q.confirm_remove = None;
+                q.confirm_delete = None;
+            } else if q.confirm_clear || q.confirm_clear_files {
+                q.confirm_clear = false;
+                q.confirm_clear_files = false;
+            } else if self.view.strip.confirm_retry_all {
+                self.view.strip.confirm_retry_all = false;
+            } else if self.view.open_nzb.visible && (!typing || self.view.open_nzb.has_focus) {
                 self.view.open_nzb.visible = false;
                 self.view.open_nzb.error = None;
-            } else if self.view.queue.confirm_remove.is_some() || self.view.queue.confirm_delete.is_some() {
-                self.view.queue.confirm_remove = None;
-                self.view.queue.confirm_delete = None;
-            } else if self.view.queue.confirm_clear || self.view.queue.confirm_clear_files {
-                self.view.queue.confirm_clear = false;
-                self.view.queue.confirm_clear_files = false;
-            } else if self.view.queue.selected.is_some() {
+            } else if typing {
+                // The field with the keyboard takes it (a search clears itself).
+            } else if q.selected.is_some() {
                 self.actions.push(Action::Select(None));
             }
         }
+        // Enter answers an inline "Remove?" with yes (deleting files always takes a click).
+        if !typing && !modal {
+            if let Some(id) = self.view.queue.confirm_remove {
+                if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter)) {
+                    self.view.queue.confirm_remove = None;
+                    self.actions.push(Action::RemoveJob(id));
+                }
+            }
+        }
         // Keys for the selected job, unless a text field or dialog has the keyboard.
-        let typing = ctx.memory(|m| m.focused().is_some()) && ctx.wants_keyboard_input();
-        let modal = self.view.settings.is_some() || self.view.about_open;
         if let (Some(id), false, false) = (self.view.queue.selected, typing, modal) {
             let Some(job) = self.data.jobs.iter().find(|j| j.id == id) else {
                 return;
@@ -1473,7 +1589,7 @@ impl NewskiteApp {
             let (space, delete, up, down) = ctx.input_mut(|i| {
                 (
                     i.consume_key(Modifiers::NONE, Key::Space),
-                    i.consume_key(Modifiers::NONE, Key::Delete),
+                    i.consume_key(Modifiers::NONE, Key::Delete) || i.consume_key(Modifiers::COMMAND, Key::Backspace),
                     i.consume_key(Modifiers::ALT, Key::ArrowUp),
                     i.consume_key(Modifiers::ALT, Key::ArrowDown),
                 )
@@ -1523,7 +1639,6 @@ impl NewskiteApp {
             return;
         }
         self.drain_messages();
-        self.poll_theme(ctx);
         self.data.status = self.service.status();
         let downloading = self
             .data
@@ -1537,7 +1652,7 @@ impl NewskiteApp {
         }
         // The stored "last 24 h" moves on while the window is open.
         if self.last_history_reload.elapsed() >= HISTORY_REFRESH {
-            self.reload_history();
+            self.refresh_history();
         }
         self.refresh_article_maps();
         self.shortcuts(ctx);
@@ -1669,13 +1784,73 @@ impl NewskiteApp {
         self.actions.extend(actions);
         self.apply_actions();
 
-        // Keep ticking: theme polling and periodic refresh while downloading. (The marks
-        // ask for frame-rate repaints themselves, and only while they move.)
-        ctx.request_repaint_after(if self.data.status.running {
-            Duration::from_millis(500)
-        } else {
-            THEME_POLL
-        });
+        // Keep ticking while downloading (the periodic refresh); an idle window only
+        // redraws on input, on events and every [`IDLE_TICK`]. (Whatever moves asks for its
+        // own frames, and only while it moves.)
+        ctx.request_repaint_after(if self.data.status.running { Duration::from_millis(500) } else { IDLE_TICK });
+    }
+}
+
+fn reveal_path(svc: &Service, p: &std::path::Path) {
+    let shown = if p.is_file() {
+        crate::desktop::show_item(p)
+    } else {
+        match p.parent().filter(|d| d.is_dir()) {
+            Some(dir) => crate::desktop::show_folder(dir),
+            None => Err("it is no longer there".to_owned()),
+        }
+    };
+    if let Err(e) = shown {
+        svc.log(LogLevel::Error, format!("cannot show {} in the file manager: {e}", p.display()));
+    }
+}
+
+fn open_path(svc: &Service, p: &std::path::Path) {
+    let opened = if p.is_dir() { crate::desktop::show_folder(p) } else { crate::desktop::open_file(p) };
+    if let Err(e) = opened {
+        svc.log(LogLevel::Error, format!("cannot open {}: {e}", p.display()));
+    }
+}
+
+/// Watches the desktop's theme (when `watcher` is given) and its reduced-motion
+/// preference (when `motion` holds the value in effect) on a thread of its own, and wakes
+/// the window only when one of them changed. Stops once `alive` is gone.
+fn spawn_desktop_watch(
+    mut watcher: Option<ThemeWatcher>,
+    mut motion: Option<bool>,
+    tx: mpsc::Sender<UiMsg>,
+    ctx: egui::Context,
+    alive: std::sync::Weak<()>,
+) {
+    let spawned = std::thread::Builder::new().name("newskite-desktop-watch".into()).spawn(move || {
+        let mut polls = 0u32;
+        loop {
+            std::thread::sleep(THEME_POLL);
+            if alive.upgrade().is_none() {
+                break;
+            }
+            let mut changed = false;
+            if let Some(w) = watcher.as_mut() {
+                w.set_prefers_dark_hint(ctx.system_theme().map(|t| t == egui::Theme::Dark));
+                if let Some(t) = w.poll_changed() {
+                    changed |= tx.send(UiMsg::ThemeChanged(Box::new(t))).is_ok();
+                }
+            }
+            polls = polls.wrapping_add(1);
+            if let (Some(was), true) = (motion, polls.is_multiple_of(MOTION_EVERY)) {
+                let now = motion::reduced_motion();
+                if now != was {
+                    motion = Some(now);
+                    changed |= tx.send(UiMsg::MotionChanged(now)).is_ok();
+                }
+            }
+            if changed {
+                ctx.request_repaint();
+            }
+        }
+    });
+    if let Err(e) = spawned {
+        tracing::debug!("cannot start the desktop watch thread: {e}");
     }
 }
 
@@ -1688,14 +1863,25 @@ fn drop_overlay(ctx: &egui::Context, pal: &Palette, reduced: bool) {
     let fade_id = egui::Id::new("drop-overlay-fade");
     if hovered.is_empty() {
         motion::fade_reset(ctx, fade_id);
+        ctx.data_mut(|d| d.remove_temp::<Arc<(Vec<PathBuf>, usize)>>(egui::Id::new("drop-overlay-count")));
         return;
     }
     let t = motion::fade_in(ctx, fade_id, 0.16, reduced);
     // Some sources only say a drag is in progress, not which files.
     let known: Vec<PathBuf> = hovered.iter().flatten().cloned().collect();
-    let (nzbs, _) = expand_drop(&known);
+    // Folders are read once per drag, not once per frame.
+    let cache_id = egui::Id::new("drop-overlay-count");
+    let cached = ctx.data(|d| d.get_temp::<Arc<(Vec<PathBuf>, usize)>>(cache_id)).filter(|c| c.0 == known);
+    let nzb_count = match cached {
+        Some(c) => c.1,
+        None => {
+            let n = expand_drop(&known).0.len();
+            ctx.data_mut(|d| d.insert_temp(cache_id, Arc::new((known.clone(), n))));
+            n
+        }
+    };
     let unknown = known.is_empty();
-    let (title, color) = match nzbs.len() {
+    let (title, color) = match nzb_count {
         _ if unknown => ("Drop NZB files to add them".to_owned(), pal.text),
         0 => ("These are not NZB files".to_owned(), pal.warning),
         1 => ("Drop to add 1 NZB".to_owned(), pal.text),
@@ -1735,7 +1921,7 @@ fn drop_overlay(ctx: &egui::Context, pal: &Palette, reduced: bool) {
                 &mut child,
                 pal,
                 beat.moving.then_some(beat.phase),
-                nzbs.len(),
+                nzb_count,
             );
             child.add_space(16.0);
             child.label(egui::RichText::new(title).size(16.0).strong().color(color));
@@ -1746,7 +1932,10 @@ fn drop_overlay(ctx: &egui::Context, pal: &Palette, reduced: bool) {
                     .color(pal.muted),
             );
         });
-    ctx.request_repaint_after(motion::FRAME);
+    // The drifting edge and the fade ask for their own frames; a still card needs none.
+    if !reduced && t < 1.0 {
+        ctx.request_repaint_after(motion::FRAME);
+    }
 }
 
 fn shutdown_banner(ui: &mut egui::Ui, pal: &Palette, secs: u32, actions: &mut Vec<Action>) {

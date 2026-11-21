@@ -12,7 +12,7 @@ use eframe::egui;
 use egui_kittest::kittest::Queryable;
 use egui_kittest::{Harness, SnapshotError, SnapshotOptions};
 use newskite_app::gui::docks::LogFilter;
-use newskite_app::gui::queue::{EMPTY_HISTORY, EMPTY_QUEUE};
+use newskite_app::gui::queue::{EMPTY_FIRST_RUN, EMPTY_HISTORY, EMPTY_QUEUE};
 use newskite_app::gui::{brand, brand_tokens, Action, Appearance, Tab, UiMsg};
 use newskite_app::{AppConfig, NewskiteApp, ThemeMode};
 use newskite_service::{
@@ -398,13 +398,16 @@ fn empty_state_renders_cleanly() {
     for (t, look) in looks() {
         let mut h = fx.harness_themed(t, SIZE, true, None, true, 0.25);
         h.run_steps(4);
-        h.get_by_label(EMPTY_QUEUE);
+        // No server yet: the empty queue leads with setting one up.
+        h.get_by_label(EMPTY_FIRST_RUN);
+        assert!(h.query_by_label(EMPTY_QUEUE).is_none());
+        h.get_by_label("Set up server…");
         h.get_by_label("Add NZB…");
         // One call to action: the header's Add NZB leaves it to the empty queue's.
         assert!(h.query_by_label("Add NZB").is_none());
         h.get_by_label("No throughput history yet");
         h.get_by_label("No server configured");
-        h.get_by_label("No server");
+        assert!(h.get_all_by_label("No server").count() >= 1);
         h.get_by_label("Idle");
         // Free space once: the wide sidebar's disk meter (the status bar has it on the rail).
         h.get_by_label("Downloads disk: 128 GB free");
@@ -1276,7 +1279,8 @@ fn appearance_switches_on_save_and_persists() {
         h.get_by_label("innerpulse ink").scroll_down();
         h.run_steps(1);
     }
-    h.run_steps(1);
+    // Let the scroll settle, so the click lands where the card now is.
+    h.run_steps(6);
     h.get_by_label("innerpulse ink").click();
     h.run_steps(2);
     assert_eq!(app(&h).appearance, Appearance::FollowDesktop);

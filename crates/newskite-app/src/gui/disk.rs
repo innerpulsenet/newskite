@@ -3,55 +3,40 @@
 
 use std::path::Path;
 
-/// Bytes available to an unprivileged user on the filesystem holding `dir`, or on its
-/// nearest existing ancestor (the download folder may not exist yet). `None` when no
-/// ancestor can be read or the platform has no way to ask.
+/// Free bytes (available to an unprivileged user) and size of the filesystem holding
+/// `dir`, or its nearest existing ancestor (the download folder may not exist yet), read
+/// with one call. `None` when no ancestor can be read or the platform has no way to ask.
+pub fn space(dir: &Path) -> Option<(u64, u64)> {
+    if dir.as_os_str().is_empty() {
+        return None;
+    }
+    let probe = dir.ancestors().find(|p| p.is_dir())?;
+    space_of(probe)
+}
+
+/// Free bytes of the filesystem holding `dir` (see [`space`]).
 pub fn free_bytes(dir: &Path) -> Option<u64> {
-    if dir.as_os_str().is_empty() {
-        return None;
-    }
-    let probe = dir.ancestors().find(|p| p.is_dir())?;
-    statvfs_free(probe)
+    space(dir).map(|(free, _)| free)
 }
 
-/// Size in bytes of the filesystem holding `dir` (or its nearest existing ancestor).
+/// Size in bytes of the filesystem holding `dir` (see [`space`]).
 pub fn total_bytes(dir: &Path) -> Option<u64> {
-    if dir.as_os_str().is_empty() {
-        return None;
-    }
-    let probe = dir.ancestors().find(|p| p.is_dir())?;
-    statvfs_total(probe)
+    space(dir).map(|(_, total)| total)
 }
 
 #[cfg(unix)]
-fn statvfs_free(p: &Path) -> Option<u64> {
+fn space_of(p: &Path) -> Option<(u64, u64)> {
     let st = rustix::fs::statvfs(p).ok()?;
-    Some(st.f_bavail.saturating_mul(st.f_frsize))
-}
-
-#[cfg(unix)]
-fn statvfs_total(p: &Path) -> Option<u64> {
-    let st = rustix::fs::statvfs(p).ok()?;
-    Some(st.f_blocks.saturating_mul(st.f_frsize))
+    Some((st.f_bavail.saturating_mul(st.f_frsize), st.f_blocks.saturating_mul(st.f_frsize)))
 }
 
 #[cfg(windows)]
-fn statvfs_free(p: &Path) -> Option<u64> {
-    crate::win::disk_space(p).map(|(free, _)| free)
-}
-
-#[cfg(windows)]
-fn statvfs_total(p: &Path) -> Option<u64> {
-    crate::win::disk_space(p).map(|(_, total)| total)
+fn space_of(p: &Path) -> Option<(u64, u64)> {
+    crate::win::disk_space(p)
 }
 
 #[cfg(not(any(unix, windows)))]
-fn statvfs_free(_p: &Path) -> Option<u64> {
-    None
-}
-
-#[cfg(not(any(unix, windows)))]
-fn statvfs_total(_p: &Path) -> Option<u64> {
+fn space_of(_p: &Path) -> Option<(u64, u64)> {
     None
 }
 
