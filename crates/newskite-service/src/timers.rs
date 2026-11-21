@@ -36,8 +36,14 @@ pub(crate) fn spawn_sampler(inner: &Arc<Inner>) {
                 _ = interval.tick() => {}
             }
             let Some(inner) = weak.upgrade() else { break };
-            let delta = take_delta(&inner);
-            sample(&inner, delta, ticks.is_multiple_of(PRUNE_EVERY_TICKS));
+            let prune = ticks.is_multiple_of(PRUNE_EVERY_TICKS);
+            // The database write runs off the async workers (they also drive the NNTP
+            // connections); awaited, so ticks stay in order and never overlap.
+            let _ = tokio::task::spawn_blocking(move || {
+                let delta = take_delta(&inner);
+                sample(&inner, delta, prune);
+            })
+            .await;
             ticks = ticks.wrapping_add(1);
         }
     });

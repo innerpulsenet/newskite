@@ -346,8 +346,8 @@ pub(crate) struct Inner {
     pub(crate) events: broadcast::Sender<ServiceEvent>,
     pub(crate) state: Mutex<RunState>,
     logs: Mutex<VecDeque<LogLine>>,
-    /// Open handle of the log file (lazily opened, dropped on rotation).
-    log_file: Mutex<Option<std::fs::File>>,
+    /// Open log file (lazily opened, dropped on rotation).
+    log_file: Mutex<Option<LogFile>>,
     /// Shared counters handed to every engine run; the sampler diffs `bytes_down`.
     pub(crate) progress: Arc<Progress>,
     /// NNTP connections kept between the jobs of one run; closed when the run ends.
@@ -391,6 +391,12 @@ pub(crate) struct Inner {
     /// The latest repair outlook of each job downloaded this session; saved with the job's
     /// outcome when it finishes.
     pub(crate) outlooks: Mutex<HashMap<i64, RepairOutlook>>,
+}
+
+/// The open log file and its length, kept here so a line costs no `stat`.
+struct LogFile {
+    file: std::fs::File,
+    len: u64,
 }
 
 /// Lock a mutex, recovering the data if a panicking thread poisoned it.
@@ -448,20 +454,40 @@ impl Inner {
         self.emit(ServiceEvent::JobLog(text));
     }
 
-    /// Appends to `<data_dir>/newskite.log`, rotating it past [`LOG_FILE_MAX`]. Failures
-    /// are ignored (the file is a convenience, the in-app log is the record).
+    /// Appends to `<data_dir>/newskite.log`, rotating it past [`LOG_FILE_MAX`]. Each line
+    /// goes to the file in one write as it is logged (nothing is held back, so there is
+    /// nothing to flush). Failures are ignored (the file is a convenience, the in-app log
+    /// is the record).
     fn write_log_file(&self, ts: i64, level: LogLevel, job_id: Option<i64>, text: &str) {
-        use std::io::Write;
+        use std::fmt::Write as _;
+        use std::io::Write as _;
+        let mut line = format!("{} {:5}", format::timestamp_utc(ts), level.as_str());
+        if let Some(j) = job_id {
+            let _ = write!(line, " job={j}");
+        }
+        line.push(' ');
+        line.push_str(text);
+        line.push('\n');
         let mut guard = lock(&self.log_file);
-        let path = self.opts.data_dir.join(LOG_FILE_NAME);
         if guard.is_none() {
-            *guard = std::fs::OpenOptions::new().create(true).append(true).open(&path).ok();
+            let path = self.opts.data_dir.join(LOG_FILE_NAME);
+            *guard = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .ok()
+                .map(|file| LogFile { len: file.metadata().map_or(0, |m| m.len()), file });
         }
         let Some(f) = guard.as_mut() else { return };
-        let job = job_id.map(|j| format!(" job={j}")).unwrap_or_default();
-        let _ = writeln!(f, "{} {:5}{job} {text}", format::timestamp_utc(ts), level.as_str());
-        if f.metadata().map(|m| m.len() > LOG_FILE_MAX).unwrap_or(false) {
+        if f.file.write_all(line.as_bytes()).is_err() {
+            // Reopened (and its length read again) on the next line.
             *guard = None;
+            return;
+        }
+        f.len += line.len() as u64;
+        if f.len > LOG_FILE_MAX {
+            *guard = None;
+            let path = self.opts.data_dir.join(LOG_FILE_NAME);
             let _ = std::fs::rename(&path, self.opts.data_dir.join(format!("{LOG_FILE_NAME}.1")));
         }
     }
