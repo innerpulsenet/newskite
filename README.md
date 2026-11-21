@@ -383,10 +383,11 @@ the app, not in the icon. The kit's whole-pixel renders keep the small sizes sha
 - `assets/brand/app-icon-256.png`: the 256 px app icon, a copy of the hicolor render.
 - `packaging/icons/`: the installed app icons and `preview.png`, a contact sheet of every size.
 
-To reinstall the icons from the kit copy (set `BRAND_KIT` to the innerpulse-brand kit to
-refresh that copy first; ImageMagick, when installed, redraws `preview.png`):
+Every icon is checked in, so building and packaging Newskite needs nothing beyond this
+repository. Regenerating them needs the innerpulse brand kit, which is the studio's own and
+is not published; with it at hand (ImageMagick, when installed, redraws `preview.png`):
 
 ```sh
-BRAND_KIT=/path/to/innerpulse-brand node packaging/icons/make-icons.mjs
+BRAND_KIT=/path/to/brand-kit node packaging/icons/make-icons.mjs
 packaging/tests/check-packaging.sh
 ```

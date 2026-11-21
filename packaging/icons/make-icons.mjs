@@ -11,12 +11,13 @@
 //
 // Usage (from anywhere):
 //
-//   BRAND_KIT=/path/to/innerpulse-brand \
+//   BRAND_KIT=/path/to/brand-kit \
 //   NODE_PATH=/path/to/node_modules \
 //   node packaging/icons/make-icons.mjs
 //
-//   BRAND_KIT  the innerpulse-brand skill directory (holds scripts/pulse.mjs).
-//              Default: ~/Documents/innerpulse-brand/innerpulse-brand
+//   BRAND_KIT  the innerpulse brand kit directory (holds scripts/pulse.mjs). Required.
+//              The kit is the studio's own and is not published; the icons it produces
+//              are checked in, so building Newskite never needs it.
 //   NODE_PATH  a node_modules directory that contains sharp (npm i sharp). sharp is the only dependency.
 //
 // Outputs (paths relative to the repository root):
@@ -32,13 +33,16 @@
 
 import { createRequire } from 'node:module';
 import { copyFileSync, mkdirSync, writeFileSync } from 'node:fs';
-import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = resolve(HERE, '../..');
-const KIT = process.env.BRAND_KIT || join(homedir(), 'Documents/innerpulse-brand/innerpulse-brand');
+const KIT = process.env.BRAND_KIT;
+if (!KIT) {
+  console.error('make-icons: set BRAND_KIT to the innerpulse brand kit directory. The kit is not published; the generated icons are checked in.');
+  process.exit(1);
+}
 const { BRAND, MARK, barHeights, barsSVG, iconSVG } = await import(pathToFileURL(join(KIT, 'scripts/pulse.mjs')).href);
 
 // sharp resolves through NODE_PATH, which ESM imports ignore, so load it with require.
