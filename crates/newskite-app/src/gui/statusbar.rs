@@ -1,4 +1,4 @@
-//! Status bar (outline §6.4).
+//! Status bar.
 
 use eframe::egui::{self, Align, Color32, Layout, Pos2, Rect, RichText, Sense, Stroke, Ui, Vec2};
 use newskite_service::JobState;

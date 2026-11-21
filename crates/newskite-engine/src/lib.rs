@@ -1,4 +1,4 @@
-//! Newskite download engine (outline F3).
+//! Newskite download engine.
 //!
 //! [`download`] fetches every segment of an NZB job over NNTP, decodes yEnc and writes each
 //! decoded part at its offset (`begin - 1`) in the output file, so parts may complete in any

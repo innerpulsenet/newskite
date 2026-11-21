@@ -1,4 +1,4 @@
-//! The egui/eframe desktop window (outline §5–§7), branded with the innerpulse kit.
+//! The egui/eframe desktop window, branded with the innerpulse kit.
 //!
 //! Layout, a quiet list: the sidebar (mark, views, watch folder, settings, disk meter) on
 //! the left, the header and job list in the center, the detail pane of the selected job on

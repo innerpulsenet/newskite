@@ -145,7 +145,7 @@ fn y_for(v: f32, rect: Rect, y_max: f32) -> f32 {
 }
 
 /// Evenly spaced points spanning `rect`'s width. One value draws a flat line across the
-/// whole width (outline: a single stored sample must still draw a visible trace); no
+/// whole width (a single stored sample must still draw a visible trace); no
 /// values draw nothing.
 pub fn index_points(values: &[f32], rect: Rect, y_max: f32) -> Vec<Pos2> {
     match values.len() {

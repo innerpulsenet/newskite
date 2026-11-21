@@ -29,7 +29,7 @@ const MISSING_PREVIEW: usize = 3;
 /// Individual fail-over log lines per job before going quiet.
 const FAILOVER_LOG_LIMIT: usize = 5;
 /// Individual "bad article" log lines (undecodable, foreign or invalid ids) per job before
-/// going quiet; a summary line follows at the end of the run (outline §6.3: one line per
+/// going quiet; a summary line follows at the end of the run (one line per
 /// meaningful event, never one per segment).
 const BAD_ARTICLE_LOG_LIMIT: usize = 5;
 /// Upper bound when searching for a free `"name (n).ext"`.

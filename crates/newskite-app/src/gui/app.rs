@@ -22,7 +22,7 @@ use super::settings::{FolderTarget, SettingsDraft};
 use super::theme::{self, Palette};
 use super::{about, disk, docks, fonts, icons, motion, queue, settings, statusbar};
 
-/// How often the job list is re-read while a job is downloading (outline §7).
+/// How often the job list is re-read while a job is downloading.
 pub const JOBS_REFRESH: Duration = Duration::from_millis(1500);
 /// How often the article maps of downloading jobs are read again.
 const MAPS_REFRESH: Duration = Duration::from_millis(200);

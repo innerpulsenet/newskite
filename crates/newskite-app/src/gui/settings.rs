@@ -1,4 +1,4 @@
-//! Settings sheet (outline §6.5, F8): a modal editing a cloned [`Settings`].
+//! Settings sheet: a modal editing a cloned [`Settings`].
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;

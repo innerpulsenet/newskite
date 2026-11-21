@@ -1,4 +1,4 @@
-//! Newskite headless mode (outline F11): download NZBs from the command line with the same
+//! Newskite headless mode: download NZBs from the command line with the same
 //! queue service, engine and database the desktop app uses.
 //!
 //! ```text

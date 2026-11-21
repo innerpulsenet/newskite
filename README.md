@@ -31,9 +31,6 @@ Newskite does not come with a Usenet server subscription, and it does not search
 Usenet: NZB files are the input (open them, drop them on the window, or use a watch folder).
 You need an account with a news provider.
 
-The product specification is in [APP-OUTLINE.md](APP-OUTLINE.md) and the public API of every
-crate is in [docs/CONTRACTS.md](docs/CONTRACTS.md).
-
 ## Screenshots
 
 These are the app's GUI snapshot tests (`crates/newskite-app/tests/snapshots/`), rendered

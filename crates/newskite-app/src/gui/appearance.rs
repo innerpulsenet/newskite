@@ -1,6 +1,5 @@
 //! The Appearance choice (Settings › Appearance): wear one of the innerpulse themes
-//! (carbon, the studio's ground, until the user chooses otherwise) or follow the desktop
-//! (outline F10).
+//! (carbon, the studio's ground, until the user chooses otherwise) or follow the desktop.
 //!
 //! `Settings` belongs to `newskite-types` and is shared with the headless CLI, so the
 //! choice is a GUI preference stored on its own: a small JSON document,

@@ -1,4 +1,4 @@
-//! Post-processing for finished downloads (outline F5): PAR2 verify/repair, archive
+//! Post-processing for finished downloads: PAR2 verify/repair, archive
 //! extraction and cleanup, all in-process: PAR2 through [`newskite_par2`], zip, 7z and RAR
 //! through native backends. No external program is ever started.
 //!

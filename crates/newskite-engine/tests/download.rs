@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 const MIB: usize = 1024 * 1024;
 
-/// Acceptance (outline §12): 2 MiB random file, 8 yEnc parts, auth, real TCP, SHA-256 equal.
+/// Acceptance: 2 MiB random file, 8 yEnc parts, auth, real TCP, SHA-256 equal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn acceptance_two_mib_eight_parts_with_auth() {
     let src = TestFile::new("acc", "payload.bin", random_bytes(2 * MIB, 0xACCE_7713), 8);

@@ -1,4 +1,4 @@
-//! Desktop color tokens for Newskite (outline F10).
+//! Desktop color tokens for Newskite.
 //!
 //! The UI never hard-codes a color: it asks this crate for a [`Theme`], whose [`Tokens`]
 //! are resolved from the desktop in this order:
