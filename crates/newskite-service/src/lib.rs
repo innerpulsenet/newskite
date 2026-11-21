@@ -569,8 +569,7 @@ impl Inner {
             if let Some(existing) = self.store.pending_job_by_source(&path)? {
                 return Err(ServiceError::Duplicate(existing.name));
             }
-            let jobs = self.store.list_jobs()?;
-            let dest_dir = unique_dest(&settings.download_dir, &name, &jobs);
+            let dest_dir = unique_dest(&settings.download_dir, &name, &self.store.dest_dirs()?);
             let job = self.store.insert_job(&newskite_store::NewJob {
                 name: name.clone(),
                 bytes_total: nzb.total_bytes(),
@@ -638,9 +637,9 @@ impl Fingerprint {
 /// the store (whatever its state, compared case-insensitively, since Windows and macOS
 /// treat `Foo` and `foo` as one folder) or already present on disk. So two jobs never
 /// share a folder and post-processing never sees another job's files.
-fn unique_dest(base: &Path, name: &str, jobs: &[Job]) -> PathBuf {
+fn unique_dest(base: &Path, name: &str, used: &[PathBuf]) -> PathBuf {
     let key = |p: &Path| p.to_string_lossy().to_lowercase();
-    let used: HashSet<String> = jobs.iter().map(|j| key(&j.dest_dir)).collect();
+    let used: HashSet<String> = used.iter().map(|p| key(p)).collect();
     let taken = |p: &Path| used.contains(&key(p)) || std::fs::symlink_metadata(p).is_ok();
     let mut candidate = base.join(name);
     let mut n = 2u32;
@@ -1010,7 +1009,8 @@ impl Service {
     pub fn delete_job_files(&self, id: i64) -> Result<Deleted, ServiceError> {
         let result = (|| {
             let job = self.inner.store.get_job(id)?.ok_or(ServiceError::NotFound(id))?;
-            self.delete_files_of(&job, &self.jobs()).map(|d| (job, d))
+            let folders = files::Folders::new(&self.inner.stored_settings().download_dir, &self.jobs());
+            self.delete_files_of(&job, &folders).map(|d| (job, d))
         })();
         match result {
             Ok((job, d)) => {
@@ -1033,10 +1033,11 @@ impl Service {
     /// total deleted.
     pub fn clear_history_and_files(&self) -> (usize, Deleted) {
         let all = self.jobs();
+        let folders = files::Folders::new(&self.inner.stored_settings().download_dir, &all);
         let mut removed = 0;
         let mut total = Deleted::default();
         for job in all.iter().filter(|j| matches!(j.state, JobState::Done | JobState::Failed)) {
-            match self.delete_files_of(job, &all) {
+            match self.delete_files_of(job, &folders) {
                 Ok(d) => {
                     removed += 1;
                     total.files += d.files;
@@ -1063,12 +1064,11 @@ impl Service {
 
     /// Checks, deletes the folder, then removes the row (so a failed deletion keeps the
     /// job visible) and records the source NZB as seen.
-    fn delete_files_of(&self, job: &Job, all: &[Job]) -> Result<Deleted, ServiceError> {
+    fn delete_files_of(&self, job: &Job, folders: &files::Folders) -> Result<Deleted, ServiceError> {
         if !matches!(job.state, JobState::Done | JobState::Failed) || self.inner.lock_state().active_job == Some(job.id) {
             return Err(ServiceError::Other(format!("{} is not finished ({})", job.name, job.state)));
         }
-        let settings = self.settings();
-        if let Some(why) = files::refuse_reason(job, &settings.download_dir, all) {
+        if let Some(why) = folders.refuse_reason(job) {
             return Err(ServiceError::Other(format!("refusing to delete: {why}")));
         }
         let deleted = files::delete_tree(&job.dest_dir)?;

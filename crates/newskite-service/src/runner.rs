@@ -421,7 +421,7 @@ async fn download_job(
     // reported for that. A download that finished anyway goes on to post-processing.
     if let (Some(state), Err(_)) = (stop, &result) {
         *interrupted = true;
-        let _ = inner.store.set_job_state(job.id, state, None);
+        set_state_back(inner, &job, state);
         inner.emit(ServiceEvent::JobsChanged);
         let what = if state == JobState::Paused { "paused" } else { "interrupted" };
         inner.log_job(job.id, LogLevel::Info, format!("{what} {}; completed files are kept", job.name));
@@ -435,7 +435,7 @@ async fn download_job(
         }
         Err(EngineError::Cancelled) => {
             // Only shutdown (or removal, handled above) cancels a job: leave it resumable.
-            let _ = inner.store.set_job_state(job.id, JobState::Queued, None);
+            set_state_back(inner, &job, JobState::Queued);
             inner.emit(ServiceEvent::JobsChanged);
             inner.log_job(job.id, LogLevel::Info, format!("interrupted {}; it will resume on the next start", job.name));
             Some(End::Shutdown)
@@ -492,7 +492,7 @@ async fn download_job(
             Some(End::Stopped)
         }
         Err(EngineError::NoServer) => {
-            let _ = inner.store.set_job_state(job.id, JobState::Queued, None);
+            set_state_back(inner, &job, JobState::Queued);
             inner.emit(ServiceEvent::JobsChanged);
             Some(End::NoServer)
         }
@@ -983,6 +983,16 @@ fn verify_done_files(dest: &Path, done: Vec<JobFile>) -> (Vec<JobFile>, Vec<Stri
         }
     }
     (keep, notes)
+}
+
+/// Puts a job that stopped without finishing back to `state` (`queued` or `paused`). A
+/// failure is logged: the row would stay `downloading`, which no run picks up again
+/// until the next start of the program.
+fn set_state_back(inner: &Inner, job: &Job, state: JobState) {
+    match inner.store.set_job_state(job.id, state, None) {
+        Ok(()) | Err(StoreError::NotFound) => {}
+        Err(e) => inner.log_job(job.id, LogLevel::Error, format!("could not set {} back to {state}: {e}", job.name)),
+    }
 }
 
 fn upsert_file(inner: &Inner, job_id: i64, name: &str, bytes_total: u64, bytes_done: u64, state: &str) {
