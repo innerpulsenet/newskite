@@ -695,7 +695,7 @@ mod tests {
             x ^= u16::from(std::hint::black_box(MulTable::new(c as u16)).nib[1][3]);
         }
         println!("MulTable::new: {:.0} ns ({x})", t0.elapsed().as_secs_f64() / 1e5 * 1e9);
-        for n in [100, 300, 600] {
+        for n in [100, 300, 1000] {
             let m = par2_matrix(n, 0);
             let t0 = Instant::now();
             let a = invert_reference(&m, n);
