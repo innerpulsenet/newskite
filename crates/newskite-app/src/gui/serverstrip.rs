@@ -114,7 +114,7 @@ pub fn failed_jobs(data: &Data) -> Vec<&Job> {
 /// Plain-language account of what a backup retry does, for buttons' tooltips.
 pub fn backup_retry_explainer(servers: &[ServerConfig]) -> String {
     match servers {
-        [] | [_] => "No fail-over server is configured. Add a second server in Settings › Servers to retry on a backup.".into(),
+        [] | [_] => "No fail-over server is configured. Add a second server in Settings › Connection to retry on a backup.".into(),
         [primary, backups @ ..] => {
             let names: Vec<String> = backups.iter().map(ServerConfig::address).collect();
             format!(

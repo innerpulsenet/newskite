@@ -55,7 +55,7 @@ impl FailureKind {
             FailureKind::Unrepairable => {
                 "More is missing than the recovery data can rebuild, so the download was stopped. Add a backup server on another provider, or find another NZB of this release."
             }
-            FailureKind::Auth => "Check the user name and password in Settings › Servers, then retry.",
+            FailureKind::Auth => "Check the user name and password in Settings › Connection, then retry.",
             FailureKind::Connection => "Check the network and the server address, then retry.",
             FailureKind::Disk => "Check free space and permissions of the download folder, then retry.",
             FailureKind::Repair => "There is not enough recovery data. Another NZB of the same release may have more.",

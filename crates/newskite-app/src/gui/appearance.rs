@@ -88,13 +88,36 @@ pub fn load(path: &Path) -> Appearance {
         .unwrap_or_default()
 }
 
-/// Writes the choice to `path` atomically (temp file + rename).
-pub fn save(path: &Path, a: Appearance) -> std::io::Result<()> {
+/// Whether the document at `path` asks for reduced motion (`"reduce_motion": true`;
+/// `false` when missing or unreadable). The desktop's own preference is read elsewhere
+/// (see [`super::motion`]); either one is enough to still the window.
+pub fn load_reduce_motion(path: &Path) -> bool {
+    std::fs::read_to_string(path).ok().is_some_and(|t| reduce_motion_from_json(&t))
+}
+
+fn reduce_motion_from_json(text: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .and_then(|v| v.get("reduce_motion")?.as_bool())
+        .unwrap_or(false)
+}
+
+/// The JSON document for a theme choice and the Reduce motion switch.
+pub fn document(a: Appearance, reduce_motion: bool) -> String {
+    if reduce_motion {
+        serde_json::json!({ "theme": a.key(), "reduce_motion": true }).to_string()
+    } else {
+        a.to_json()
+    }
+}
+
+/// Writes the choices to `path` atomically (temp file + rename).
+pub fn save(path: &Path, a: Appearance, reduce_motion: bool) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, a.to_json())?;
+    std::fs::write(&tmp, document(a, reduce_motion))?;
     std::fs::rename(&tmp, path)
 }
 
@@ -113,8 +136,13 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let p = dir.path().join("sub").join(FILE_NAME);
         assert_eq!(load(&p), Appearance::FollowDesktop, "missing file");
-        save(&p, Appearance::Paper).expect("save");
+        assert!(!load_reduce_motion(&p), "missing file");
+        save(&p, Appearance::Paper, false).expect("save");
         assert_eq!(load(&p), Appearance::Paper);
+        assert!(!load_reduce_motion(&p));
+        save(&p, Appearance::Ink, true).expect("save");
+        assert_eq!(load(&p), Appearance::Ink);
+        assert!(load_reduce_motion(&p));
         std::fs::write(&p, "garbage").expect("write");
         assert_eq!(load(&p), Appearance::FollowDesktop, "unreadable file");
     }

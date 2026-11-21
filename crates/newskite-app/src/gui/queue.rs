@@ -32,6 +32,8 @@ pub fn eta_secs(remaining: u64, speed_bps: u64) -> Option<u64> {
 
 /// Exact empty-state text of the Queue tab.
 pub const EMPTY_QUEUE: &str = "The queue is empty. Add an NZB to begin.";
+/// Exact empty-state text of the Queue tab before any server is set up.
+pub const EMPTY_FIRST_RUN: &str = "Set up your news server to begin.";
 /// Exact empty-state text of the History tab.
 pub const EMPTY_HISTORY: &str = "Nothing has finished yet.";
 
@@ -53,6 +55,12 @@ pub struct QueueState {
     pub confirm_clear_files: bool,
     /// Job whose archive password is being edited, with the text typed so far.
     pub password_edit: Option<(i64, String)>,
+    /// The job whose password editor already took the keyboard (it asks once, on opening).
+    pub password_focused: Option<i64>,
+    /// The password being typed shows in clear.
+    pub password_shown: bool,
+    /// Height of the row measured last: what a row off screen is taken to be.
+    pub row_h: Option<f32>,
     /// Focus the filter field next frame (Ctrl+F).
     pub focus_filter: bool,
     /// Most recently imported job (briefly highlighted).
@@ -241,7 +249,7 @@ pub(crate) fn filter_box(ui: &mut Ui, pal: &Palette, view: &mut ViewState) {
         &mut view.queue.focus_filter,
         "job-filter",
         "Filter by name",
-        "Show only jobs whose name contains this text (Ctrl+F)",
+        &format!("Show only jobs whose name contains this text ({}+F)", super::widgets::CMD_KEY),
     );
 }
 
@@ -301,10 +309,11 @@ pub(crate) fn empty_queue(
     view: &ViewState,
     actions: &mut Vec<Action>,
 ) {
-    let ambient = Beat::ambient(ui.ctx(), view.reduced_motion, brand::PERIOD_AMBIENT * 2.0);
     ui.add_space(24.0);
-    // A drop zone: a dashed, rounded frame whose dashes drift slowly around it.
-    let finished = data.history().len();
+    // A drop zone: a dashed, rounded frame whose dashes drift slowly around it while the
+    // pointer is over it (an idle window stays still, and costs nothing).
+    let finished = data.finished_count();
+    let first_run = data.settings.first_usable_server().is_none();
     let zone_w = (ui.available_width() - 48.0).clamp(280.0, 580.0);
     let zone_h = if finished > 0 { 286.0 } else { 256.0 };
     let zone = egui::Rect::from_center_size(
@@ -312,6 +321,7 @@ pub(crate) fn empty_queue(
         egui::vec2(zone_w, zone_h),
     );
     ui.allocate_rect(zone, Sense::hover());
+    let ambient = zone_beat(ui, zone, view.reduced_motion);
     ui.painter().rect_filled(zone, egui::CornerRadius::same(16), Palette::fade(pal.raised, 0.55));
     let drift = if ambient.moving { ambient.phase * 22.0 } else { 0.0 };
     ui.painter().extend(egui::Shape::dashed_line_with_offset(
@@ -330,30 +340,53 @@ pub(crate) fn empty_queue(
     {
         article_grid(ui, pal, ambient.moving.then_some(ambient.phase));
         ui.add_space(20.0);
-        ui.label(RichText::new(EMPTY_QUEUE).font(fonts::semibold_id(15.5)).color(pal.text));
-        ui.add_space(5.0);
-        ui.label(
-            RichText::new("Drop .nzb files onto the window, or set a watch folder in Settings.")
-                .small()
-                .color(pal.muted),
-        );
-        ui.add_space(16.0);
-        if kit_button(
-            ui,
-            pal,
-            ButtonKind::Primary,
-            Some(Icon::OpenNzb),
-            "Add NZB…",
-            !view.dialog_open,
-        )
-        .on_hover_text("Choose NZB files (Ctrl+O)")
-        .clicked()
-        {
-            actions.push(Action::BrowseNzb);
+        let cmd = super::widgets::CMD_KEY;
+        let browse_tip = format!("Choose NZB files ({cmd}+O)");
+        if first_run {
+            // Nothing can download yet: the server comes first, the NZB second.
+            ui.label(RichText::new(EMPTY_FIRST_RUN).font(fonts::semibold_id(15.5)).color(pal.text));
+            ui.add_space(5.0);
+            ui.label(
+                RichText::new("Newskite downloads from your Usenet provider. Add its address and sign-in, then an NZB.")
+                    .small()
+                    .color(pal.muted),
+            );
+            ui.add_space(16.0);
+            let w = kit_width(ui, pal, Some(Icon::Gear), "Set up server…") + 8.0 + kit_width(ui, pal, Some(Icon::OpenNzb), "Add NZB…");
+            ui.allocate_ui_with_layout(egui::vec2(w, 30.0), Layout::left_to_right(Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                if kit_button(ui, pal, ButtonKind::Primary, Some(Icon::Gear), "Set up server…", true)
+                    .on_hover_text(format!("Open Settings ({cmd}+,)"))
+                    .clicked()
+                {
+                    actions.push(Action::OpenSettings);
+                }
+                if kit_button(ui, pal, ButtonKind::Outline, Some(Icon::OpenNzb), "Add NZB…", !view.dialog_open)
+                    .on_hover_text(browse_tip.as_str())
+                    .clicked()
+                {
+                    actions.push(Action::BrowseNzb);
+                }
+            });
+        } else {
+            ui.label(RichText::new(EMPTY_QUEUE).font(fonts::semibold_id(15.5)).color(pal.text));
+            ui.add_space(5.0);
+            ui.label(
+                RichText::new("Drop .nzb files onto the window, or set a watch folder in Settings.")
+                    .small()
+                    .color(pal.muted),
+            );
+            ui.add_space(16.0);
+            if kit_button(ui, pal, ButtonKind::Primary, Some(Icon::OpenNzb), "Add NZB…", !view.dialog_open)
+                .on_hover_text(browse_tip.as_str())
+                .clicked()
+            {
+                actions.push(Action::BrowseNzb);
+            }
         }
         ui.add_space(14.0);
         // Keyboard hints, centered under the call to action.
-        let hints: [(&[&str], &str); 2] = [(&["Ctrl", "O"], "browse"), (&["Ctrl", "V"], "paste copied files")];
+        let hints: [(&[&str], &str); 2] = [(&[cmd, "O"], "browse"), (&[cmd, "V"], "paste copied files")];
         let font = egui::TextStyle::Small.resolve(ui.style());
         let row_w: f32 = hints
             .iter()
@@ -395,6 +428,26 @@ pub(crate) fn empty_queue(
     }
 }
 
+/// The empty queue's ambient beat: its clock only runs while the pointer is over `zone`,
+/// so the dashes drift on from where they stopped and an idle window asks for no frames.
+fn zone_beat(ui: &Ui, zone: egui::Rect, reduced_motion: bool) -> Beat {
+    let id = egui::Id::new("empty-zone-clock");
+    let mut clock = ui.data(|d| d.get_temp::<f64>(id)).unwrap_or(0.0);
+    if !reduced_motion && ui.rect_contains_pointer(zone) {
+        clock += f64::from(ui.input(|i| i.stable_dt).min(0.1));
+        ui.data_mut(|d| d.insert_temp(id, clock));
+        ui.ctx().request_repaint_after(super::motion::AMBIENT_FRAME);
+    }
+    Beat::at(clock, true, reduced_motion, brand::PERIOD_AMBIENT * 2.0)
+}
+
+/// Width a [`kit_button`] with this icon and label takes.
+fn kit_width(ui: &Ui, pal: &Palette, icon: Option<Icon>, text: &str) -> f32 {
+    let font = fonts::semibold_id(12.0);
+    let label = ui.painter().layout_job(super::widgets::spaced(&text.to_uppercase(), font, pal.text, 0.72)).size().x;
+    label + if icon.is_some() { 23.0 } else { 0.0 } + 28.0
+}
+
 /// Points around `rect` with corners of `radius`, closed (for dashed outlines).
 pub(crate) fn rounded_outline(rect: egui::Rect, radius: f32) -> Vec<egui::Pos2> {
     const STEPS: usize = 6;
@@ -416,14 +469,32 @@ pub(crate) fn rounded_outline(rect: egui::Rect, radius: f32) -> Vec<egui::Pos2> 
     pts
 }
 
-pub(crate) fn no_match(ui: &mut Ui, pal: &Palette, filter: &str) {
+/// What an empty filtered list says: the search that matched nothing, or the state
+/// filter that has no jobs.
+pub fn no_match_text(filter: &str, list: super::center::ListFilter) -> String {
+    use super::center::ListFilter;
+    let f = filter.trim();
+    match (f.is_empty(), list) {
+        (true, ListFilter::Active) => "No active jobs.".to_owned(),
+        (true, ListFilter::Held) => "No held jobs.".to_owned(),
+        (true, ListFilter::All) => "No jobs.".to_owned(),
+        (false, ListFilter::Active) => format!("No active jobs match “{f}”."),
+        (false, ListFilter::Held) => format!("No held jobs match “{f}”."),
+        (false, ListFilter::All) => format!("No jobs match “{f}”."),
+    }
+}
+
+/// The empty filtered list: what matched nothing, and a way back to every job.
+pub(crate) fn no_match(ui: &mut Ui, pal: &Palette, view: &mut ViewState, list: super::center::ListFilter) {
     ui.add_space(24.0);
     ui.vertical_centered(|ui| {
-        ui.label(
-            RichText::new(format!("No jobs match “{}”.", filter.trim()))
-                .size(14.0)
-                .color(pal.muted),
-        );
+        ui.label(RichText::new(no_match_text(&view.filter, list)).size(14.0).color(pal.muted));
+        ui.add_space(6.0);
+        let label = if list == super::center::ListFilter::All { "Clear filter" } else { "Show all jobs" };
+        if kit_button(ui, pal, ButtonKind::Text, None, label, true).clicked() {
+            view.filter.clear();
+            view.list_filter = super::center::ListFilter::All;
+        }
     });
 }
 
@@ -495,8 +566,15 @@ pub(crate) fn inline_editors(
     q: &mut super::queue::QueueState,
     actions: &mut Vec<Action>,
 ) -> bool {
+    if q.password_edit.is_none() {
+        q.password_focused = None;
+        q.password_shown = false;
+    }
+    let take_focus = q.password_focused != Some(job.id);
+    let shown = &mut q.password_shown;
     if let Some((id, text)) = q.password_edit.as_mut() {
         if *id == job.id {
+            q.password_focused = Some(job.id);
             // Right to left, so the field takes the box's width after Save and Cancel.
             let (save, cancel, enter) = ui
                 .allocate_ui_with_layout(
@@ -506,12 +584,21 @@ pub(crate) fn inline_editors(
                         ui.spacing_mut().item_spacing.x = 6.0;
                         let cancel = icon_button(ui, pal, Icon::Close, pal.muted, "Cancel").clicked();
                         let save = compact_button(ui, pal, ButtonKind::Outline, "Save", true).clicked();
+                        if compact_button(ui, pal, ButtonKind::Text, if *shown { "Hide" } else { "Show" }, true)
+                            .on_hover_text(if *shown { "Hide the password" } else { "Show the password to check it" })
+                            .clicked()
+                        {
+                            *shown = !*shown;
+                        }
                         let resp = ui.add(
                             TextEdit::singleline(text)
-                                .password(true)
+                                .password(!*shown)
                                 .hint_text("Archive password")
                                 .desired_width(ui.available_width()),
                         );
+                        if take_focus {
+                            resp.request_focus();
+                        }
                         (save, cancel, resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
                     },
                 )
@@ -634,8 +721,8 @@ pub(crate) fn history_actions(
         }
         let servers = data.settings.usable_servers();
         let tip = format!("Retry on the backup server: {}", super::serverstrip::backup_retry_explainer(&servers));
-        let color = if servers.len() >= 2 { pal.accent_fg } else { pal.faint };
-        let r = icon_button(ui, pal, Icon::RetryBackup, color, &tip);
+        let ok = servers.len() >= 2;
+        let r = icon_button_enabled(ui, pal, Icon::RetryBackup, if ok { pal.accent_fg } else { pal.muted }, &tip, ok);
         if r.clicked() && servers.len() >= 2 {
             actions.push(Action::RetryOnBackup(job.id));
         }

@@ -136,6 +136,16 @@ pub fn show(ctx: &egui::Context, pal: &Palette, toasts: &mut Vec<Toast>, bottom:
                                 actions.push(Action::ShowJob(t.job_id));
                                 actions.push(Action::DismissToast(t.id));
                             }
+                            if t.ok {
+                                let folder = ui
+                                    .add(egui::Label::new(RichText::new("Folder").small().color(pal.accent_fg)).extend().sense(Sense::click()))
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                    .on_hover_text("Open the download folder");
+                                if folder.clicked() {
+                                    actions.push(Action::OpenJobFolder(t.job_id));
+                                    actions.push(Action::DismissToast(t.id));
+                                }
+                            }
                         });
                     });
                 })
