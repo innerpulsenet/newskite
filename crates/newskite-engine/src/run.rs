@@ -1262,11 +1262,9 @@ fn resolve_output(shared: &Shared, fi: usize, first: Option<&YencPart>, create: 
         .filter(|n| !n.trim().is_empty())
         .map(sanitize_filename)
         .unwrap_or_else(|| file.label.clone());
-    let mut claimed = lock(&shared.claimed);
 
     if let Some(part) = first {
-        if let Some((name, existing)) = completed_earlier(shared, &claimed, &base, part) {
-            claimed.insert(claim_key(&name));
+        if let Some((name, existing)) = completed_earlier(shared, &base, part) {
             return Ok(Output {
                 name,
                 part_path: part_path(&existing),
@@ -1276,6 +1274,7 @@ fn resolve_output(shared: &Shared, fi: usize, first: Option<&YencPart>, create: 
             });
         }
     }
+    let mut claimed = lock(&shared.claimed);
     let (name, final_path) = free_name(shared, &mut claimed, &base)?;
     drop(claimed);
     let part = part_path(&final_path);
@@ -1342,24 +1341,32 @@ fn resume_candidates(dir: &Path) -> Vec<OnDisk> {
 /// for each other, and finds outputs an earlier run saved under a numbered name. Failing
 /// that, any other file of the folder with that content (see [`resume_candidates`]): a
 /// file post-processing moved to its real name (obfuscated posts), or one renamed by hand.
-fn completed_earlier(
-    shared: &Shared,
-    claimed: &HashSet<String>,
-    base: &str,
-    part: &YencPart,
-) -> Option<(String, PathBuf)> {
-    let mut candidates: Vec<(u32, &String)> =
-        shared.skip_files.iter().filter_map(|s| suffix_number(s, base).map(|n| (n, s))).collect();
-    candidates.sort();
-    let by_name = candidates.into_iter().map(|(_, name)| name);
-    let by_content = shared.on_disk.iter().filter(|(_, len)| *len == part.size).map(|(name, _)| name);
-    by_name.chain(by_content).find_map(|name| {
-        if claimed.contains(&claim_key(name)) {
-            return None;
+/// The match is claimed. The files are read without holding the claims, so other workers
+/// deciding their outputs are not held up; a match another file claimed meanwhile is
+/// passed over and the search repeated without it.
+fn completed_earlier(shared: &Shared, base: &str, part: &YencPart) -> Option<(String, PathBuf)> {
+    loop {
+        let candidates: Vec<&String> = {
+            let claimed = lock(&shared.claimed);
+            let mut by_name: Vec<(u32, &String)> =
+                shared.skip_files.iter().filter_map(|s| suffix_number(s, base).map(|n| (n, s))).collect();
+            by_name.sort();
+            let by_content = shared.on_disk.iter().filter(|(_, len)| *len == part.size).map(|(name, _)| name);
+            by_name
+                .into_iter()
+                .map(|(_, name)| name)
+                .chain(by_content)
+                .filter(|name| !claimed.contains(&claim_key(name)))
+                .collect()
+        };
+        let (name, path) = candidates.into_iter().find_map(|name| {
+            let path = shared.dest_dir.join(name);
+            (path.parent() == Some(shared.dest_dir.as_path()) && holds_part(&path, part)).then(|| (name.clone(), path))
+        })?;
+        if lock(&shared.claimed).insert(claim_key(&name)) {
+            return Some((name, path));
         }
-        let path = shared.dest_dir.join(name);
-        (path.parent() == Some(shared.dest_dir.as_path()) && holds_part(&path, part)).then(|| (name.clone(), path))
-    })
+    }
 }
 
 /// Blocking: whether the regular file at `path` is `part.size` bytes long and holds the

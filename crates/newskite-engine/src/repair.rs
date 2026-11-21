@@ -76,8 +76,16 @@ struct FileInfo {
     /// Segment numbers and encoded sizes, in segment order.
     numbers: Vec<u32>,
     encoded: Vec<u64>,
+    /// Sums of `encoded`: all articles, and those not damaged (kept as articles fail).
+    total_encoded: u128,
+    intact_encoded: u128,
     /// yEnc `name=` and `size=` of the file's parts.
     yenc: Option<(String, u64)>,
+    /// Derived from [`FileInfo::names`] (see [`FileInfo::refresh_names`]): their lowercased
+    /// base names, whether one is a `.par2` name, and the first `.volNN+MM` block count.
+    keys: Vec<String>,
+    par2_name: bool,
+    vol: Option<u64>,
     head: Option<Head>,
     /// Bytes per article (every article but the last), from a decoded part; 0 = unknown.
     part_len: u64,
@@ -96,13 +104,22 @@ impl FileInfo {
         std::iter::once(self.label.as_str()).chain(self.yenc.as_ref().map(|(n, _)| n.as_str()))
     }
 
+    fn refresh_names(&mut self) {
+        let (keys, par2_name, vol) = (
+            self.names().map(base_name).collect(),
+            self.names().any(is_par2_name),
+            self.names().find_map(vol_blocks),
+        );
+        (self.keys, self.par2_name, self.vol) = (keys, par2_name, vol);
+    }
+
     /// Encoded bytes of the articles that arrived intact or are still to come.
     fn intact_encoded(&self) -> u64 {
-        self.encoded.iter().zip(&self.damaged).filter(|(_, &d)| !d).map(|(&b, _)| b).fold(0, u64::saturating_add)
+        u64::try_from(self.intact_encoded).unwrap_or(u64::MAX)
     }
 
     fn total_encoded(&self) -> u64 {
-        self.encoded.iter().fold(0, |a, &b| a.saturating_add(b))
+        u64::try_from(self.total_encoded).unwrap_or(u64::MAX)
     }
 
     /// Byte range of article `si` when the article length is known.
@@ -146,7 +163,8 @@ impl FileInfo {
 }
 
 pub(crate) fn is_par2_name(name: &str) -> bool {
-    name.to_ascii_lowercase().ends_with(".par2")
+    let b = name.as_bytes();
+    b.len() >= 5 && b[b.len() - 5..].eq_ignore_ascii_case(b".par2")
 }
 
 /// The block count in a `name.vol012+08.par2` style name.
@@ -179,11 +197,18 @@ impl Tracker {
             .into_iter()
             .map(|(label, numbers, encoded)| {
                 let n = numbers.len();
-                FileInfo {
+                let encoded: Vec<u64> = encoded.into_iter().map(|b| if b > 0 { b } else { unknown_bytes }).collect();
+                let total: u128 = encoded.iter().map(|&b| u128::from(b)).sum();
+                let mut f = FileInfo {
                     label,
                     numbers,
-                    encoded: encoded.into_iter().map(|b| if b > 0 { b } else { unknown_bytes }).collect(),
+                    encoded,
+                    total_encoded: total,
+                    intact_encoded: total,
                     yenc: None,
+                    keys: Vec::new(),
+                    par2_name: false,
+                    vol: None,
                     head: None,
                     part_len: 0,
                     irregular: false,
@@ -191,7 +216,9 @@ impl Tracker {
                     damaged_count: 0,
                     read: None,
                     slices: None,
-                }
+                };
+                f.refresh_names();
+                f
             })
             .collect();
         Self { files, sets: Vec::new(), last: None }
@@ -205,6 +232,7 @@ impl Tracker {
         let mut changed = false;
         if f.yenc.is_none() {
             f.yenc = Some((name.to_string(), size));
+            f.refresh_names();
             changed = true;
         }
         if f.head.is_none() && head.is_some() {
@@ -230,7 +258,10 @@ impl Tracker {
     /// File `fi` was found complete on disk from an earlier run.
     pub(crate) fn note_complete(&mut self, fi: usize, len: u64, head: Option<Head>) {
         if let Some(f) = self.files.get_mut(fi) {
-            f.yenc.get_or_insert_with(|| (f.label.clone(), len));
+            if f.yenc.is_none() {
+                f.yenc = Some((f.label.clone(), len));
+                f.refresh_names();
+            }
             f.head = f.head.or(head);
         }
     }
@@ -243,13 +274,14 @@ impl Tracker {
             _ => return false,
         }
         f.damaged_count += 1;
+        f.intact_encoded = f.intact_encoded.saturating_sub(u128::from(f.encoded.get(si).copied().unwrap_or(0)));
         f.add_slices(si);
         true
     }
 
     /// Whether file `fi` is (or may be) PAR2 and is worth reading once complete.
     pub(crate) fn is_par2(&self, fi: usize) -> bool {
-        self.files.get(fi).is_some_and(|f| f.names().any(is_par2_name) || f.head.is_some_and(|h| h.magic))
+        self.files.get(fi).is_some_and(|f| f.par2_name || f.head.is_some_and(|h| h.magic))
     }
 
     /// File `fi` was read as PAR2: `sets` are the recovery sets found in it.
@@ -272,11 +304,11 @@ impl Tracker {
     }
 
     fn role(&self, f: &FileInfo) -> Role {
-        if f.read.is_some() || f.names().any(is_par2_name) || f.head.is_some_and(|h| h.magic) {
+        if f.read.is_some() || f.par2_name || f.head.is_some_and(|h| h.magic) {
             return Role::Par2;
         }
         for (i, set) in self.sets.iter().enumerate() {
-            if let Some(&len) = f.names().find_map(|n| set.by_name.get(&base_name(n))) {
+            if let Some(&len) = f.keys.iter().find_map(|k| set.by_name.get(k)) {
                 return Role::Data { set: i, len };
             }
         }
@@ -314,12 +346,12 @@ impl Tracker {
                     (Role::Par2, Some(read)) => {
                         // A damaged volume reads fewer blocks than its name says were posted.
                         let n = read.get(&set.id).copied().unwrap_or(0);
-                        posted += f.names().find_map(vol_blocks).map_or(n, |named| named.max(n));
+                        posted += f.vol.map_or(n, |named| named.max(n));
                         available += n;
                     }
                     (Role::Par2, None) => {
                         let fits = f.intact_encoded() / block;
-                        let named = f.names().find_map(vol_blocks);
+                        let named = f.vol;
                         posted += named.unwrap_or(f.total_encoded() / block);
                         available += named.map_or(fits, |n| n.min(fits));
                     }
@@ -401,6 +433,20 @@ mod tests {
         assert_eq!(vol_blocks("a.vol3-7.par2"), Some(7));
         assert_eq!(vol_blocks("a.par2"), None);
         assert_eq!(vol_blocks("a.volume.par2"), None);
+    }
+
+    #[test]
+    fn par2_names_and_encoded_sums() {
+        assert!(is_par2_name("a.PAR2") && is_par2_name("é.vol0+1.par2") && is_par2_name(".par2"));
+        assert!(!is_par2_name("a.par") && !is_par2_name("par2") && !is_par2_name("a.par2.rar"));
+        // Sums saturate as the old per-call fold did; damage is subtracted once.
+        let mut t = Tracker::new(vec![("x".into(), vec![1, 2, 3], vec![u64::MAX, 5, 7])], 0);
+        assert_eq!((t.files[0].total_encoded(), t.files[0].intact_encoded()), (u64::MAX, u64::MAX));
+        t.note_damaged(0, 0);
+        t.note_damaged(0, 0);
+        assert_eq!(t.files[0].intact_encoded(), 12);
+        t.note_damaged(0, 9);
+        assert_eq!(t.files[0].intact_encoded(), 12);
     }
 
     #[test]
@@ -504,6 +550,33 @@ mod tests {
         t.note_damaged(1, 0);
         t.note_damaged(1, 1);
         assert_eq!(t.outlook().needed, 1, "all of b.rar's slices");
+    }
+
+    /// Outlook cost on a large job where every article goes missing (each one recomputes
+    /// the outlook under the job's lock; not run by default):
+    /// `cargo test --release -p newskite-engine outlook_throughput -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn outlook_throughput() {
+        // 200 data files of 700 articles, 30 recovery volumes still downloading and 20
+        // obfuscated files not identified yet.
+        let mut files: Vec<_> = (0..200).map(|i| file(&format!("Movie.Part{i:03}.rar"), 700, 790_000)).collect();
+        files.extend((0..30).map(|i| file(&format!("Movie.vol{i:03}+10.par2"), 100, 790_000)));
+        files.extend((0..20).map(|i| file(&format!("{i:032x}"), 700, 790_000)));
+        let mut t = Tracker::new(files, 0);
+        let names: Vec<String> = (0..200).map(|i| format!("Movie.Part{i:03}.rar")).collect();
+        let entries: Vec<(&str, u64)> = names.iter().map(|n| (n.as_str(), 700 * S)).collect();
+        t.note_par2(200, &[set(1, &entries, 0)]);
+        let started = std::time::Instant::now();
+        let mut calls = 0;
+        for fi in 0..20 {
+            for si in 0..700 {
+                t.note_damaged(fi, si);
+                std::hint::black_box(t.outlook());
+                calls += 1;
+            }
+        }
+        println!("outlook: {:.1} us per call", started.elapsed().as_secs_f64() * 1e6 / calls as f64);
     }
 
     #[test]
