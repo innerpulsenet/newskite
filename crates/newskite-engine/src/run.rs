@@ -202,6 +202,8 @@ struct Shared {
     stop_unrepairable: bool,
     /// Complete files in `dest_dir` when the run started (see [`resume_candidates`]).
     on_disk: Vec<OnDisk>,
+    /// Files being finalized (see [`finish_segment`]); drained by [`run`] before it reports.
+    finalizing: Mutex<JoinSet<()>>,
 }
 
 impl Shared {
@@ -523,6 +525,7 @@ pub(crate) async fn run(
         repair: Mutex::new(tracker),
         stop_unrepairable: options.stop_unrepairable,
         on_disk,
+        finalizing: Mutex::new(JoinSet::new()),
     });
 
     // A new job tries every server again; earlier login failures stay in last_error.
@@ -575,6 +578,14 @@ pub(crate) async fn run(
     while let Some(res) = set.join_next().await {
         if let Err(e) = res {
             shared.fail(EngineError::Io(io::Error::other(format!("download worker failed: {e}"))));
+        }
+    }
+    // Every file whose last segment was processed finishes (flushed, renamed, reported)
+    // before the run does, cancelled or not; no worker is left to start another.
+    let mut finalizing = std::mem::take(&mut *lock(&shared.finalizing));
+    while let Some(res) = finalizing.join_next().await {
+        if let Err(e) = res {
+            shared.fail(EngineError::Io(io::Error::other(format!("finishing a file failed: {e}"))));
         }
     }
 
@@ -1185,7 +1196,9 @@ async fn store_part(shared: &Arc<Shared>, fi: usize, si: usize, decoded: Decoded
 }
 
 /// Counts processed segment `si` of file `fi`, emits `SegmentDone` for stored ones and
-/// finalizes the file after its last segment.
+/// finalizes the file after its last segment. Finalizing (flushing the data to disk, the
+/// rename, reading a PAR2 file) runs as a task of its own so the worker's connection goes
+/// on fetching meanwhile; [`run`] waits for it, and a failure stops the job as before.
 async fn finish_segment(shared: &Arc<Shared>, fi: usize, si: usize, stored: Option<(&str, u64)>) -> Flow {
     let file = &shared.files[fi];
     let total = file.segments.len();
@@ -1206,10 +1219,12 @@ async fn finish_segment(shared: &Arc<Shared>, fi: usize, si: usize, stored: Opti
     };
     shared.progress.segments_done.fetch_add(1, Ordering::Relaxed);
     if done == total {
-        if let Err(e) = finalize(shared, fi).await {
-            shared.fail(EngineError::Io(e));
-            return Flow::Stop;
-        }
+        let s = shared.clone();
+        lock(&shared.finalizing).spawn(async move {
+            if let Err(e) = finalize(&s, fi).await {
+                s.fail(EngineError::Io(e));
+            }
+        });
     }
     Flow::Continue
 }
@@ -1516,6 +1531,7 @@ mod tests {
             repair: Mutex::new(Tracker::new(Vec::new(), 0)),
             stop_unrepairable: false,
             on_disk: Vec::new(),
+            finalizing: Mutex::new(JoinSet::new()),
         };
         let ids: Vec<String> = (1..=5).map(|i| format!("id{i}@x")).collect();
         fail_file(&shared, "f.bin", &ids);
@@ -1551,6 +1567,7 @@ mod tests {
             repair: Mutex::new(Tracker::new(Vec::new(), 0)),
             stop_unrepairable: false,
             on_disk: Vec::new(),
+            finalizing: Mutex::new(JoinSet::new()),
         };
         for i in 0..60 {
             shared.log_bad_article(&format!("f.bin: article <{i}@x> could not be decoded"));
@@ -1593,6 +1610,7 @@ mod tests {
             repair: Mutex::new(Tracker::new(Vec::new(), 0)),
             stop_unrepairable: false,
             on_disk: Vec::new(),
+            finalizing: Mutex::new(JoinSet::new()),
         };
         assert_eq!(shared.order(&[false, false, false], 0), vec![0, 1, 2]);
         assert_eq!(shared.order(&[false, false, false], 2), vec![2, 0, 1]);
