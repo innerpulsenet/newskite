@@ -1,6 +1,6 @@
 ; Inno Setup script for the Newskite Windows installer.
 ;
-;   iscc /DAppVersion=0.9.0 /DSourceDir=C:\path\to\stage /DOutputDir=C:\path\to\out
+;   iscc /DAppVersion=1.5.0 /DSourceDir=C:\path\to\stage /DOutputDir=C:\path\to\out
 ;        [/DIconFile=C:\path\to\newskite.ico] packaging\windows\newskite.iss
 ;
 ; SourceDir holds newskite.exe, README.md, copyright.txt and fonts-OFL.txt (the release

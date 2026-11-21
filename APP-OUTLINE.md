@@ -232,8 +232,16 @@ Rules:
 - Drag a row to another place in the queue: an accent line shows where it will land, and
   Esc cancels. Rows hidden by the filter keep their places next to their visible neighbors.
 - Click selects a row (the detail pane opens). Keys on the selection: Space toggles, Delete
-  asks to remove, Alt+↑/↓ move, Esc clears; ↑/↓ and Home/End walk the rows on screen (the
-  chosen row scrolls into view). Ctrl+F focuses the filter.
+  asks to remove (Enter confirms), Alt+↑/↓ move, Esc clears; ↑/↓ and Home/End walk the rows on
+  screen (the chosen row scrolls into view). Ctrl+F focuses the filter; Ctrl+1/2/3 switch to
+  Queue, History and Log. Esc closes one thing at a time, innermost first (dialog, drag, inline
+  editor or confirmation, the Add NZB field, then the selection), and the window's shortcuts
+  rest while a dialog is open.
+- Before a server is set up, the empty queue leads with **Set up server** (Add NZB second) and
+  Start is unavailable. An empty Active or Held filter says which one is empty and offers the
+  way back to every job.
+- Only the rows in or near view are laid out; with the detail pane open, a row's figures give
+  way to their brief form before the job's name is cut.
 - Under the queue, the jobs that finished in the last 24 hours, in the same row style.
 - Empty state: "The queue is empty. Add an NZB to begin." with an Add NZB button.
 
@@ -279,7 +287,11 @@ Toasts in the lower right announce each finished (6 s) or failed (15 s) job, wit
   (`effective / max`) and `Retry N on backup` for failed jobs, with a confirmation that
   says what will happen.
 
-All motion stops under reduced motion.
+All motion stops under reduced motion (the desktop's preference, `NEWSKITE_REDUCED_MOTION`, or
+Settings › Appearance › Reduce motion). An idle window does not redraw on a timer: the theme
+and motion preferences are watched off the UI thread, the empty queue's drift runs only under
+the pointer, and blocking work (deleting folders, file-manager calls, the history read) runs
+on worker threads. While a run is active the window title carries its progress and speed.
 
 ### 6.4 Status bar
 Left: a state dot (Online, Downloading, Pausing, Paused, No server, or the error) and the

@@ -738,3 +738,14 @@ content beyond `skip_files`: any regular file directly in `dest_dir` whose lengt
 the first decoded part's offset match (one article fetched), except `.nkpart` files and PAR2
 repair backups (`name.N` next to `name`). The Repair step is recorded whenever files were
 renamed, however fast.
+
+1.5 (additive unless noted). `gui::app`: `UiMsg::{Refresh, History, ThemeChanged,
+MotionChanged}`; `Action::DiscardSettings` (`CloseSettings` now asks first when the sheet is
+dirty); `Action::Note` is gone (it had no caller). `Data::{history_peak, history_cells,
+set_history, finished_count, has_pending}`; set the stored history through `set_history` so
+the derived figures follow. `NewskiteApp::{reduce_motion_pref, set_look}`, `window_title`.
+`SettingsDraft::{reduce_motion, save_requested, confirm_discard, confirm_remove, dirty,
+open_with_appearance}`. `gui::appearance`: the document may carry `"reduce_motion": true`
+(`load_reduce_motion`, `document`); `save` takes the switch as a third argument.
+`gui::disk::space` reads free and total bytes in one call. `gui::queue`: `EMPTY_FIRST_RUN`,
+`no_match_text`; `gui::widgets`: `CMD_KEY`, `copy_button`; `Icon::Theme`.
