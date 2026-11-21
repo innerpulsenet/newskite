@@ -62,6 +62,27 @@ pub fn focus_ring(ui: &Ui, pal: &Palette, rect: Rect, radius: u8) {
     );
 }
 
+/// The platform's command key as shortcuts name it (`Ctrl+O`, `Cmd+O`).
+pub const CMD_KEY: &str = if cfg!(target_os = "macos") { "Cmd" } else { "Ctrl" };
+
+/// Seconds a copy button keeps saying "Copied".
+const COPIED_SECS: f64 = 1.5;
+
+/// A text button that copies `text()` to the clipboard and says "Copied" for a moment,
+/// so the click is seen to have worked. `salt` tells the copy buttons on screen apart.
+pub fn copy_button(ui: &mut Ui, pal: &Palette, salt: &str, label: &str, enabled: bool, text: impl FnOnce() -> String) -> Response {
+    let id = egui::Id::new(("copied-at", salt));
+    let now = ui.input(|i| i.time);
+    let copied = ui.data(|d| d.get_temp::<f64>(id)).is_some_and(|at| now - at < COPIED_SECS);
+    let resp = kit_button(ui, pal, ButtonKind::Text, None, if copied { "Copied" } else { label }, enabled);
+    if resp.clicked() {
+        ui.ctx().copy_text(text());
+        ui.data_mut(|d| d.insert_temp(id, now));
+        ui.ctx().request_repaint_after(std::time::Duration::from_secs_f64(COPIED_SECS));
+    }
+    resp
+}
+
 /// Height of a toolbar button.
 pub const TOOL_H: f32 = 34.0;
 /// Height of a toolbar key on the material themes.
@@ -150,7 +171,9 @@ pub fn tool_button(
         Some(g) => Vec2::new(12.0 + 18.0 + 8.0 + g.size().x + 14.0, TOOL_H),
         None => Vec2::splat(TOOL_H),
     };
-    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    // An unavailable button is not a click target: no hand cursor, no keyboard stop.
+    let sense = if state == ToolState::Unavailable { Sense::hover() } else { Sense::click() };
+    let (rect, resp) = ui.allocate_exact_size(size, sense);
     if ui.is_rect_visible(rect) {
         let live = state != ToolState::Unavailable;
         let hover = ui.ctx().animate_bool(resp.id.with("hover"), live && resp.hovered());
@@ -214,6 +237,9 @@ pub fn tool_button(
             label,
         )
     });
+    if state == ToolState::Unavailable {
+        return resp;
+    }
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 

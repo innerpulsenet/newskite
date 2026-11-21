@@ -282,15 +282,20 @@ impl Pass<'_> {
             }
             let _ = progress.send((n * rlen) as u64);
         }
-        // D_m = sum_j inverse[m][j] * R'_j, written into the owning copy.
+        // D_m = sum_j inverse[m][j] * R'_j, written into the owning copy. The sum is built
+        // a sub-block at a time, so that sub-block of D_m stays in cache over all k rows.
         let out = &mut buf[..rlen];
         for (m, &(file, start, data_len)) in self.targets.iter().enumerate() {
+            tables.clear();
+            tables.extend(self.inverse[m * k..(m + 1) * k].iter().map(|&c| MulTable::new(c)));
             out.fill(0);
-            for (j, row) in rows.iter().enumerate() {
-                let c = self.inverse[m * k + j];
-                if c != 0 {
-                    self.kernel.mul_acc(out, row, &MulTable::new(c));
+            let mut s0 = 0;
+            while s0 < rlen {
+                let s1 = (s0 + sub).min(rlen);
+                for (row, t) in rows.iter().zip(&tables) {
+                    self.kernel.mul_acc(&mut out[s0..s1], &row[s0..s1], t);
                 }
+                s0 = s1;
             }
             let have = data_len.saturating_sub(pos).min(rlen as u64) as usize;
             if have > 0 {
@@ -419,6 +424,7 @@ fn rebuild_files(
 /// other in the same file go in one run.
 fn copy_known(set: &RecoverySet, source: &[Option<(usize, u64)>], paths: &[PathBuf], rebuilds: &[Rebuild]) -> io::Result<()> {
     let ss = set.slice_size;
+    let mut open: Option<(usize, File)> = None;
     for r in rebuilds {
         let e = &set.files[r.file];
         let mut s = 0;
@@ -433,7 +439,10 @@ fn copy_known(set: &RecoverySet, source: &[Option<(usize, u64)>], paths: &[PathB
             }
             let start = s as u64 * ss;
             let total = (end as u64 * ss).min(e.length) - start;
-            let mut from = File::open(&paths[h])?;
+            if open.as_ref().is_none_or(|(k, _)| *k != h) {
+                open = Some((h, File::open(&paths[h])?));
+            }
+            let mut from = &open.as_ref().expect("opened above").1;
             let mut to = &r.handle;
             from.seek(SeekFrom::Start(off))?;
             to.seek(SeekFrom::Start(start))?;

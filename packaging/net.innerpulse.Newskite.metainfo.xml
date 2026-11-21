@@ -55,6 +55,11 @@
   </requires>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.5.0" date="2026-11-21">
+      <description>
+        <p>Faster and quieter: downloads reserve half the memory per article, keep every connection fetching while finished files are flushed to disk, and request the first article of every file ahead; verification reads damaged files once; and an idle window no longer redraws. Long queues and histories stay smooth. Canceling a download no longer makes later articles look missing. A first-run guide leads to the server settings, Settings asks before discarding changes, and the keyboard reaches more (Ctrl+1/2/3, Ctrl+S, Enter to confirm).</p>
+      </description>
+    </release>
     <release version="1.0.0" date="2026-11-10">
       <description>
         <p>A new look on Linux and Windows: the innerpulse carbon theme, with a brushed plate, keys of smoked glass, frosted sheets, toasts and menus, and a seven-segment display of the download speed in the sidebar. A warm ink theme joins paper, and following the desktop color scheme stays available in Settings. The app icons are redrawn on the carbon ground.</p>

@@ -656,6 +656,40 @@ pub fn new_mark(age: f64, animate: bool) -> f32 {
     }
 }
 
+/// What the Log view remembers about one line between frames.
+#[derive(Clone, Copy)]
+struct LineMemo {
+    /// When it first showed (egui time).
+    first_seen: f64,
+    /// How tall it drew at [`LogMemo::text_w`], once drawn.
+    height: Option<f32>,
+}
+
+/// [`LineMemo`]s of the lines listed last frame.
+#[derive(Clone, Default)]
+struct LogMemo {
+    text_w: f32,
+    lines: std::collections::HashMap<Id, LineMemo>,
+}
+
+/// The lines the Log view lists under `filter` and `search`, newest first.
+fn visible_lines<'a>(data: &'a Data, filter: LogFilter, search: &str) -> Vec<&'a LogLine> {
+    let needle = search.trim().to_lowercase();
+    data.logs
+        .iter()
+        .filter(|l| filter.admits(l.level) && (needle.is_empty() || l.text.to_lowercase().contains(&needle)))
+        .collect()
+}
+
+/// The listed lines as text, oldest first (what "Copy visible" puts on the clipboard).
+pub fn visible_log_text(data: &Data, filter: LogFilter, search: &str) -> String {
+    visible_lines(data, filter, search)
+        .iter()
+        .rev()
+        .map(|l| format!("{} {:5} {}\n", format::timestamp_utc(l.ts), l.level.to_string(), l.text))
+        .collect()
+}
+
 /// Messages, newest first, in three columns: a level mark, the clock, the text (which
 /// wraps under itself, never under the clock). Long message-id lists fold behind a
 /// disclosure; the newest failure of a job that can be retried on a backup carries that
@@ -676,10 +710,7 @@ pub(crate) fn messages(
         return;
     }
     let needle = search.trim().to_lowercase();
-    let shown: Vec<&LogLine> = logs
-        .iter()
-        .filter(|l| filter.admits(l.level) && (needle.is_empty() || l.text.to_lowercase().contains(&needle)))
-        .collect();
+    let shown = visible_lines(data, filter, search);
     if shown.is_empty() && !needle.is_empty() {
         ui.label(RichText::new(format!("No lines contain \u{201c}{}\u{201d}", search.trim())).color(pal.muted));
         return;
@@ -696,12 +727,18 @@ pub(crate) fn messages(
     }
     let ctx = ui.ctx().clone();
     let now = ui.input(|i| i.time);
-    let seen_key = Id::new("messages-seen-once");
-    let first_frame = !ctx.data(|d| d.get_temp::<bool>(seen_key)).unwrap_or(false);
+    // What is remembered about the lines on show (when each first showed, how tall it
+    // drew), kept in one place and pruned to the lines still listed.
+    let memo_key = Id::new("messages-memo");
+    let memo: Option<std::sync::Arc<LogMemo>> = ctx.data(|d| d.get_temp(memo_key));
+    let first_frame = memo.is_none();
+    let mut memo = memo.map(|m| (*m).clone()).unwrap_or_default();
     let backup_servers = data.settings.usable_servers();
     let has_backup = backup_servers.len() >= 2;
+    let jobs: std::collections::HashMap<i64, &Job> = data.jobs.iter().map(|j| (j.id, j)).collect();
     let mut offered: std::collections::HashSet<i64> = std::collections::HashSet::new();
     let mut marked = false;
+    let mut next = LogMemo::default();
     // With materials the log is read in a well of dark glass, not on the brushed plate.
     let well = egui::Frame::new()
         .corner_radius(CornerRadius::same(pal.radius(12)));
@@ -715,22 +752,38 @@ pub(crate) fn messages(
                 let text_w = (ui.available_width() - LEVEL_COL_W - TIME_COL_W - 12.0).max(40.0);
                 // The gutter columns are one text row tall, so glyph, clock and text share a center.
                 let row_h = ui.fonts_mut(|f| f.row_height(&fonts::mono_id(12.0))).max(14.0);
+                // Heights were measured at this text width; another width wraps anew.
+                if (memo.text_w - text_w).abs() > 0.5 {
+                    memo.lines.values_mut().for_each(|l| l.height = None);
+                }
+                next.text_w = text_w;
+                let clip = ui.clip_rect().expand2(Vec2::new(0.0, 200.0));
                 for line in shown {
                     let id = Id::new(("logline", line.ts, &line.text));
                     // When this line first showed; lines present on the first frame count as old.
-                    let first_seen = ctx.data_mut(|d| {
-                        *d.get_temp_mut_or_insert_with(id, || if first_frame { f64::NEG_INFINITY } else { now })
+                    let mut seen = memo.lines.get(&id).copied().unwrap_or(LineMemo {
+                        first_seen: if first_frame { f64::NEG_INFINITY } else { now },
+                        height: None,
                     });
-                    let mark = new_mark(now - first_seen, animate);
+                    let mark = new_mark(now - seen.first_seen, animate);
                     marked |= mark > 0.0;
-                    let job = line.job_id.and_then(|jid| data.jobs.iter().find(|j| j.id == jid));
-                    let folded = split_id_list(&line.text);
+                    let job = line.job_id.and_then(|jid| jobs.get(&jid).copied());
                     let retry = has_backup
                         && line.level != LogLevel::Info
                         && job.is_some_and(|j| j.state == JobState::Failed && !offered.contains(&j.id));
                     if retry {
                         offered.extend(job.map(|j| j.id));
                     }
+                    // A line off screen keeps the room it took and is not laid out again.
+                    if let Some(h) = seen.height {
+                        let rect = Rect::from_min_size(ui.cursor().min, Vec2::new(ui.available_width(), h));
+                        if !clip.intersects(rect) {
+                            ui.allocate_space(rect.size());
+                            next.lines.insert(id, seen);
+                            continue;
+                        }
+                    }
+                    let folded = split_id_list(&line.text);
                     // Reserve the backdrop's slot first so it paints under the row.
                     let backdrop = ui.painter().add(Shape::Noop);
                     let row = ui
@@ -777,6 +830,8 @@ pub(crate) fn messages(
                         })
                         .response
                         .rect;
+                    seen.height = Some(row.height());
+                    next.lines.insert(id, seen);
                     if mark > 0.0 {
                         // Across the whole log width, so a short line reads as marked too.
                         let band = Rect::from_min_max(
@@ -795,9 +850,7 @@ pub(crate) fn messages(
                 }
             });
     });
-    if first_frame {
-        ctx.data_mut(|d| d.insert_temp(seen_key, true));
-    }
+    ctx.data_mut(|d| d.insert_temp(memo_key, std::sync::Arc::new(next)));
     if marked {
         ctx.request_repaint_after(if animate { MOTION_FRAME } else { std::time::Duration::from_millis(500) });
     }

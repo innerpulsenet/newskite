@@ -202,6 +202,8 @@ struct Shared {
     stop_unrepairable: bool,
     /// Complete files in `dest_dir` when the run started (see [`resume_candidates`]).
     on_disk: Vec<OnDisk>,
+    /// Files being finalized (see [`finish_segment`]); drained by [`run`] before it reports.
+    finalizing: Mutex<JoinSet<()>>,
 }
 
 impl Shared {
@@ -523,6 +525,7 @@ pub(crate) async fn run(
         repair: Mutex::new(tracker),
         stop_unrepairable: options.stop_unrepairable,
         on_disk,
+        finalizing: Mutex::new(JoinSet::new()),
     });
 
     // A new job tries every server again; earlier login failures stay in last_error.
@@ -575,6 +578,14 @@ pub(crate) async fn run(
     while let Some(res) = set.join_next().await {
         if let Err(e) = res {
             shared.fail(EngineError::Io(io::Error::other(format!("download worker failed: {e}"))));
+        }
+    }
+    // Every file whose last segment was processed finishes (flushed, renamed, reported)
+    // before the run does, cancelled or not; no worker is left to start another.
+    let mut finalizing = std::mem::take(&mut *lock(&shared.finalizing));
+    while let Some(res) = finalizing.join_next().await {
+        if let Err(e) = res {
+            shared.fail(EngineError::Io(io::Error::other(format!("finishing a file failed: {e}"))));
         }
     }
 
@@ -833,14 +844,17 @@ async fn wait_cooldown(shared: &Shared, server: usize) -> Result<(), ConnFail> {
 async fn process_segment(shared: &Arc<Shared>, held: &mut Option<Held>, st: &mut SegmentState) -> Flow {
     let (fi, si) = (st.fi, st.si);
     let file = &shared.files[fi];
-    if file.is_skipped() {
-        return finish_segment(shared, fi, si, None).await;
-    }
     let seg = &file.segments[si];
 
     loop {
         if shared.abort.is_cancelled() {
             return Flow::Stop;
+        }
+        // A file's first article may be requested ahead before the file turns out to be
+        // complete from an earlier run; its reply is still read (and dropped by
+        // `store_part`) so the next reply on the connection is the next segment's.
+        if file.is_skipped() && held.as_ref().is_none_or(|h| h.conn.outstanding_bodies() == 0) {
+            return finish_segment(shared, fi, si, None).await;
         }
         // A connection with a pipelined reply pending can only be used for that reply:
         // step aside when it cannot serve this segment any more.
@@ -997,10 +1011,12 @@ async fn fetch(shared: &Arc<Shared>, h: &mut Held, message_id: &str) -> Result<V
 
 /// Sends the `BODY` request for the next queued segment while the current body is still
 /// streaming. Only on the primary server, so a worker that spilled over to a fallback
-/// returns to the primary as soon as it has room, and only for files whose output is
-/// already decided: the first decoded part of a file may reveal it as complete from an
-/// earlier run, and then no second part should have been requested. Segments of skipped
-/// files are completed on the spot instead.
+/// returns to the primary as soon as it has room, and only for a file's first article or
+/// files whose output is already decided: the first decoded part of a file may reveal it
+/// as complete from an earlier run, and then no second part should have been requested,
+/// but the first article is needed either way (the queue starts with the first article
+/// of every file, which would otherwise all go unpipelined). Segments of skipped files
+/// are completed on the spot instead.
 async fn prefetch_next(shared: &Arc<Shared>, h: &mut Held) {
     if shared.primary_server() != Some(h.slot.server) {
         return;
@@ -1013,7 +1029,7 @@ async fn prefetch_next(shared: &Arc<Shared>, h: &mut Held) {
             }
             continue;
         }
-        if file.output.get().is_none() {
+        if item.1 != 0 && file.output.get().is_none() {
             shared.requeue(item);
             return;
         }
@@ -1185,7 +1201,9 @@ async fn store_part(shared: &Arc<Shared>, fi: usize, si: usize, decoded: Decoded
 }
 
 /// Counts processed segment `si` of file `fi`, emits `SegmentDone` for stored ones and
-/// finalizes the file after its last segment.
+/// finalizes the file after its last segment. Finalizing (flushing the data to disk, the
+/// rename, reading a PAR2 file) runs as a task of its own so the worker's connection goes
+/// on fetching meanwhile; [`run`] waits for it, and a failure stops the job as before.
 async fn finish_segment(shared: &Arc<Shared>, fi: usize, si: usize, stored: Option<(&str, u64)>) -> Flow {
     let file = &shared.files[fi];
     let total = file.segments.len();
@@ -1206,10 +1224,12 @@ async fn finish_segment(shared: &Arc<Shared>, fi: usize, si: usize, stored: Opti
     };
     shared.progress.segments_done.fetch_add(1, Ordering::Relaxed);
     if done == total {
-        if let Err(e) = finalize(shared, fi).await {
-            shared.fail(EngineError::Io(e));
-            return Flow::Stop;
-        }
+        let s = shared.clone();
+        lock(&shared.finalizing).spawn(async move {
+            if let Err(e) = finalize(&s, fi).await {
+                s.fail(EngineError::Io(e));
+            }
+        });
     }
     Flow::Continue
 }
@@ -1242,11 +1262,9 @@ fn resolve_output(shared: &Shared, fi: usize, first: Option<&YencPart>, create: 
         .filter(|n| !n.trim().is_empty())
         .map(sanitize_filename)
         .unwrap_or_else(|| file.label.clone());
-    let mut claimed = lock(&shared.claimed);
 
     if let Some(part) = first {
-        if let Some((name, existing)) = completed_earlier(shared, &claimed, &base, part) {
-            claimed.insert(claim_key(&name));
+        if let Some((name, existing)) = completed_earlier(shared, &base, part) {
             return Ok(Output {
                 name,
                 part_path: part_path(&existing),
@@ -1256,6 +1274,7 @@ fn resolve_output(shared: &Shared, fi: usize, first: Option<&YencPart>, create: 
             });
         }
     }
+    let mut claimed = lock(&shared.claimed);
     let (name, final_path) = free_name(shared, &mut claimed, &base)?;
     drop(claimed);
     let part = part_path(&final_path);
@@ -1322,24 +1341,32 @@ fn resume_candidates(dir: &Path) -> Vec<OnDisk> {
 /// for each other, and finds outputs an earlier run saved under a numbered name. Failing
 /// that, any other file of the folder with that content (see [`resume_candidates`]): a
 /// file post-processing moved to its real name (obfuscated posts), or one renamed by hand.
-fn completed_earlier(
-    shared: &Shared,
-    claimed: &HashSet<String>,
-    base: &str,
-    part: &YencPart,
-) -> Option<(String, PathBuf)> {
-    let mut candidates: Vec<(u32, &String)> =
-        shared.skip_files.iter().filter_map(|s| suffix_number(s, base).map(|n| (n, s))).collect();
-    candidates.sort();
-    let by_name = candidates.into_iter().map(|(_, name)| name);
-    let by_content = shared.on_disk.iter().filter(|(_, len)| *len == part.size).map(|(name, _)| name);
-    by_name.chain(by_content).find_map(|name| {
-        if claimed.contains(&claim_key(name)) {
-            return None;
+/// The match is claimed. The files are read without holding the claims, so other workers
+/// deciding their outputs are not held up; a match another file claimed meanwhile is
+/// passed over and the search repeated without it.
+fn completed_earlier(shared: &Shared, base: &str, part: &YencPart) -> Option<(String, PathBuf)> {
+    loop {
+        let candidates: Vec<&String> = {
+            let claimed = lock(&shared.claimed);
+            let mut by_name: Vec<(u32, &String)> =
+                shared.skip_files.iter().filter_map(|s| suffix_number(s, base).map(|n| (n, s))).collect();
+            by_name.sort();
+            let by_content = shared.on_disk.iter().filter(|(_, len)| *len == part.size).map(|(name, _)| name);
+            by_name
+                .into_iter()
+                .map(|(_, name)| name)
+                .chain(by_content)
+                .filter(|name| !claimed.contains(&claim_key(name)))
+                .collect()
+        };
+        let (name, path) = candidates.into_iter().find_map(|name| {
+            let path = shared.dest_dir.join(name);
+            (path.parent() == Some(shared.dest_dir.as_path()) && holds_part(&path, part)).then(|| (name.clone(), path))
+        })?;
+        if lock(&shared.claimed).insert(claim_key(&name)) {
+            return Some((name, path));
         }
-        let path = shared.dest_dir.join(name);
-        (path.parent() == Some(shared.dest_dir.as_path()) && holds_part(&path, part)).then(|| (name.clone(), path))
-    })
+    }
 }
 
 /// Blocking: whether the regular file at `path` is `part.size` bytes long and holds the
@@ -1516,6 +1543,7 @@ mod tests {
             repair: Mutex::new(Tracker::new(Vec::new(), 0)),
             stop_unrepairable: false,
             on_disk: Vec::new(),
+            finalizing: Mutex::new(JoinSet::new()),
         };
         let ids: Vec<String> = (1..=5).map(|i| format!("id{i}@x")).collect();
         fail_file(&shared, "f.bin", &ids);
@@ -1551,6 +1579,7 @@ mod tests {
             repair: Mutex::new(Tracker::new(Vec::new(), 0)),
             stop_unrepairable: false,
             on_disk: Vec::new(),
+            finalizing: Mutex::new(JoinSet::new()),
         };
         for i in 0..60 {
             shared.log_bad_article(&format!("f.bin: article <{i}@x> could not be decoded"));
@@ -1593,6 +1622,7 @@ mod tests {
             repair: Mutex::new(Tracker::new(Vec::new(), 0)),
             stop_unrepairable: false,
             on_disk: Vec::new(),
+            finalizing: Mutex::new(JoinSet::new()),
         };
         assert_eq!(shared.order(&[false, false, false], 0), vec![0, 1, 2]);
         assert_eq!(shared.order(&[false, false, false], 2), vec![2, 0, 1]);

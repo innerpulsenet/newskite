@@ -74,8 +74,21 @@ pub struct SettingsDraft {
     pub save_error: Option<String>,
     /// Settings › Appearance (applied on Save).
     pub appearance: Appearance,
+    /// Settings › Appearance › Reduce motion (applied on Save).
+    pub reduce_motion: bool,
+    opened_reduce_motion: bool,
     /// Why the stored settings could not be read, shown as a notice at the top.
     pub load_error: Option<String>,
+    /// What Save would have persisted when the sheet opened (see [`Self::dirty`]).
+    opened: Settings,
+    /// The appearance in effect when the sheet opened.
+    opened_appearance: Appearance,
+    /// Save was asked for from the keyboard; the footer acts on it.
+    pub save_requested: bool,
+    /// Closing was asked for with unsaved changes: the footer asks before discarding.
+    pub confirm_discard: bool,
+    /// The configured server row whose removal awaits confirmation.
+    pub confirm_remove: Option<u64>,
 }
 
 impl SettingsDraft {
@@ -83,17 +96,41 @@ impl SettingsDraft {
     pub fn new(settings: Settings) -> Self {
         let settings = settings.normalized();
         let row_ids = settings.servers.iter().map(|_| new_row_id()).collect();
-        Self {
+        let mut draft = Self {
             download_dir: settings.download_dir.display().to_string(),
             watch_folder: settings.watch_folder.display().to_string(),
+            opened: settings.clone(),
             settings,
             row_ids,
             tests: HashMap::new(),
             shown_passwords: HashSet::new(),
             save_error: None,
             appearance: Appearance::default(),
+            reduce_motion: false,
+            opened_reduce_motion: false,
             load_error: None,
-        }
+            opened_appearance: Appearance::default(),
+            save_requested: false,
+            confirm_discard: false,
+            confirm_remove: None,
+        };
+        draft.opened = draft.result();
+        draft
+    }
+
+    /// Sets the appearance the sheet opens with (not a change of the user's).
+    pub fn open_with_appearance(&mut self, a: Appearance, reduce_motion: bool) {
+        self.appearance = a;
+        self.opened_appearance = a;
+        self.reduce_motion = reduce_motion;
+        self.opened_reduce_motion = reduce_motion;
+    }
+
+    /// Whether Save would change anything: closing a dirty sheet asks first.
+    pub fn dirty(&self) -> bool {
+        self.appearance != self.opened_appearance
+            || self.reduce_motion != self.opened_reduce_motion
+            || self.result() != self.opened
     }
 
     /// Current text of a folder field.
@@ -315,7 +352,7 @@ const SECTIONS: [(&str, Icon); 6] = [
     ("Performance", Icon::Gear),
     ("Post-processing", Icon::Retry),
     ("Automation", Icon::Play),
-    ("Appearance", Icon::Info),
+    ("Appearance", Icon::Theme),
 ];
 
 /// Temp-data keys: the section the reader is in (scroll spy), a pending jump, and where
@@ -425,7 +462,7 @@ fn sheet_body(
                 ui.add_space(14.0);
                 automation_section(ui, pal, &mut draft.settings);
                 ui.add_space(14.0);
-                appearance_section(ui, pal, &mut draft.appearance);
+                appearance_section(ui, pal, &mut draft.appearance, &mut draft.reduce_motion);
             });
         });
     // Scroll spy: the last section whose title has passed the top of the view (the
@@ -463,32 +500,42 @@ fn footer(ui: &mut Ui, pal: &Palette, draft: &mut SettingsDraft, actions: &mut V
     if let Some(e) = &draft.save_error {
         error_line(ui, pal, &format!("Saving failed: {e}"));
     }
+    let save_now = std::mem::take(&mut draft.save_requested) && errors.is_empty();
+    if !draft.dirty() {
+        draft.confirm_discard = false;
+    }
     ui.horizontal(|ui| {
-        ui.label(
-            RichText::new(
-                "Passwords are stored unencrypted in the local settings database.",
-            )
-            .small()
-            .color(pal.muted),
-        );
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            // The sheet's one filled call to action.
-            let save = kit_button(
-                ui,
-                pal,
-                ButtonKind::Primary,
-                None,
-                "Save",
-                errors.is_empty(),
-            );
-            if save.clicked() && errors.is_empty() {
-                // The app applies the sheet's appearance only once the save
-                // succeeds, so a failed save changes nothing.
-                actions.push(Action::SaveSettings(Box::new(result)));
+            if draft.confirm_discard {
+                if kit_button(ui, pal, ButtonKind::Danger, None, "Discard", true).clicked() {
+                    actions.push(Action::DiscardSettings);
+                }
+                if kit_button(ui, pal, ButtonKind::Outline, None, "Keep editing", true).clicked() {
+                    draft.confirm_discard = false;
+                }
+            } else {
+                // The sheet's one filled call to action.
+                let save = kit_button(ui, pal, ButtonKind::Primary, None, "Save", errors.is_empty())
+                    .on_hover_text(format!("Save and close ({}+S)", super::widgets::CMD_KEY));
+                if (save.clicked() && errors.is_empty()) || save_now {
+                    // The app applies the sheet's appearance only once the save
+                    // succeeds, so a failed save changes nothing.
+                    actions.push(Action::SaveSettings(Box::new(result)));
+                }
+                // Cancel says what it does; closing any other way asks first.
+                if kit_button(ui, pal, ButtonKind::Outline, None, "Cancel", true).clicked() {
+                    actions.push(Action::DiscardSettings);
+                }
             }
-            if kit_button(ui, pal, ButtonKind::Outline, None, "Cancel", true).clicked() {
-                actions.push(Action::CloseSettings);
-            }
+            // The note takes the room the buttons leave, and wraps inside it.
+            ui.with_layout(Layout::left_to_right(Align::Center).with_main_wrap(true), |ui| {
+                let (text, color) = if draft.confirm_discard {
+                    ("Discard the changes you made here?", pal.text)
+                } else {
+                    ("Passwords are stored unencrypted in the local settings database.", pal.muted)
+                };
+                ui.add(egui::Label::new(RichText::new(text).small().color(color)).wrap());
+            });
         });
     });
 }
@@ -538,11 +585,30 @@ fn connection_section(
                     ui.label(RichText::new(role).small().color(pal.muted));
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if draft.confirm_remove == Some(row_id) {
+                        if compact_button(ui, pal, ButtonKind::Text, "Keep", true).clicked() {
+                            draft.confirm_remove = None;
+                        }
+                        if compact_button(ui, pal, ButtonKind::Danger, "Remove", true)
+                            .on_hover_text("Remove this server and its sign-in (nothing is saved until Save)")
+                            .clicked()
+                        {
+                            remove = Some(i);
+                            draft.confirm_remove = None;
+                        }
+                        ui.label(RichText::new("Remove this server?").small().color(pal.negative));
+                        return;
+                    }
                     if compact_button(ui, pal, ButtonKind::Outline, "Remove", true)
                         .on_hover_text("Remove this server")
                         .clicked()
                     {
-                        remove = Some(i);
+                        // An empty row goes at once; a filled-in one asks first.
+                        if srv.host.trim().is_empty() && srv.username.trim().is_empty() {
+                            remove = Some(i);
+                        } else {
+                            draft.confirm_remove = Some(row_id);
+                        }
                     }
                     if i > 0
                         && compact_button(ui, pal, ButtonKind::Outline, "Make primary", true)
@@ -834,7 +900,7 @@ fn automation_section(ui: &mut Ui, pal: &Palette, s: &mut Settings) {
     });
 }
 
-fn appearance_section(ui: &mut Ui, pal: &Palette, appearance: &mut Appearance) {
+fn appearance_section(ui: &mut Ui, pal: &Palette, appearance: &mut Appearance, reduce_motion: &mut bool) {
     section(ui, pal, "Appearance", |ui| {
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(12.0, 10.0);
@@ -853,6 +919,10 @@ fn appearance_section(ui: &mut Ui, pal: &Palette, appearance: &mut Appearance) {
             )
             .small()
             .color(pal.muted),
+        );
+        ui.add_space(10.0);
+        toggle(ui, pal, reduce_motion, "Reduce motion").on_hover_text(
+            "Stills the beating mark, drifting edges and fades. On as well whenever the desktop asks for reduced motion.",
         );
     });
 }

@@ -143,14 +143,42 @@ newskite ~/Downloads/some-release.nzb            # open the window and queue an 
 newskite file:///home/me/Downloads/a.nzb         # file:// and nzb:///path URIs work too
 ```
 
-Open Settings (gear icon or `Ctrl+,`) and add your news server: host, port (563 for TLS,
-119 without), username, password and connection count. **Test** shows the server's actual
-reply. Then import an NZB (Add NZB, `Ctrl+O`, or drag it onto the window) and press Start.
+On first launch the empty queue leads with **Set up server**. Open Settings (that button,
+the gear icon or `Ctrl+,`) and add your news server: host, port (563 for TLS, 119 without),
+username, password and connection count. **Test** shows the server's actual reply. Then
+import an NZB (Add NZB, `Ctrl+O`, or drag it onto the window) and press Start (it waits
+until a server is set up).
 With the window already open, opening an NZB from the file manager or an `nzb://` link
 queues it there and brings the window forward.
 
 Web links (`http(s)://`, `nzb://http...`, `nzblnk:`) are recognized but not fetched yet; the
-app logs them as unsupported.
+app says so under the header and logs them as unsupported.
+
+While a queue run is active the window title carries its progress and measured speed
+(`42% · 12.4 MB/s · Newskite`), so a minimized window still says how it is going. An idle
+window does not redraw: it wakes on input, on events and twice a minute.
+
+#### Keyboard
+
+| Keys | What they do |
+|---|---|
+| `Ctrl+O` | Choose NZB files |
+| `Ctrl+V` | Add `.nzb` files copied in the file manager |
+| `Ctrl+F` | Focus the name filter (the search, on the Log view) |
+| `Ctrl+1` / `Ctrl+2` / `Ctrl+3` | Queue, History, Log |
+| `Ctrl+,` | Settings; `Ctrl+S` there saves and closes |
+| `↑` `↓` `Home` `End` | Walk the rows on screen |
+| `Space` | Start, pause or retry the selected job |
+| `Alt+↑` / `Alt+↓` | Move the selected job in the queue |
+| `Delete` | Ask to remove the selected job; `Enter` confirms |
+| `Esc` | Close one thing: a dialog, an inline editor or confirmation, then the selection |
+
+On macOS the command key takes the place of `Ctrl`. Closing a Settings sheet with unsaved
+changes asks before discarding them (Cancel discards at once).
+
+Motion (the beating mark, drifting edges, fades) stops when the desktop asks for reduced
+motion (KDE's animation speed set to instant), with `NEWSKITE_REDUCED_MOTION=1`, or with
+**Reduce motion** in Settings › Appearance.
 
 ### Headless CLI
 
@@ -246,7 +274,7 @@ and manual runs (Actions → Packages → Run workflow) attach the packages to t
 artifacts; pushing a tag that matches the workspace version publishes a GitHub Release:
 
 ```sh
-git tag v1.0.0 && git push origin v1.0.0
+git tag v1.5.0 && git push origin v1.5.0
 ```
 
 ### Windows
@@ -273,8 +301,8 @@ follow the steps in the workflow's `windows` job.
 ```sh
 cargo install cargo-deb --locked     # once
 cargo deb -p newskite
-# -> target/debian/newskite_1.0.0-1_amd64.deb
-sudo apt install ./target/debian/newskite_1.0.0-1_amd64.deb
+# -> target/debian/newskite_1.5.0-1_amd64.deb
+sudo apt install ./target/debian/newskite_1.5.0-1_amd64.deb
 ```
 
 The metadata is in `[package.metadata.deb]` in `crates/newskite-app/Cargo.toml`. The package
@@ -320,7 +348,8 @@ The icons are generated, not hand-drawn; see [Brand](#brand) for the command.
   installer. A second launch (a double-clicked `.nzb`) hands its files to the open window
   over a loopback port guarded by a per-run token. The window wears the same carbon look as on
   Linux; with "Follow desktop" chosen it follows Windows' light/dark setting through the
-  toolkit. Finished-queue desktop notifications are not shown yet.
+  toolkit. "Show in folder" selects the file in Explorer. Finished-queue desktop
+  notifications are not shown yet (the in-window toasts are).
   The GUI snapshot tests run on Linux only.
 - **macOS:** the code is written to compile there (platform-specific code is behind `cfg`,
   paths come from the `directories` crate), but it has not been built or tested, and there

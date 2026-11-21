@@ -61,7 +61,7 @@ pub fn show(ui: &mut Ui, pal: &Palette, data: &Data, view: &ViewState, rail: boo
         Entry {
             icon: Icon::StatusOk,
             label: "History",
-            count: Some(data.history().len().to_string()),
+            count: Some(data.finished_count().to_string()),
             count_warn: false,
             current: view.tab == Tab::History,
             tip: "Finished and failed jobs".into(),
@@ -74,7 +74,7 @@ pub fn show(ui: &mut Ui, pal: &Palette, data: &Data, view: &ViewState, rail: boo
             count_warn: true,
             current: view.tab == Tab::Log,
             tip: if problems > 0 {
-                format!("Messages, newest first; {problems} warning(s) or error(s)")
+                format!("Messages, newest first; {problems} need{} a look (warnings and errors)", if problems == 1 { "s" } else { "" })
             } else {
                 "Messages, newest first".into()
             },
@@ -101,7 +101,7 @@ pub fn show(ui: &mut Ui, pal: &Palette, data: &Data, view: &ViewState, rail: boo
             count: None,
             count_warn: false,
             current: false,
-            tip: "Settings (Ctrl+,)".into(),
+            tip: format!("Settings ({}+,)", super::widgets::CMD_KEY),
             action: Action::OpenSettings,
         },
     ];
@@ -110,7 +110,11 @@ pub fn show(ui: &mut Ui, pal: &Palette, data: &Data, view: &ViewState, rail: boo
             actions.push(e.action);
         }
     }
-    // The disk meter sits at the bottom.
+    // The disk meter sits at the bottom of the wide sidebar; beside the rail the status
+    // bar has the reading, and a bare bar would say nothing.
+    if rail {
+        return;
+    }
     let bottom = ui.max_rect().bottom();
     let meter_h = if rail { 40.0 } else { 46.0 };
     let top = (bottom - meter_h).max(ui.cursor().top() + 8.0);

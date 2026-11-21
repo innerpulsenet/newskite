@@ -391,7 +391,10 @@ async fn download_job(
     let req = DownloadRequest { nzb, dest_dir: job.dest_dir.clone(), servers, options };
 
     let (tx, rx) = mpsc::unbounded_channel();
-    let mut forwarder = inner.rt.spawn(forward_events(inner.clone(), job.id, job.bytes_total, base_bytes, rx));
+    let mut forwarder = {
+        let (inner, id, total) = (inner.clone(), job.id, job.bytes_total);
+        inner.rt.clone().spawn_blocking(move || forward_events(&inner, id, total, base_bytes, rx))
+    };
     let started = Instant::now();
     let result = download_with_pool(req, inner.pool.clone(), tx, inner.progress.clone(), token).await;
     let _ = inner.store.add_job_download_ms(job.id, started.elapsed().as_millis() as u64);
@@ -403,10 +406,8 @@ async fn download_job(
             failed_files = failed;
         }
         Ok(Err(e)) => tracing::warn!(target: "newskite_service", "event forwarder failed: {e}"),
-        Err(_) => {
-            forwarder.abort();
-            tracing::warn!(target: "newskite_service", "event forwarder did not drain; aborted");
-        }
+        // It ends by itself once the engine's last event sender is gone.
+        Err(_) => tracing::warn!(target: "newskite_service", "event forwarder did not drain; continuing without it"),
     }
 
     let stop = {
@@ -420,7 +421,7 @@ async fn download_job(
     // reported for that. A download that finished anyway goes on to post-processing.
     if let (Some(state), Err(_)) = (stop, &result) {
         *interrupted = true;
-        let _ = inner.store.set_job_state(job.id, state, None);
+        set_state_back(inner, &job, state);
         inner.emit(ServiceEvent::JobsChanged);
         let what = if state == JobState::Paused { "paused" } else { "interrupted" };
         inner.log_job(job.id, LogLevel::Info, format!("{what} {}; completed files are kept", job.name));
@@ -434,7 +435,7 @@ async fn download_job(
         }
         Err(EngineError::Cancelled) => {
             // Only shutdown (or removal, handled above) cancels a job: leave it resumable.
-            let _ = inner.store.set_job_state(job.id, JobState::Queued, None);
+            set_state_back(inner, &job, JobState::Queued);
             inner.emit(ServiceEvent::JobsChanged);
             inner.log_job(job.id, LogLevel::Info, format!("interrupted {}; it will resume on the next start", job.name));
             Some(End::Shutdown)
@@ -491,7 +492,7 @@ async fn download_job(
             Some(End::Stopped)
         }
         Err(EngineError::NoServer) => {
-            let _ = inner.store.set_job_state(job.id, JobState::Queued, None);
+            set_state_back(inner, &job, JobState::Queued);
             inner.emit(ServiceEvent::JobsChanged);
             Some(End::NoServer)
         }
@@ -827,9 +828,11 @@ pub(crate) fn missing_message(ids: &[String]) -> String {
 
 /// Rebroadcasts engine events, keeps `job_files` and `bytes_done` current and turns
 /// file-level events into log lines. Returns the articles fetched and missing, and the
-/// missing articles of each file that had some.
-async fn forward_events(
-    inner: Arc<Inner>,
+/// missing articles of each file that had some. Blocking: it runs on its own thread for
+/// the whole download, so its database and log-file writes never hold up the async
+/// workers, and the events are still handled one at a time, in order.
+fn forward_events(
+    inner: &Inner,
     job_id: i64,
     bytes_total: u64,
     base_bytes: u64,
@@ -854,7 +857,7 @@ async fn forward_events(
         }
     };
 
-    while let Some(ev) = rx.recv().await {
+    while let Some(ev) = rx.blocking_recv() {
         match &ev {
             EngineEvent::Layout { files } => {
                 lock(&inner.articles).insert(job_id, ArticleMap::from_layout(files));
@@ -870,7 +873,7 @@ async fn forward_events(
                 }
             }
             EngineEvent::FileStarted { name, segments } => {
-                upsert_file(&inner, job_id, name, 0, 0, "downloading");
+                upsert_file(inner, job_id, name, 0, 0, "downloading");
                 inner.log_job(job_id, 
                     LogLevel::Info,
                     format!("downloading {name} ({segments} segment{})", if *segments == 1 { "" } else { "s" }),
@@ -882,14 +885,19 @@ async fn forward_events(
                 }
                 fetched += 1;
                 run_bytes = run_bytes.saturating_add(*bytes);
-                *per_file.entry(name.clone()).or_default() += *bytes;
+                match per_file.get_mut(name) {
+                    Some(n) => *n += *bytes,
+                    None => {
+                        per_file.insert(name.clone(), *bytes);
+                    }
+                }
                 if last_persist.elapsed() >= Duration::from_secs(1) {
                     persist(run_bytes, &mut persist_error_logged);
                     last_persist = Instant::now();
                 }
             }
             EngineEvent::FileDone { name, bytes, .. } => {
-                upsert_file(&inner, job_id, name, *bytes, *bytes, "done");
+                upsert_file(inner, job_id, name, *bytes, *bytes, "done");
                 persist(run_bytes, &mut persist_error_logged);
                 last_persist = Instant::now();
                 inner.log_job(job_id, LogLevel::Info, format!("wrote {name} ({})", format::bytes(*bytes)));
@@ -898,7 +906,7 @@ async fn forward_events(
                 missing_n += missing.len() as u64;
                 *failed.entry(name.clone()).or_default() += missing.len();
                 let got = per_file.get(name).copied().unwrap_or(0);
-                upsert_file(&inner, job_id, name, 0, got, "failed");
+                upsert_file(inner, job_id, name, 0, got, "failed");
                 persist(run_bytes, &mut persist_error_logged);
                 last_persist = Instant::now();
                 inner.log_job(job_id, 
@@ -975,6 +983,16 @@ fn verify_done_files(dest: &Path, done: Vec<JobFile>) -> (Vec<JobFile>, Vec<Stri
         }
     }
     (keep, notes)
+}
+
+/// Puts a job that stopped without finishing back to `state` (`queued` or `paused`). A
+/// failure is logged: the row would stay `downloading`, which no run picks up again
+/// until the next start of the program.
+fn set_state_back(inner: &Inner, job: &Job, state: JobState) {
+    match inner.store.set_job_state(job.id, state, None) {
+        Ok(()) | Err(StoreError::NotFound) => {}
+        Err(e) => inner.log_job(job.id, LogLevel::Error, format!("could not set {} back to {state}: {e}", job.name)),
+    }
 }
 
 fn upsert_file(inner: &Inner, job_id: i64, name: &str, bytes_total: u64, bytes_done: u64, state: &str) {

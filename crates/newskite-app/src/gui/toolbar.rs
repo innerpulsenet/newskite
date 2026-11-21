@@ -59,13 +59,16 @@ pub fn queue_control(data: &Data) -> (Action, Icon, &'static str, &'static str, 
             true,
         )
     } else {
-        let runnable = data.jobs.iter().any(|j| j.state == JobState::Queued);
-        let tip = if runnable {
-            "Download every queued job, in queue order"
-        } else {
+        let queued = data.jobs.iter().any(|j| j.state == JobState::Queued);
+        let server = data.settings.first_usable_server().is_some();
+        let tip = if !queued {
             "Nothing queued to start (held jobs start from their row)"
+        } else if !server {
+            "Add a server in Settings before starting"
+        } else {
+            "Download every queued job, in queue order"
         };
-        (Action::Start, Icon::Play, "Start", tip, runnable)
+        (Action::Start, Icon::Play, "Start", tip, queued && server)
     }
 }
 
@@ -77,13 +80,14 @@ pub(crate) fn open_nzb_row(ui: &mut Ui, pal: &Palette, view: &mut ViewState, act
         let resp = ui.add(
             TextEdit::singleline(&mut view.open_nzb.path)
                 .id_salt("open-nzb-path")
-                .hint_text("/path/to/file.nzb")
+                .hint_text(if cfg!(windows) { r"C:\path\to\file.nzb" } else { "/path/to/file.nzb" })
                 .desired_width(width),
         );
         if view.open_nzb.focus {
             resp.request_focus();
             view.open_nzb.focus = false;
         }
+        view.open_nzb.has_focus = resp.has_focus();
         let submit = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
         if resp.changed() {
             view.open_nzb.error = None;

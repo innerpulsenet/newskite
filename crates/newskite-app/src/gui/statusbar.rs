@@ -152,8 +152,7 @@ pub fn servers_reading(data: &Data) -> Option<String> {
 /// per second).
 pub fn peak_speed(data: &Data) -> u64 {
     let live = data.live.iter().map(|&(_, v)| v).max().unwrap_or(0);
-    let stored = data.history.iter().map(|s| s.bytes_down).max().unwrap_or(0);
-    live.max(stored)
+    live.max(data.history_peak)
 }
 
 /// The center reading: what the queue is doing (`Downloading` and the speed, `Pausing`,
@@ -297,12 +296,11 @@ fn spark_values(data: &Data) -> Vec<f32> {
     if data.live.len() >= 2 {
         return data.live.iter().map(|&(_, v)| v as f32).collect();
     }
-    let raw: Vec<(i64, u64)> = data.history.iter().map(|s| (s.ts, s.bytes_down)).collect();
-    if raw.is_empty() {
-        return Vec::new();
-    }
-    super::docks::history_buckets(&raw, super::docks::now_secs(), super::app::HISTORY_SECS as i64, 48)
+    data.history_cells.clone()
 }
+
+/// Cells the stored day is folded into for the sparkline (30 minutes each).
+pub const SPARK_CELLS: usize = 48;
 
 /// A small zigzag (the activity glyph): `color` strokes in `rect`.
 fn paint_pulse(painter: &egui::Painter, rect: Rect, color: Color32) {
@@ -399,7 +397,7 @@ pub fn show(
         ui.add_space(4.0);
         let left_text = match &state {
             Pill::Error(e) => RichText::new(short_cause(e)).font(mono.clone()).color(pal.negative),
-            Pill::NoServer => RichText::new("Add a server in Settings").font(mono.clone()).color(pal.warning),
+            Pill::NoServer => RichText::new("No server").font(mono.clone()).color(pal.warning),
             _ => RichText::new(servers_reading(data).unwrap_or_default()).font(mono.clone()).color(pal.muted),
         };
         let r = ui.add(egui::Label::new(left_text).sense(Sense::click()).selectable(false));

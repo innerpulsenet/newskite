@@ -12,7 +12,7 @@ use eframe::egui;
 use egui_kittest::kittest::Queryable;
 use egui_kittest::{Harness, SnapshotError, SnapshotOptions};
 use newskite_app::gui::docks::LogFilter;
-use newskite_app::gui::queue::{EMPTY_HISTORY, EMPTY_QUEUE};
+use newskite_app::gui::queue::{EMPTY_FIRST_RUN, EMPTY_HISTORY, EMPTY_QUEUE};
 use newskite_app::gui::{brand, brand_tokens, Action, Appearance, Tab, UiMsg};
 use newskite_app::{AppConfig, NewskiteApp, ThemeMode};
 use newskite_service::{
@@ -399,13 +399,16 @@ fn empty_state_renders_cleanly() {
     for (t, look) in looks() {
         let mut h = fx.harness_themed(t, SIZE, true, None, true, 0.25);
         h.run_steps(4);
-        h.get_by_label(EMPTY_QUEUE);
+        // No server yet: the empty queue leads with setting one up.
+        h.get_by_label(EMPTY_FIRST_RUN);
+        assert!(h.query_by_label(EMPTY_QUEUE).is_none());
+        h.get_by_label("Set up server…");
         h.get_by_label("Add NZB…");
         // One call to action: the header's Add NZB leaves it to the empty queue's.
         assert!(h.query_by_label("Add NZB").is_none());
         h.get_by_label("No throughput history yet");
         h.get_by_label("No server configured");
-        h.get_by_label("No server");
+        assert!(h.get_all_by_label("No server").count() >= 1);
         h.get_by_label("Idle");
         // Free space once: the wide sidebar's disk meter (the status bar has it on the rail).
         h.get_by_label("Downloads disk: 128 GB free");
@@ -1279,7 +1282,8 @@ fn appearance_switches_on_save_and_persists() {
         h.get_by_label("innerpulse paper").scroll_down();
         h.run_steps(1);
     }
-    h.run_steps(1);
+    // Let the scroll settle, so the click lands where the card now is.
+    h.run_steps(6);
     h.get_by_label("innerpulse paper").click();
     h.run_steps(2);
     assert_eq!(app(&h).appearance, Appearance::Ink);
@@ -1916,4 +1920,152 @@ fn failover_strip_wide_log_and_backup_retry_render() {
     h.run_steps(2);
     assert_disjoint(&h, &strip_labels);
     snapshot(&mut h, "failover-light-wide");
+}
+
+/// Esc closes one thing at a time, innermost first: the row's password editor, then the
+/// selection; and the window's shortcuts rest while Settings is open over it.
+#[test]
+fn escape_closes_one_thing_and_shortcuts_rest_under_dialogs() {
+    let fx = Fixture::new(seed_populated);
+    let mut h = fx.harness(true, SIZE);
+    h.run_steps(3);
+    let id = app(&h).data.jobs.iter().find(|j| j.state.is_pending()).map(|j| j.id).expect("a pending job");
+    {
+        let a = h.state_mut().as_mut().expect("app");
+        a.push_action(Action::Select(Some(id)));
+        a.push_action(Action::EditPassword(id));
+    }
+    h.run_steps(3);
+    assert!(app(&h).view.queue.password_edit.is_some());
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(app(&h).view.queue.password_edit.is_none(), "the editor closes first");
+    assert_eq!(app(&h).view.queue.selected, Some(id), "and the selection stays");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert_eq!(app(&h).view.queue.selected, None, "the next Esc clears the selection");
+
+    // Under the Settings sheet, Ctrl+2 does not switch the view behind it.
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Num2);
+    h.run_steps(2);
+    assert_eq!(app(&h).view.tab, Tab::History, "Ctrl+2 shows History");
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Comma);
+    h.run_steps(3);
+    assert!(app(&h).view.settings.is_some());
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Num1);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::O);
+    h.run_steps(2);
+    assert_eq!(app(&h).view.tab, Tab::History);
+    assert!(!app(&h).view.dialog_open, "no file picker opens behind the sheet");
+}
+
+/// Closing a changed Settings sheet with Esc asks first; Esc again backs out of the
+/// question, Discard closes, and Ctrl+S saves.
+#[test]
+fn a_changed_settings_sheet_asks_before_closing_and_saves_from_the_keyboard() {
+    let fx = Fixture::new(|_, _| {});
+    let mut h = fx.harness(false, SIZE);
+    h.run_steps(2);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Comma);
+    h.run_steps(3);
+    // Unchanged: Esc closes at once.
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(app(&h).view.settings.is_none());
+
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Comma);
+    h.run_steps(3);
+    let change = |h: &mut Harness<'_, Option<NewskiteApp>>| {
+        let d = h.state_mut().as_mut().expect("app").view.settings.as_mut().expect("sheet");
+        d.settings.speed_limit_kbps = 4096;
+        assert!(d.dirty());
+    };
+    change(&mut h);
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(app(&h).view.settings.as_ref().is_some_and(|d| d.confirm_discard), "asks first");
+    h.get_by_label("Discard the changes you made here?");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(app(&h).view.settings.as_ref().is_some_and(|d| !d.confirm_discard), "Esc keeps editing");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    h.get_by_label("Discard").click();
+    h.run_steps(2);
+    assert!(app(&h).view.settings.is_none());
+    assert_eq!(fx.service.settings().speed_limit_kbps, 0, "discarded");
+
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Comma);
+    h.run_steps(3);
+    change(&mut h);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::S);
+    h.run_steps(3);
+    assert!(app(&h).view.settings.is_none(), "saved and closed");
+    assert_eq!(fx.service.settings().speed_limit_kbps, 4096);
+}
+
+/// An empty Active or Held list says which filter is empty (never empty quotes) and
+/// offers the way back.
+#[test]
+fn an_empty_state_filter_names_itself() {
+    use newskite_app::gui::center::ListFilter;
+    use newskite_app::gui::queue::no_match_text;
+    assert_eq!(no_match_text("", ListFilter::Held), "No held jobs.");
+    assert_eq!(no_match_text("  ", ListFilter::Active), "No active jobs.");
+    assert_eq!(no_match_text(" iso ", ListFilter::All), "No jobs match “iso”.");
+    assert_eq!(no_match_text("iso", ListFilter::Held), "No held jobs match “iso”.");
+
+    let fx = Fixture::new(seed_populated);
+    let mut h = fx.harness(true, SIZE);
+    h.run_steps(3);
+    h.state_mut().as_mut().expect("app").view.list_filter = ListFilter::Held;
+    h.run_steps(2);
+    if app(&h).data.jobs.iter().any(|j| j.state == newskite_service::JobState::Paused) {
+        return;
+    }
+    h.get_by_label("No held jobs.");
+    h.get_by_label("Show all jobs").click();
+    h.run_steps(2);
+    assert_eq!(app(&h).view.list_filter, ListFilter::All);
+}
+
+/// A long history costs what fits on screen: prints the frame time of the History view
+/// with 2,000 finished jobs (each with a saved article map). Run by hand:
+/// `cargo test -p newskite --release --test gui long_history -- --ignored --nocapture`.
+#[test]
+#[ignore = "a measurement, not a check"]
+fn long_history_frame_time() {
+    let fx = Fixture::new(|store, dir| {
+        for i in 0..2000 {
+            let name = format!("Finished.Job.{i:04}");
+            let job = store
+                .insert_job_at(
+                    &NewJob {
+                        name: name.clone(),
+                        bytes_total: 700 * 1024 * 1024,
+                        dest_dir: dir.join(&name),
+                        source_path: dir.join(format!("{name}.nzb")),
+                        password: None,
+                    },
+                    now() - 100_000 + i,
+                )
+                .expect("job");
+            store.set_job_progress(job.id, 700 * 1024 * 1024).expect("progress");
+            store.set_job_state(job.id, JobState::Done, None).expect("state");
+            seed_map(store, job.id, &[("a.bin", 900)], |_| newskite_types::ArticleState::Done);
+        }
+    });
+    let mut h = fx.harness(true, SIZE);
+    h.state_mut();
+    let started = std::time::Instant::now();
+    h.run_steps(3);
+    println!("first three frames: {:?}", started.elapsed());
+    h.state_mut().as_mut().expect("app").push_action(Action::SetTab(Tab::History));
+    // Let every article map load (they are read within a per-frame budget).
+    h.run_steps(400);
+    let frames = 200;
+    let started = std::time::Instant::now();
+    h.run_steps(frames);
+    println!("History, 2,000 jobs: {:?} per frame", started.elapsed() / frames as u32);
+    assert_eq!(app(&h).data.strips.len(), 2000, "every strip was read");
 }

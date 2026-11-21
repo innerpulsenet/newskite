@@ -104,6 +104,14 @@ const MIGRATIONS: &[&str] = &[
         map     TEXT    NOT NULL
     );
     "#,
+    // v6: indexes for the queue order v3 introduced, so picking the next job reads it from
+    // an index instead of sorting, and a new job's position (MAX) is one index lookup. The
+    // new queue index starts with `state` too, so it replaces jobs_state_created.
+    r#"
+    CREATE INDEX jobs_queue ON jobs (state, position, created_at, id);
+    CREATE INDEX jobs_position ON jobs (position);
+    DROP INDEX jobs_state_created;
+    "#,
 ];
 
 /// The schema version this build writes.
@@ -130,4 +138,85 @@ pub(crate) fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
         tx.commit()?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{JobState, NewJob, Store, DB_FILE_NAME};
+
+    /// The schema version of the last release (0.9.0).
+    const RELEASED_VERSION: usize = 5;
+
+    fn plan(conn: &Connection, sql: &str) -> String {
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let nulls = std::iter::repeat_n(rusqlite::types::Null, stmt.parameter_count());
+        let rows = stmt.query_map(rusqlite::params_from_iter(nulls), |r| r.get::<_, String>(3)).unwrap();
+        rows.map(Result::unwrap).collect::<Vec<_>>().join("; ")
+    }
+
+    #[test]
+    fn upgrades_a_released_database() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            // A database as 0.9.0 left it, with a reordered queue and some history.
+            let conn = Connection::open(dir.path().join(DB_FILE_NAME)).unwrap();
+            for sql in &MIGRATIONS[..RELEASED_VERSION] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.execute_batch(&format!("PRAGMA user_version = {RELEASED_VERSION}")).unwrap();
+            conn.execute_batch(
+                "INSERT INTO jobs (name, state, dest_dir, source_path, created_at, position) VALUES
+                     ('old-done', 'done', '/d/a', '/n/a.nzb', 100, 0),
+                     ('second', 'queued', '/d/b', '/n/b.nzb', 200, 2),
+                     ('first', 'queued', '/d/c', '/n/c.nzb', 300, 1),
+                     ('held', 'paused', '/d/d', '/n/d.nzb', 400, 3);
+                 INSERT INTO job_log (job_id, ts, level, text) VALUES (2, 1, 'info', 'kept');",
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(store.list_jobs().unwrap().len(), 4);
+        assert_eq!(store.next_runnable_job().unwrap().unwrap().name, "first");
+        assert_eq!(store.queue_order().unwrap(), [3, 2, 4]);
+        assert_eq!(store.job_log(2).unwrap()[0].text, "kept");
+        // A reordered queue: a new job goes after the highest position.
+        let new = NewJob {
+            name: "new".into(),
+            bytes_total: 1,
+            dest_dir: "/d/e".into(),
+            source_path: "/n/e.nzb".into(),
+            password: None,
+        };
+        let added = store.insert_job(&new).unwrap();
+        assert_eq!(store.queue_order().unwrap(), [3, 2, 4, added.id]);
+        store.set_job_state(3, JobState::Done, None).unwrap();
+        assert_eq!(store.next_runnable_job().unwrap().unwrap().name, "second");
+        drop(store);
+
+        let conn = Connection::open(dir.path().join(DB_FILE_NAME)).unwrap();
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let indexes: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'jobs' AND sql IS NOT NULL ORDER BY name")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(indexes, ["jobs_position", "jobs_queue", "jobs_source"]);
+    }
+
+    #[test]
+    fn queue_queries_use_indexes() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        let next = plan(&conn, crate::store::SQL_NEXT_RUNNABLE);
+        assert!(next.contains("jobs_queue") && !next.contains("TEMP B-TREE"), "{next}");
+        let max = plan(&conn, "SELECT MAX(position) FROM jobs");
+        assert!(max.contains("jobs_position"), "{max}");
+        let insert = plan(&conn, crate::store::SQL_INSERT_JOB);
+        assert!(!insert.contains("SCAN jobs"), "{insert}");
+    }
 }

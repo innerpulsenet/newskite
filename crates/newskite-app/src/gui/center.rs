@@ -18,6 +18,7 @@ use super::queue::{
     home_relative, job_menu, live_subline, matches_filter, no_match, now_unix, queue_summary, result_qualifier,
     search_field, EMPTY_HISTORY,
 };
+use super::widgets::{copy_button, focus_ring, CMD_KEY};
 use super::theme::Palette;
 use super::toolbar::{open_nzb_row, queue_control};
 use super::brand;
@@ -61,8 +62,13 @@ impl ListFilter {
 
 /// Width kept for a row's controls (six icon buttons, or an inline confirmation).
 const CONTROLS_W: f32 = 178.0;
-/// Width of the controls box while an archive password is typed in the row.
+/// Width of the controls box while an archive password is typed in the row (less in a
+/// narrow list, so the name keeps some room).
 const PASSWORD_EDIT_W: f32 = 320.0;
+/// Room a job's name keeps before the row's figures give way to their brief form.
+const NAME_KEEP_W: f32 = 240.0;
+/// How far outside the list's visible part rows are still drawn.
+const CULL_MARGIN: f32 = 240.0;
 /// Gap between a row's figures and its controls box.
 const FIGURE_GAP: f32 = 12.0;
 /// A row's padding.
@@ -95,6 +101,7 @@ pub fn show(ui: &mut Ui, pal: &Palette, data: &Data, view: &mut ViewState, actio
     view.queue.note_finishes(&data.jobs, now);
     match view.tab {
         Tab::Log => {
+            log_actions(ui, pal, data, view, actions);
             docks::messages(ui, pal, data, view.docks.log_filter, &view.docks.log_search, !view.reduced_motion, actions);
         }
         tab => {
@@ -111,13 +118,37 @@ pub fn show(ui: &mut Ui, pal: &Palette, data: &Data, view: &mut ViewState, actio
 
 /// `"1 finished  ·  1 failed"`.
 pub fn history_summary(data: &Data) -> String {
-    let all = data.history();
-    let failed = all.iter().filter(|j| j.state == JobState::Failed).count();
+    let all = data.finished_count();
+    let failed = data.jobs.iter().filter(|j| j.state == JobState::Failed).count();
     if failed > 0 {
-        format!("{} finished  ·  {failed} failed", all.len() - failed)
+        format!("{} finished  ·  {failed} failed", all - failed)
     } else {
-        format!("{} finished", all.len())
+        format!("{all} finished")
     }
+}
+
+/// The Log view's own actions, right-aligned above the lines: copy what the filter and
+/// search show, and open the full log file.
+fn log_actions(ui: &mut Ui, pal: &Palette, data: &Data, view: &ViewState, actions: &mut Vec<Action>) {
+    if data.logs.is_empty() {
+        return;
+    }
+    ui.horizontal(|ui| {
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            if kit_button(ui, pal, ButtonKind::Text, Some(Icon::External), "Open log file", true)
+                .on_hover_text("The full application log, in the data folder")
+                .clicked()
+            {
+                actions.push(Action::OpenLogFile);
+            }
+            copy_button(ui, pal, "log-visible", "Copy visible", true, || {
+                docks::visible_log_text(data, view.docks.log_filter, &view.docks.log_search)
+            })
+            .on_hover_text("Copy the lines the filter and search show");
+        });
+    });
+    ui.add_space(4.0);
 }
 
 fn header(ui: &mut Ui, pal: &Palette, data: &Data, view: &mut ViewState, actions: &mut Vec<Action>) {
@@ -159,10 +190,10 @@ fn header_actions(ui: &mut Ui, pal: &Palette, data: &Data, view: &mut ViewState,
     ui.spacing_mut().item_spacing.x = 8.0;
     let rtl = ui.layout().prefer_right_to_left();
     let mut items: Vec<HeaderItem<'_>> = Vec::new();
-    if !(view.tab == Tab::Queue && data.queue().is_empty()) {
+    if view.tab != Tab::Queue || data.has_pending() {
         items.push(Box::new(|ui, view, actions| {
             let r = kit_button(ui, pal, ButtonKind::Primary, Some(Icon::Plus), "Add NZB", !view.dialog_open)
-                .on_hover_text("Choose NZB files (Ctrl+O), or drop .nzb files onto the window");
+                .on_hover_text(format!("Choose NZB files ({CMD_KEY}+O), or drop .nzb files onto the window"));
             if r.clicked() {
                 actions.push(Action::BrowseNzb);
             }
@@ -186,7 +217,7 @@ fn header_actions(ui: &mut Ui, pal: &Palette, data: &Data, view: &mut ViewState,
                     &mut view.queue.focus_filter,
                     "log-search",
                     "Search the log",
-                    "Show only lines that contain this text (Ctrl+F)",
+                    &format!("Show only lines that contain this text ({CMD_KEY}+F)"),
                 )
             }));
         }
@@ -234,7 +265,7 @@ fn queue_view(ui: &mut Ui, pal: &Palette, data: &Data, view: &mut ViewState, act
             .filter(|j| matches_filter(&j.name, &view.filter) && view.list_filter.admits(j.state))
             .collect();
         if jobs.is_empty() {
-            no_match(ui, pal, &view.filter);
+            no_match(ui, pal, view, view.list_filter);
         } else {
             list(ui, pal, data, &jobs, view, actions, RowKind::Queue);
         }
@@ -272,7 +303,7 @@ fn history_view(ui: &mut Ui, pal: &Palette, data: &Data, view: &mut ViewState, a
     ui.add_space(8.0);
     let jobs: Vec<&Job> = all.into_iter().filter(|j| matches_filter(&j.name, &view.filter)).collect();
     if jobs.is_empty() {
-        no_match(ui, pal, &view.filter);
+        no_match(ui, pal, view, ListFilter::All);
         return;
     }
     list(ui, pal, data, &jobs, view, actions, RowKind::Finished);
@@ -352,7 +383,21 @@ fn list(ui: &mut Ui, pal: &Palette, data: &Data, jobs: &[&Job], view: &mut ViewS
             ui.spacing_mut().item_spacing.y = 0.0;
             let last = jobs.len().saturating_sub(1);
             view.queue.visible.extend(jobs.iter().map(|j| j.id));
+            // Only the rows in (or near) view are laid out: a long history costs what
+            // fits on screen. A row off screen keeps the room it had, or a typical row's.
+            let clip = ui.clip_rect().expand2(Vec2::new(0.0, CULL_MARGIN));
+            let width = ui.available_width();
             for (i, &job) in jobs.iter().enumerate() {
+                let id = row_id(kind, job.id);
+                let known = ui.ctx().data(|d| d.get_temp::<f32>(id)).or(view.queue.row_h);
+                let revealing = view.queue.reveal && view.queue.selected == Some(job.id);
+                if let (Some(h), false) = (known, revealing) {
+                    let rect = Rect::from_min_size(ui.cursor().min, Vec2::new(width, h));
+                    if !clip.intersects(rect) {
+                        ui.allocate_space(rect.size());
+                        continue;
+                    }
+                }
                 row(ui, pal, data, job, view, actions, kind, i == last);
             }
         });
@@ -397,7 +442,10 @@ fn drag_overlay(ui: &mut Ui, pal: &Palette, data: &Data, view: &mut ViewState, a
         painter.circle_filled(egui::pos2(x.min, y), 3.5, pal.accent);
         painter.circle_filled(egui::pos2(x.max, y), 3.5, pal.accent);
     }
-    ui.ctx().request_repaint();
+}
+
+fn row_id(kind: RowKind, job: i64) -> Id {
+    Id::new(("job-row", kind as u8, job))
 }
 
 /// The state word of a row and its color: what the job is doing, in plain words.
@@ -451,11 +499,11 @@ fn row(
     kind: RowKind,
     last: bool,
 ) {
-    let id = Id::new(("job-row", kind as u8, job.id));
+    let id = row_id(kind, job.id);
     let width = ui.available_width();
     // The row's own click area goes first, so the buttons drawn on it take their clicks;
     // its height is the one the row had last frame.
-    let h = ui.ctx().data(|d| d.get_temp::<f32>(id)).unwrap_or(80.0);
+    let h = ui.ctx().data(|d| d.get_temp::<f32>(id)).or(view.queue.row_h).unwrap_or(80.0);
     let rect = Rect::from_min_size(ui.cursor().min, Vec2::new(width, h));
     // Queue rows can also be dragged to a new place in the queue.
     let sense = if kind == RowKind::Queue { Sense::click_and_drag() } else { Sense::click() };
@@ -501,6 +549,7 @@ fn row(
         ui.scroll_to_rect(real, None);
         view.queue.reveal = false;
     }
+    view.queue.row_h = Some(real.height());
     if (real.height() - h).abs() > 0.5 {
         ui.ctx().data_mut(|d| d.insert_temp(id, real.height()));
         ui.ctx().request_repaint();
@@ -538,6 +587,13 @@ fn row(
         shapes.push(Shape::hline(real.x_range(), real.bottom() - 0.5, egui::Stroke::new(1.0, pal.border)));
     }
     ui.painter().set(slot, Shape::Vec(shapes));
+    if resp.has_focus() {
+        focus_ring(ui, pal, real.shrink(1.0), 4);
+    }
+    resp.widget_info(|| {
+        let (word, _) = state_word(pal, data, job);
+        egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, selected, format!("{}, {word}", job.name))
+    });
 
     let resp = if dragging { resp } else { resp.on_hover_cursor(egui::CursorIcon::PointingHand) };
     if kind == RowKind::Finished && resp.double_clicked() {
@@ -572,6 +628,9 @@ fn first_line(
     // The figure: progress and speed while queued or downloading; size and the finish
     // time once finished.
     let mut figures: Vec<(String, Option<String>)> = Vec::new();
+    // What the figures shrink to when the name would otherwise be cut (the inspector
+    // open beside a narrow list): the one number that matters most.
+    let mut brief: Vec<(String, Option<String>)> = Vec::new();
     match kind {
         RowKind::Queue => {
             if let Some(p) = data.status.post.as_ref().filter(|p| p.job_id == job.id) {
@@ -590,9 +649,14 @@ fn first_line(
                 } else {
                     format::bytes(done)
                 };
+                brief.push((format!("{}%  ·  {}", format::percent(done, job.bytes_total), format::speed(data.speed())), Some(format!("{progress}  ·  {live}"))));
                 figures.push((progress, None));
                 figures.push((live, None));
             } else if done > 0 {
+                brief.push((
+                    format!("{}%", format::percent(done, job.bytes_total)),
+                    Some(format!("{} of {}", format::bytes(done), format::bytes(job.bytes_total))),
+                ));
                 figures.push((
                     format!(
                         "{}%  ·  {} / {}",
@@ -608,17 +672,21 @@ fn first_line(
         }
         RowKind::Finished => match job.stats.finished_at {
             // Relative ("58 min ago"), the exact local and UTC times on hover.
-            Some(t) => figures.push((
-                format!("{}  ·  {}", format::bytes(job.bytes_total), format::ago(t, now_unix())),
-                Some(format!("Finished at {} · {}", clock_hm(t), format::timestamp_utc(t))),
-            )),
+            Some(t) => {
+                let when = format!("Finished {} at {} · {}", format::ago(t, now_unix()), clock_hm(t), format::timestamp_utc(t));
+                brief.push((format::bytes(job.bytes_total), Some(when)));
+                figures.push((
+                    format!("{}  ·  {}", format::bytes(job.bytes_total), format::ago(t, now_unix())),
+                    Some(format!("Finished at {} · {}", clock_hm(t), format::timestamp_utc(t))),
+                ));
+            }
             None => figures.push((format::bytes(job.bytes_total), None)),
         },
     }
     // While an archive password is typed in the row, its editor takes the figure's room.
     let controls_w = if view.queue.password_edit.as_ref().is_some_and(|(id, _)| *id == job.id) {
         figures.clear();
-        PASSWORD_EDIT_W
+        PASSWORD_EDIT_W.min(w * 0.6).max(CONTROLS_W)
     } else {
         CONTROLS_W
     };
@@ -626,9 +694,15 @@ fn first_line(
     let measure = |t: &str, f: &egui::FontId| ui.painter().layout_no_wrap(t.to_owned(), f.clone(), pal.text).size().x;
     // The figures end flush against the controls, so sizes and speeds line up down the
     // list whatever the names and state words before them take.
-    let figures_w = figures.iter().map(|(t, _)| measure(t, &mono) + 12.0).sum::<f32>();
-    let mid_w = status_chip_width(ui, &word) + figures_w + 16.0 + FIGURE_GAP;
-    let name_w = (w - controls_w - mid_w - 8.0).max(90.0);
+    let width_of = |f: &[(String, Option<String>)]| f.iter().map(|(t, _)| measure(t, &mono) + 12.0).sum::<f32>();
+    let chip_w = status_chip_width(ui, &word);
+    let room = |figures_w: f32| w - controls_w - (chip_w + figures_w + 16.0 + FIGURE_GAP) - 8.0;
+    let name_needs = measure(&job.name, &fonts::semibold_id(14.5)) + 2.0;
+    if !brief.is_empty() && !figures.is_empty() && room(width_of(&figures)) < name_needs.min(NAME_KEEP_W) {
+        figures = brief;
+    }
+    let figures_w = width_of(&figures);
+    let name_w = room(figures_w).max(90.0);
     ui.horizontal(|ui| {
         ui.set_min_height(24.0);
         ui.spacing_mut().item_spacing.x = 0.0;

@@ -370,16 +370,23 @@ pub fn verify(set: &RecoverySet, dir: &Path, others: &[PathBuf], on: &mut dyn Fn
             candidates.push((i, p));
         }
     }
-    let jobs: Vec<SliceCheck<'_>> = candidates
-        .iter()
-        .map(|(i, p)| SliceCheck { file: Source::Path(p), len: set.files[*i].length, entry: &set.files[*i] })
-        .collect();
+    // Each slice's CRC32 is kept with its MD5, so the stray-slice search below needs no
+    // second read of the damaged copies.
+    let files: Vec<(Source<'_>, usize)> = candidates.iter().map(|(i, p)| (Source::Path(p), set.files[*i].slices.len())).collect();
     let of: Vec<usize> = candidates.iter().map(|c| c.0).collect();
-    let checked = check_slices(&jobs, slice_size, threads, &mut |p| tick(p, &of, on));
+    let scanned = scan_slices(&files, slice_size, threads, &mut |p| tick(p, &of, on), |_, _, slice| {
+        (crc32fast::hash(slice), <[u8; 16]>::from(Md5::digest(slice)))
+    });
+    let mut hashed: HashMap<&PathBuf, Vec<(u32, [u8; 16])>> = HashMap::new();
     let mut partial = Vec::new();
-    for ((i, p), res) in candidates.iter().zip(checked) {
+    for ((i, p), (hashes, err)) in candidates.iter().zip(scanned) {
         let entry = &set.files[*i];
-        let Ok(good) = res else { continue };
+        if err.is_some() {
+            continue;
+        }
+        let mut good: Vec<bool> = hashes.iter().zip(&entry.slices).map(|(h, s)| h.1 == s.md5).collect();
+        good.resize(entry.slices.len(), false);
+        hashed.entry(*p).or_insert(hashes);
         if !is_complete(entry, entry.length, &good) {
             partial.push((*i, *p, good));
             continue;
@@ -424,19 +431,29 @@ pub fn verify(set: &RecoverySet, dir: &Path, others: &[PathBuf], on: &mut dyn Fn
             .filter(|p| !targets.contains(*p) && !used.contains(*p))
             .filter_map(|p| Some((p, std::fs::metadata(p).ok()?.len())))
             .collect();
-        let files: Vec<(Source<'_>, usize)> =
-            strays.iter().map(|(p, len)| (Source::Path(p), len.div_ceil(slice_size) as usize)).collect();
+        // Damaged copies checked above were hashed already; only the others are read.
+        let files: Vec<(Source<'_>, usize)> = strays
+            .iter()
+            .filter(|(p, _)| !hashed.contains_key(p))
+            .map(|(p, len)| (Source::Path(p), len.div_ceil(slice_size) as usize))
+            .collect();
         let snapshot = &sources;
-        let scanned = scan_slices(&files, slice_size, threads, &mut |_| {}, |_, _, slice| {
+        let mut scanned = scan_slices(&files, slice_size, threads, &mut |_| {}, |_, _, slice| {
             let crc = crc32fast::hash(slice);
             let missing = wanted.get(&crc)?.iter().any(|&g| snapshot[g].is_none());
             missing.then(|| (crc, <[u8; 16]>::from(Md5::digest(slice))))
-        });
-        for ((p, _), (hashes, _)) in strays.iter().zip(scanned) {
+        })
+        .into_iter();
+        for (p, _) in &strays {
+            let hashes: Vec<Option<(u32, [u8; 16])>> = match hashed.remove(p) {
+                Some(h) => h.into_iter().map(Some).collect(),
+                None => scanned.next().map(|(h, _)| h).unwrap_or_default(),
+            };
             let mut hits = 0;
             for (k, hash) in hashes.into_iter().enumerate() {
                 let Some((crc, md5)) = hash else { continue };
-                if let Some(&g) = wanted[&crc].iter().find(|&&g| {
+                let Some(gs) = wanted.get(&crc) else { continue };
+                if let Some(&g) = gs.iter().find(|&&g| {
                     let (fi, k) = owner[g];
                     sources[g].is_none() && set.files[fi].slices[k].md5 == md5
                 }) {
