@@ -9,35 +9,55 @@ use std::path::{Component, Path, PathBuf};
 use newskite_store::Job;
 
 /// Why a job's folder may not be deleted.
+#[cfg(test)]
 pub(crate) fn refuse_reason(job: &Job, download_dir: &Path, others: &[Job]) -> Option<String> {
-    let dir = &job.dest_dir;
-    if !dir.is_absolute() {
-        return Some(format!("{} is not an absolute path", dir.display()));
+    Folders::new(download_dir, others).refuse_reason(job)
+}
+
+/// The download folder, the home folder and every job's folder, resolved once, so
+/// checking many jobs (clearing the history) does not resolve every folder per job.
+pub(crate) struct Folders {
+    base: PathBuf,
+    home: Option<PathBuf>,
+    jobs: Vec<(i64, String, PathBuf)>,
+}
+
+impl Folders {
+    pub(crate) fn new(download_dir: &Path, jobs: &[Job]) -> Self {
+        Self {
+            base: canon(download_dir),
+            home: home_dir().map(|h| canon(&h)),
+            jobs: jobs.iter().map(|j| (j.id, j.name.clone(), canon(&j.dest_dir))).collect(),
+        }
     }
-    if dir.components().any(|c| matches!(c, Component::ParentDir | Component::CurDir)) {
-        return Some(format!("{} is not a plain path", dir.display()));
-    }
-    // A folder directly under the root (or the root itself) is never a job folder.
-    if dir.components().filter(|c| matches!(c, Component::Normal(_))).count() < 2 {
-        return Some(format!("{} is too close to the file system root", dir.display()));
-    }
-    let real = canon(dir);
-    let base = canon(download_dir);
-    if real == base || base.starts_with(&real) {
-        return Some(format!("{} is (or holds) the download folder", dir.display()));
-    }
-    if let Some(home) = home_dir() {
-        if canon(&home).starts_with(&real) {
+
+    /// Why `job`'s folder may not be deleted.
+    pub(crate) fn refuse_reason(&self, job: &Job) -> Option<String> {
+        let dir = &job.dest_dir;
+        if !dir.is_absolute() {
+            return Some(format!("{} is not an absolute path", dir.display()));
+        }
+        if dir.components().any(|c| matches!(c, Component::ParentDir | Component::CurDir)) {
+            return Some(format!("{} is not a plain path", dir.display()));
+        }
+        // A folder directly under the root (or the root itself) is never a job folder.
+        if dir.components().filter(|c| matches!(c, Component::Normal(_))).count() < 2 {
+            return Some(format!("{} is too close to the file system root", dir.display()));
+        }
+        let real = canon(dir);
+        if real == self.base || self.base.starts_with(&real) {
+            return Some(format!("{} is (or holds) the download folder", dir.display()));
+        }
+        if self.home.as_ref().is_some_and(|home| home.starts_with(&real)) {
             return Some(format!("{} is (or holds) the home folder", dir.display()));
         }
-    }
-    for other in others.iter().filter(|o| o.id != job.id) {
-        let o = canon(&other.dest_dir);
-        if o.starts_with(&real) || real.starts_with(&o) {
-            return Some(format!("{} is shared with {}", dir.display(), other.name));
+        for (_, name, o) in self.jobs.iter().filter(|(id, ..)| *id != job.id) {
+            if o.starts_with(&real) || real.starts_with(o) {
+                return Some(format!("{} is shared with {name}", dir.display()));
+            }
         }
+        None
     }
-    None
 }
 
 /// `p` with links resolved as far as it exists, the rest appended unchanged, so a folder

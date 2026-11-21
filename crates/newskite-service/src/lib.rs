@@ -12,9 +12,9 @@
 //!   insensitive, not recursive) whose canonical path has no job in any state and was not
 //!   imported (or its job removed) before with the same size and mtime, so removing a job
 //!   does not bring it back.
-//!   A background timer scans every `watch_interval_secs` while `watch_enabled` (settings are
-//!   re-read every second, so changes apply without a restart). Manual scans work whenever a
-//!   watch folder is configured. Timer scans log only imports and new problems.
+//!   A background timer scans every `watch_interval_secs` while `watch_enabled`; saved
+//!   settings wake it, so changes apply at once without a restart. Manual scans work
+//!   whenever a watch folder is configured. Timer scans log only imports and new problems.
 //! * **Queue (F4).** One run at a time ([`Service::start`] is idempotent). A run processes
 //!   `queued` jobs in queue order (an explicit position set by [`Service::move_job`], then
 //!   oldest first); `paused` jobs are held by the user and skipped. [`Service::pause`] is
@@ -346,8 +346,8 @@ pub(crate) struct Inner {
     pub(crate) events: broadcast::Sender<ServiceEvent>,
     pub(crate) state: Mutex<RunState>,
     logs: Mutex<VecDeque<LogLine>>,
-    /// Open handle of the log file (lazily opened, dropped on rotation).
-    log_file: Mutex<Option<std::fs::File>>,
+    /// Open log file (lazily opened, dropped on rotation).
+    log_file: Mutex<Option<LogFile>>,
     /// Shared counters handed to every engine run; the sampler diffs `bytes_down`.
     pub(crate) progress: Arc<Progress>,
     /// NNTP connections kept between the jobs of one run; closed when the run ends.
@@ -369,7 +369,15 @@ pub(crate) struct Inner {
     pub(crate) sampler_error_logged: AtomicBool,
     /// In-memory settings used instead of the stored document (never persisted); set by
     /// [`Service::set_runtime_settings_override`] (the headless CLI).
-    settings_override: Mutex<Option<Settings>>,
+    settings_override: Mutex<Option<Arc<Settings>>>,
+    /// The stored settings document as last loaded; `None` until it is loaded, after every
+    /// save, and while it cannot be loaded. Every write of the document goes through
+    /// [`Service::save_settings`], which clears it while holding this lock, so a load can
+    /// never put an older document back.
+    settings_cache: Mutex<Option<Arc<Settings>>>,
+    /// Bumped whenever the effective settings may have changed (a save or an override),
+    /// so the watch timer re-reads them at once instead of polling.
+    pub(crate) settings_changed: watch::Sender<u64>,
     /// The speed limit every job's engine reads as it runs; kept equal to the effective
     /// settings' limit (set on save, on override and at each job's start).
     pub(crate) speed_limit: SpeedLimit,
@@ -383,6 +391,12 @@ pub(crate) struct Inner {
     /// The latest repair outlook of each job downloaded this session; saved with the job's
     /// outcome when it finishes.
     pub(crate) outlooks: Mutex<HashMap<i64, RepairOutlook>>,
+}
+
+/// The open log file and its length, kept here so a line costs no `stat`.
+struct LogFile {
+    file: std::fs::File,
+    len: u64,
 }
 
 /// Lock a mutex, recovering the data if a panicking thread poisoned it.
@@ -440,36 +454,73 @@ impl Inner {
         self.emit(ServiceEvent::JobLog(text));
     }
 
-    /// Appends to `<data_dir>/newskite.log`, rotating it past [`LOG_FILE_MAX`]. Failures
-    /// are ignored (the file is a convenience, the in-app log is the record).
+    /// Appends to `<data_dir>/newskite.log`, rotating it past [`LOG_FILE_MAX`]. Each line
+    /// goes to the file in one write as it is logged (nothing is held back, so there is
+    /// nothing to flush). Failures are ignored (the file is a convenience, the in-app log
+    /// is the record).
     fn write_log_file(&self, ts: i64, level: LogLevel, job_id: Option<i64>, text: &str) {
-        use std::io::Write;
+        use std::fmt::Write as _;
+        use std::io::Write as _;
+        let mut line = format!("{} {:5}", format::timestamp_utc(ts), level.as_str());
+        if let Some(j) = job_id {
+            let _ = write!(line, " job={j}");
+        }
+        line.push(' ');
+        line.push_str(text);
+        line.push('\n');
         let mut guard = lock(&self.log_file);
-        let path = self.opts.data_dir.join(LOG_FILE_NAME);
         if guard.is_none() {
-            *guard = std::fs::OpenOptions::new().create(true).append(true).open(&path).ok();
+            let path = self.opts.data_dir.join(LOG_FILE_NAME);
+            *guard = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .ok()
+                .map(|file| LogFile { len: file.metadata().map_or(0, |m| m.len()), file });
         }
         let Some(f) = guard.as_mut() else { return };
-        let job = job_id.map(|j| format!(" job={j}")).unwrap_or_default();
-        let _ = writeln!(f, "{} {:5}{job} {text}", format::timestamp_utc(ts), level.as_str());
-        if f.metadata().map(|m| m.len() > LOG_FILE_MAX).unwrap_or(false) {
+        if f.file.write_all(line.as_bytes()).is_err() {
+            // Reopened (and its length read again) on the next line.
             *guard = None;
+            return;
+        }
+        f.len += line.len() as u64;
+        if f.len > LOG_FILE_MAX {
+            *guard = None;
+            let path = self.opts.data_dir.join(LOG_FILE_NAME);
             let _ = std::fs::rename(&path, self.opts.data_dir.join(format!("{LOG_FILE_NAME}.1")));
         }
     }
 
     /// Effective settings for runs, imports and timers: the runtime override when one is
     /// set, otherwise the stored document.
-    pub(crate) fn settings(&self) -> Settings {
+    pub(crate) fn settings(&self) -> Arc<Settings> {
         if let Some(s) = lock(&self.settings_override).as_ref() {
             return s.clone();
         }
         self.stored_settings()
     }
 
-    /// The stored settings document; a load failure is logged once and defaults are used.
-    pub(crate) fn stored_settings(&self) -> Settings {
-        match self.store.load_settings() {
+    /// Tells the watch timer that the effective settings may have changed.
+    fn settings_changed(&self) {
+        self.settings_changed.send_modify(|n| *n = n.wrapping_add(1));
+    }
+
+    /// The stored settings document (cached, see `settings_cache`); a load failure is
+    /// logged once and defaults are used.
+    pub(crate) fn stored_settings(&self) -> Arc<Settings> {
+        let loaded = {
+            let mut cache = lock(&self.settings_cache);
+            if let Some(s) = cache.as_ref() {
+                return s.clone();
+            }
+            let loaded = self.store.load_settings().map(Arc::new);
+            if let Ok(s) = &loaded {
+                *cache = Some(s.clone());
+            }
+            loaded
+        };
+        match loaded {
             Ok(s) => s,
             Err(e) => {
                 if !self.settings_error_logged.swap(true, Ordering::Relaxed) {
@@ -481,7 +532,7 @@ impl Inner {
                         ),
                     );
                 }
-                Settings::default().normalized()
+                Arc::new(Settings::default().normalized())
             }
         }
     }
@@ -518,8 +569,7 @@ impl Inner {
             if let Some(existing) = self.store.pending_job_by_source(&path)? {
                 return Err(ServiceError::Duplicate(existing.name));
             }
-            let jobs = self.store.list_jobs()?;
-            let dest_dir = unique_dest(&settings.download_dir, &name, &jobs);
+            let dest_dir = unique_dest(&settings.download_dir, &name, &self.store.dest_dirs()?);
             let job = self.store.insert_job(&newskite_store::NewJob {
                 name: name.clone(),
                 bytes_total: nzb.total_bytes(),
@@ -550,7 +600,7 @@ impl Inner {
     /// Watch-folder dedupe: `path` has a job in any state, or was imported (or its job
     /// removed) while it had this fingerprint.
     pub(crate) fn watch_source_known(&self, path: &Path, fp: Fingerprint) -> Result<bool, StoreError> {
-        Ok(self.store.job_by_source(path)?.is_some() || self.store.source_seen(path, fp.size, fp.mtime)?)
+        self.store.source_known(path, fp.size, fp.mtime)
     }
 }
 
@@ -569,13 +619,17 @@ pub(crate) struct Fingerprint {
 impl Fingerprint {
     /// The fingerprint of the file at `path`, or `None` if it cannot be read.
     pub(crate) fn of(path: &Path) -> Option<Self> {
-        let meta = std::fs::metadata(path).ok()?;
+        Some(Self::from_meta(&std::fs::metadata(path).ok()?))
+    }
+
+    /// The fingerprint of a file from its (link-following) metadata.
+    pub(crate) fn from_meta(meta: &std::fs::Metadata) -> Self {
         let mtime = meta
             .modified()
             .ok()
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
             .map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX));
-        Some(Self { size: meta.len(), mtime })
+        Self { size: meta.len(), mtime }
     }
 }
 
@@ -583,9 +637,9 @@ impl Fingerprint {
 /// the store (whatever its state, compared case-insensitively, since Windows and macOS
 /// treat `Foo` and `foo` as one folder) or already present on disk. So two jobs never
 /// share a folder and post-processing never sees another job's files.
-fn unique_dest(base: &Path, name: &str, jobs: &[Job]) -> PathBuf {
+fn unique_dest(base: &Path, name: &str, used: &[PathBuf]) -> PathBuf {
     let key = |p: &Path| p.to_string_lossy().to_lowercase();
-    let used: HashSet<String> = jobs.iter().map(|j| key(&j.dest_dir)).collect();
+    let used: HashSet<String> = used.iter().map(|p| key(p)).collect();
     let taken = |p: &Path| used.contains(&key(p)) || std::fs::symlink_metadata(p).is_ok();
     let mut candidate = base.join(name);
     let mut n = 2u32;
@@ -627,6 +681,7 @@ impl Service {
     pub fn with_store(store: Store, opts: ServiceOptions, rt: Handle) -> Self {
         let (events, _) = broadcast::channel(EVENT_CAPACITY);
         let (running_tx, _) = watch::channel(false);
+        let (settings_changed, _) = watch::channel(0);
         let inner = Arc::new(Inner {
             store,
             rt,
@@ -647,6 +702,8 @@ impl Service {
             settings_error_logged: AtomicBool::new(false),
             sampler_error_logged: AtomicBool::new(false),
             settings_override: Mutex::new(None),
+            settings_cache: Mutex::new(None),
+            settings_changed,
             speed_limit: SpeedLimit::default(),
             backup_first: Mutex::new(HashMap::new()),
             articles: Mutex::new(HashMap::new()),
@@ -952,7 +1009,8 @@ impl Service {
     pub fn delete_job_files(&self, id: i64) -> Result<Deleted, ServiceError> {
         let result = (|| {
             let job = self.inner.store.get_job(id)?.ok_or(ServiceError::NotFound(id))?;
-            self.delete_files_of(&job, &self.jobs()).map(|d| (job, d))
+            let folders = files::Folders::new(&self.inner.stored_settings().download_dir, &self.jobs());
+            self.delete_files_of(&job, &folders).map(|d| (job, d))
         })();
         match result {
             Ok((job, d)) => {
@@ -975,10 +1033,11 @@ impl Service {
     /// total deleted.
     pub fn clear_history_and_files(&self) -> (usize, Deleted) {
         let all = self.jobs();
+        let folders = files::Folders::new(&self.inner.stored_settings().download_dir, &all);
         let mut removed = 0;
         let mut total = Deleted::default();
         for job in all.iter().filter(|j| matches!(j.state, JobState::Done | JobState::Failed)) {
-            match self.delete_files_of(job, &all) {
+            match self.delete_files_of(job, &folders) {
                 Ok(d) => {
                     removed += 1;
                     total.files += d.files;
@@ -1005,12 +1064,11 @@ impl Service {
 
     /// Checks, deletes the folder, then removes the row (so a failed deletion keeps the
     /// job visible) and records the source NZB as seen.
-    fn delete_files_of(&self, job: &Job, all: &[Job]) -> Result<Deleted, ServiceError> {
+    fn delete_files_of(&self, job: &Job, folders: &files::Folders) -> Result<Deleted, ServiceError> {
         if !matches!(job.state, JobState::Done | JobState::Failed) || self.inner.lock_state().active_job == Some(job.id) {
             return Err(ServiceError::Other(format!("{} is not finished ({})", job.name, job.state)));
         }
-        let settings = self.settings();
-        if let Some(why) = files::refuse_reason(job, &settings.download_dir, all) {
+        if let Some(why) = folders.refuse_reason(job) {
             return Err(ServiceError::Other(format!("refusing to delete: {why}")));
         }
         let deleted = files::delete_tree(&job.dest_dir)?;
@@ -1220,7 +1278,7 @@ impl Service {
     /// loaded). A runtime override ([`Service::set_runtime_settings_override`]) is not
     /// reflected here, so saving what this returns never persists override values.
     pub fn settings(&self) -> Settings {
-        self.inner.stored_settings()
+        Settings::clone(&self.inner.stored_settings())
     }
 
     /// Why the stored settings document cannot be loaded, or `None` when it loads. While
@@ -1238,8 +1296,9 @@ impl Service {
     /// by the headless CLI for `--server`/`--dest`. Like saved settings, it applies from
     /// the next job, except the speed limit, which applies at once.
     pub fn set_runtime_settings_override(&self, s: Option<Settings>) {
-        *lock(&self.inner.settings_override) = s.map(Settings::normalized);
+        *lock(&self.inner.settings_override) = s.map(|s| Arc::new(s.normalized()));
         self.inner.speed_limit.set(self.inner.settings().speed_limit_bps());
+        self.inner.settings_changed();
     }
 
     /// The speed limit in force now, in bytes per second (0 = unlimited).
@@ -1286,8 +1345,17 @@ impl Service {
     /// When the stored document cannot be loaded, it is kept as a backup row first (see
     /// [`Store::save_settings`]) and a warning names the backup key.
     pub fn save_settings(&self, s: Settings) -> Result<(), ServiceError> {
-        let was_unreadable = self.inner.store.load_settings().is_err();
-        match self.inner.store.save_settings(&s.normalized()) {
+        let (was_unreadable, saved) = {
+            // Held across the write, so no load in between can cache the old document.
+            let mut cache = lock(&self.inner.settings_cache);
+            let was_unreadable = self.inner.store.load_settings().is_err();
+            let saved = self.inner.store.save_settings(&s.normalized());
+            // Also after a failed save: whatever is stored now is read again.
+            *cache = None;
+            (was_unreadable, saved)
+        };
+        self.inner.settings_changed();
+        match saved {
             Ok(()) => {
                 // Running downloads follow a new limit at once (the rest from the next job).
                 self.inner.speed_limit.set(self.inner.settings().speed_limit_bps());
