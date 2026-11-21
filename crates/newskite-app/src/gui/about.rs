@@ -42,6 +42,7 @@ pub fn show(
         .show(ctx, |ui| {
             ui.set_opacity(t);
             ui.set_width(320.0);
+            super::widgets::frost_sheen(ui, pal, 24.0);
             ui.vertical_centered(|ui| {
                 ui.add_space(12.0);
                 let (r, resp) = ui.allocate_exact_size(Vec2::splat(64.0), egui::Sense::hover());

@@ -22,7 +22,7 @@
       <li>Built-in PAR2 verify and repair plus RAR, 7z and ZIP extraction, including split and spanned volumes and passwords</li>
       <li>Watch folder, speed limit, scheduler window and optional shutdown when done</li>
       <li>Live throughput graph, activity log and bookmarks</li>
-      <li>Follows the desktop light or dark color scheme</li>
+      <li>The innerpulse carbon look, a warm ink and a paper theme, or the desktop light or dark color scheme</li>
       <li>Headless command-line mode that drives the same queue engine</li>
     </ul>
     <p>
@@ -55,6 +55,11 @@
   </requires>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.0.0" date="2026-11-10">
+      <description>
+        <p>A new look on Linux and Windows: the innerpulse carbon theme, with a brushed plate, keys of smoked glass, frosted sheets, toasts and menus, and a seven-segment display of the download speed in the sidebar. A warm ink theme joins paper, and following the desktop color scheme stays available in Settings. The app icons are redrawn on the carbon ground.</p>
+      </description>
+    </release>
     <release version="0.9.0" date="2026-11-02">
       <description>
         <p>Post-processing needs no external programs: PAR2 repair and RAR, 7z and zip extraction, including split zip sets, are built in. Repair, verification and downloading are faster, and the interface is redesigned with smoother motion and readable contrast in every theme.</p>

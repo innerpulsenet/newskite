@@ -381,13 +381,14 @@ fn assert_no_bad_numbers(h: &Harness<'_, Option<NewskiteApp>>) {
     }
 }
 
-/// The four looks every window is checked in: desktop dark and light (Breeze fixtures)
-/// and the two innerpulse themes.
-fn looks() -> [(Theme, &'static str); 4] {
+/// The looks every window is checked in: desktop dark and light (Breeze fixtures) and
+/// the innerpulse themes (carbon, the warm ink and paper).
+fn looks() -> [(Theme, &'static str); 5] {
     [
         (theme(true), "dark"),
         (theme(false), "light"),
         (brand_tokens::ink(), "ink"),
+        (brand_tokens::warm(), "warm"),
         (brand_tokens::paper(), "paper"),
     ]
 }
@@ -1263,45 +1264,119 @@ fn appearance_switches_on_save_and_persists() {
     let file = fx.dir.path().join("prefs").join("appearance.json");
     let mut h = fx.harness_themed(theme(false), SIZE, true, Some(file.clone()), true, 0.25);
     h.run_steps(2);
-    assert_eq!(app(&h).appearance, Appearance::FollowDesktop);
-    assert!(!app(&h).theme.dark, "follows the (light) desktop theme");
+    assert_eq!(app(&h).appearance, Appearance::Ink, "carbon until the user chooses");
+    assert_eq!(app(&h).theme, brand_tokens::ink());
+    assert!(app(&h).palette.metal.is_some(), "carbon wears the materials");
 
     h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Comma);
     h.run_steps(2);
-    h.get_by_label("innerpulse ink");
-    h.get_by_label("innerpulse paper");
+    h.get_by_label("innerpulse carbon");
+    h.get_by_label("innerpulse warm");
+    h.get_by_label("Follow desktop");
     // Choosing in the sheet changes nothing until Save.
     // The Appearance section is at the end of the sheet: scroll it into view.
     for _ in 0..8 {
-        h.get_by_label("innerpulse ink").scroll_down();
+        h.get_by_label("innerpulse paper").scroll_down();
         h.run_steps(1);
     }
     h.run_steps(1);
-    h.get_by_label("innerpulse ink").click();
+    h.get_by_label("innerpulse paper").click();
     h.run_steps(2);
-    assert_eq!(app(&h).appearance, Appearance::FollowDesktop);
+    assert_eq!(app(&h).appearance, Appearance::Ink);
     assert_eq!(
         app(&h).view.settings.as_ref().map(|d| d.appearance),
-        Some(Appearance::Ink),
+        Some(Appearance::Paper),
         "the sheet holds the choice"
     );
-    snapshot(&mut h, "settings-light");
+    snapshot(&mut h, "settings-carbon");
     h.get_by_label("Save").click();
     h.run_steps(3);
     let a = app(&h);
     assert!(a.view.settings.is_none());
-    assert_eq!(a.appearance, Appearance::Ink);
-    assert_eq!(a.theme, brand_tokens::ink());
-    assert!(a.palette.dark);
+    assert_eq!(a.appearance, Appearance::Paper);
+    assert_eq!(a.theme, brand_tokens::paper());
+    assert!(!a.palette.dark);
+    assert!(a.palette.metal.is_none(), "paper stays flat");
     let stored = std::fs::read_to_string(&file).expect("appearance file written");
-    assert!(stored.contains("innerpulse-ink"), "{stored}");
+    assert!(stored.contains("innerpulse-paper"), "{stored}");
     drop(h);
 
-    // A new window wears the stored choice.
+    // A new window wears the stored choice, and following the desktop is one of them.
+    let mut h = fx.harness_themed(theme(false), SIZE, true, Some(file.clone()), true, 0.25);
+    h.run_steps(2);
+    assert_eq!(app(&h).appearance, Appearance::Paper);
+    assert_eq!(app(&h).theme, brand_tokens::paper());
+    drop(h);
+    std::fs::write(&file, Appearance::FollowDesktop.to_json()).expect("write");
     let mut h = fx.harness_themed(theme(false), SIZE, true, Some(file), true, 0.25);
     h.run_steps(2);
-    assert_eq!(app(&h).appearance, Appearance::Ink);
-    assert_eq!(app(&h).theme, brand_tokens::ink());
+    assert_eq!(app(&h).appearance, Appearance::FollowDesktop);
+    assert!(!app(&h).theme.dark, "follows the (light) desktop theme");
+}
+
+/// Carbon is what a window wears until its user chooses, so every view is rendered in
+/// it: the detail pane, History, the Log and the top of Settings.
+#[test]
+fn carbon_wears_every_view() {
+    let fx = Fixture::new(seed_populated);
+    fx.service.log(LogLevel::Info, "first line");
+    fx.service.log(LogLevel::Warn, "Open.Movie.Project.2160p: par2 repaired 3 blocks, extract ok");
+    fx.service.log(LogLevel::Error, "second line");
+    let mut h = fx.harness_themed(brand_tokens::ink(), SIZE, false, None, true, 0.25);
+    h.run_steps(3);
+    assert!(app(&h).palette.metal.is_some());
+    let movie = app(&h).data.jobs.iter().find(|j| j.name == "Open.Movie.Project.2160p").map(|j| j.id);
+    // Idle, the display reads zero and what the queue still has to fetch.
+    h.get_by_label("Throughput display: 0 B/s, 2.49 GB to go");
+    // A download under way, with a toast over it: the display's figures are the row's.
+    let tx = app(&h).sender();
+    tx.send(UiMsg::Service(newskite_service::ServiceEvent::Throughput { bytes_per_sec: 24 * 1024 * 1024 + 419_430 }))
+        .expect("send");
+    run_until(&mut h, |h| app(h).data.speed() > 0);
+    {
+        let a = h.state_mut().as_mut().expect("app");
+        for j in a.data.jobs.iter_mut().filter(|j| Some(j.id) == movie) {
+            j.state = JobState::Downloading;
+        }
+        a.data.toasts.push(newskite_app::gui::toast::Toast {
+            id: 1,
+            job_id: movie.expect("job"),
+            name: "Debian.12.Netinst.amd64".into(),
+            ok: true,
+            detail: "658 MB in 33s".into(),
+            shown_at: None,
+        });
+    }
+    h.run_steps(2);
+    h.get_by_label("Throughput display: 24.4 MB/s, 2.49 GB to go");
+    h.get_by_label("Download complete");
+    assert_no_bad_numbers(&h);
+    snapshot(&mut h, "live-carbon");
+    h.state_mut().as_mut().expect("app").data.toasts.clear();
+    h.state_mut().as_mut().expect("app").reload_jobs();
+    h.run_steps(2);
+    h.state_mut().as_mut().expect("app").push_action(Action::Select(movie));
+    h.run_steps(6);
+    h.get_by_label("LIFECYCLE");
+    h.get_by_label("ARTICLE MAP");
+    assert_no_bad_numbers(&h);
+    snapshot(&mut h, "details-carbon");
+    h.state_mut().as_mut().expect("app").push_action(Action::Select(None));
+    h.state_mut().as_mut().expect("app").push_action(Action::SetTab(Tab::History));
+    h.run_steps(6);
+    h.get_by_label("Clear history");
+    snapshot(&mut h, "history-carbon");
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Comma);
+    h.run_steps(3);
+    h.get_by_label("Save");
+    snapshot(&mut h, "settings-servers-carbon");
+    h.get_by_label("Cancel").click();
+    h.run_steps(3);
+    assert!(app(&h).view.settings.is_none());
+    h.state_mut().as_mut().expect("app").push_action(Action::SetTab(Tab::Log));
+    h.run_steps(4);
+    h.get_by_label("second line");
+    snapshot(&mut h, "log-carbon");
 }
 
 #[test]

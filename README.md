@@ -14,8 +14,10 @@ yEnc payloads, writes the original files to disk byte for byte, then verifies, r
 extracts them without any external program. It keeps a resumable, reorderable queue
 where every job can be started, paused or moved on its own (drag a row to reorder), a download history, per-file
 progress, a live map of every article (downloaded, missing, waiting) with a strip of it under each job, a filterable log and a
-throughput graph in the status bar, and it follows the desktop's light
-or dark color scheme (KDE Plasma first).
+throughput graph in the status bar. It wears the innerpulse carbon look on Linux and Windows
+alike (a brushed plate, keys of smoked glass, frosted sheets and a seven-segment throughput
+display), with a warm ink, a paper theme and "follow the desktop's light or dark color
+scheme" (KDE Plasma first) in Settings › Appearance.
 
 Drop `.nzb` files (or a folder of them) onto the window, or copy them in the file manager
 and press Ctrl+V. On Wayland the window runs through XWayland, because the windowing
@@ -38,7 +40,11 @@ These are the app's GUI snapshot tests (`crates/newskite-app/tests/snapshots/`),
 with sample jobs and the placeholder server `news.example.net`, so the names and figures are
 test data, not a real download.
 
-The queue, following the desktop's dark or light color scheme:
+A download under way in the carbon look, which a new install wears:
+
+<img alt="The Newskite queue on a brushed dark plate: one job downloading, one held, one failed and one finished, a seven-segment display reading 24.4 MB/s in the sidebar and a frosted toast for a finished download" src="crates/newskite-app/tests/snapshots/live-carbon.png" width="800">
+
+The same queue following the desktop's dark or light color scheme (Settings › Appearance):
 
 <picture>
   <source media="(prefers-color-scheme: light)" srcset="crates/newskite-app/tests/snapshots/populated-light.png">
@@ -240,7 +246,7 @@ and manual runs (Actions → Packages → Run workflow) attach the packages to t
 artifacts; pushing a tag that matches the workspace version publishes a GitHub Release:
 
 ```sh
-git tag v0.9.0 && git push origin v0.9.0
+git tag v1.0.0 && git push origin v1.0.0
 ```
 
 ### Windows
@@ -267,8 +273,8 @@ follow the steps in the workflow's `windows` job.
 ```sh
 cargo install cargo-deb --locked     # once
 cargo deb -p newskite
-# -> target/debian/newskite_0.9.0-1_amd64.deb
-sudo apt install ./target/debian/newskite_0.9.0-1_amd64.deb
+# -> target/debian/newskite_1.0.0-1_amd64.deb
+sudo apt install ./target/debian/newskite_1.0.0-1_amd64.deb
 ```
 
 The metadata is in `[package.metadata.deb]` in `crates/newskite-app/Cargo.toml`. The package
@@ -312,8 +318,9 @@ The icons are generated, not hand-drawn; see [Brand](#brand) for the command.
   reads KDE's `kdeglobals` and the XDG desktop portal.
 - **Windows 10 (1809) and 11, x64:** built and unit-tested on every release run, with an
   installer. A second launch (a double-clicked `.nzb`) hands its files to the open window
-  over a loopback port guarded by a per-run token. The theme follows Windows' light/dark
-  setting through the toolkit, and finished-queue desktop notifications are not shown yet.
+  over a loopback port guarded by a per-run token. The window wears the same carbon look as on
+  Linux; with "Follow desktop" chosen it follows Windows' light/dark setting through the
+  toolkit. Finished-queue desktop notifications are not shown yet.
   The GUI snapshot tests run on Linux only.
 - **macOS:** the code is written to compile there (platform-specific code is behind `cfg`,
   paths come from the `directories` crate), but it has not been built or tested, and there
@@ -335,8 +342,8 @@ to create RAR archives or to rebuild the RAR compression algorithm. The full tex
 
 Newskite is an [innerpulse](https://innerpulse.net) product.
 
-The app icon is the stock innerpulse app icon at every size: the ink tile and the six-bar
-mark. Following the brand's rule for desktop apps, the product's violet accent appears inside
+The app icon is the stock innerpulse app icon at every size: the ink (carbon) tile and the
+six-bar mark. Following the brand's rule for desktop apps, the product's violet accent appears inside
 the app, not in the icon. The kit's whole-pixel renders keep the small sizes sharp.
 
 - `assets/brand/product/`: the Newskite wordmark and horizontal lockups (on dark and on light)

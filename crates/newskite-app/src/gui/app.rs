@@ -1555,47 +1555,60 @@ impl NewskiteApp {
             ctx.all_styles_mut(|s| s.animation_time = anim);
         }
 
+        // With materials the whole window is one plate, painted once behind every panel;
+        // the panels are cut from it by grooves instead of being filled and outlined.
+        let plate = ctx.layer_painter(egui::LayerId::background());
+        let edge = |fill: egui::Color32| match pal.metal {
+            Some(_) => egui::Frame::new(),
+            None => egui::Frame::new().fill(fill).stroke(egui::Stroke::new(1.0, pal.border)),
+        };
+        if let Some(m) = &pal.metal {
+            let screen = ctx.content_rect();
+            super::metal::plate(&plate, m, screen);
+            // A light along the top edge in the family accent, brighter while bytes move.
+            let level = if self.data.status.running { 1.0 } else { 0.45 };
+            super::metal::edge_light(&plate, screen, pal.accent, 0.1, level);
+        }
+
         // The sidebar: views and actions on the left (a rail of icons on narrow windows).
         let rail = width < super::sidebar::RAIL_BELOW;
-        egui::SidePanel::left("sidebar")
+        let side = egui::SidePanel::left("sidebar")
             .resizable(false)
             .exact_width(if rail { super::sidebar::RAIL_W } else { super::sidebar::WIDE_W })
-            .frame(
-                egui::Frame::new()
-                    .fill(pal.raised)
-                    .inner_margin(egui::Margin { left: 10, right: 10, top: 18, bottom: 12 })
-                    .stroke(egui::Stroke::new(1.0, pal.border)),
-            )
-            .show(ctx, |ui| super::sidebar::show(ui, &pal, &self.data, &self.view, rail, &mut actions));
+            .frame(edge(pal.raised).inner_margin(egui::Margin { left: 10, right: 10, top: 18, bottom: 12 }))
+            .show(ctx, |ui| super::sidebar::show(ui, &pal, &self.data, &self.view, rail, &mut actions))
+            .response
+            .rect;
+        if pal.metal.is_some() {
+            super::metal::groove_v(&plate, side.right() - 2.0, side.top(), side.bottom());
+        }
 
-        egui::TopBottomPanel::bottom("statusbar")
+        let bar = egui::TopBottomPanel::bottom("statusbar")
             .exact_height(30.0)
-            .frame(
-                egui::Frame::new()
-                    .fill(pal.raised)
-                    .inner_margin(egui::Margin::symmetric(12, 3))
-                    .stroke(egui::Stroke::new(1.0, pal.border)),
-            )
+            .frame(edge(pal.raised).inner_margin(egui::Margin::symmetric(12, 3)))
             .show(ctx, |ui| {
                 statusbar::show(ui, &pal, &self.data, rail, self.reduced_motion, &mut actions)
-            });
+            })
+            .response
+            .rect;
+        if pal.metal.is_some() {
+            super::metal::groove_h(&plate, bar.left(), bar.right(), bar.top());
+        }
 
         // The server readings: one quiet line above the status bar. Toasts stack from its
         // top edge, so they never cover its actions.
-        let strip_top = egui::TopBottomPanel::bottom("serverstrip")
+        let strip = egui::TopBottomPanel::bottom("serverstrip")
             .exact_height(super::serverstrip::STRIP_H)
-            .frame(
-                egui::Frame::new()
-                    .fill(pal.surface)
-                    .inner_margin(egui::Margin::symmetric(14, 0))
-                    .stroke(egui::Stroke::new(1.0, pal.border)),
-            )
+            .frame(edge(pal.surface).inner_margin(egui::Margin::symmetric(14, 0)))
             .show(ctx, |ui| {
                 super::serverstrip::show(ui, &pal, &self.data, &mut self.view.strip, &mut actions)
             })
             .response
-            .rect
-            .top();
+            .rect;
+        if pal.metal.is_some() {
+            super::metal::groove_h(&plate, strip.left(), strip.right(), strip.top());
+        }
+        let strip_top = strip.top();
 
         // The detail pane slides in beside the list when a job is selected, and out (still
         // showing that job) when the selection is cleared.
@@ -1610,13 +1623,12 @@ impl NewskiteApp {
                 .default_width(super::inspector::PANEL_DEFAULT_W)
                 .min_width(super::inspector::PANEL_MIN_W)
                 .max_width((width * 0.45).max(super::inspector::PANEL_MIN_W))
-                .frame(
-                    egui::Frame::new()
-                        .fill(pal.raised)
-                        .inner_margin(egui::Margin::symmetric(20, 18))
-                        .stroke(egui::Stroke::new(1.0, pal.border)),
-                )
+                .frame(edge(pal.raised).inner_margin(egui::Margin::symmetric(20, 18)))
                 .show_animated(ctx, inspecting, |ui| {
+                    if pal.metal.is_some() {
+                        let r = ui.max_rect().expand2(egui::vec2(20.0, 18.0));
+                        super::metal::groove_v(ui.painter(), r.left(), r.top(), r.bottom());
+                    }
                     super::inspector::show(
                         ui,
                         &pal,
@@ -1635,7 +1647,7 @@ impl NewskiteApp {
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
-                    .fill(pal.surface)
+                    .fill(pal.panel(pal.surface))
                     .inner_margin(egui::Margin { left: 28, right: 24, top: 22, bottom: 12 }),
             )
             .show(ctx, |ui| {
@@ -1715,7 +1727,15 @@ fn drop_overlay(ctx: &egui::Context, pal: &Palette, reduced: bool) {
             let beat = motion::Beat::new(ctx, true, reduced, brand::PERIOD_AMBIENT * 2.0);
             let radius = egui::CornerRadius::same(18);
             ui.painter().add(egui::Shadow { offset: [0, 16], blur: 44, spread: 0, color: pal.shadow }.as_shape(card, radius));
-            ui.painter().rect_filled(card, radius, pal.raised);
+            match &pal.metal {
+                Some(m) => {
+                    ui.painter().rect_filled(card, radius, m.frost);
+                    ui.painter().add(super::metal::frost(m, card, 18));
+                }
+                None => {
+                    ui.painter().rect_filled(card, radius, pal.raised);
+                }
+            }
             ui.painter().rect_filled(card.shrink(6.0), egui::CornerRadius::same(13), Palette::fade(pal.accent_soft, 0.5));
             // A dashed accent edge whose dashes drift around the card while it waits.
             let drift = if beat.moving { beat.phase * 40.0 } else { 0.0 };

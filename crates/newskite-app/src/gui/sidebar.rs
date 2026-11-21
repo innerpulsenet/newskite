@@ -114,10 +114,93 @@ pub fn show(ui: &mut Ui, pal: &Palette, data: &Data, view: &ViewState, rail: boo
     let bottom = ui.max_rect().bottom();
     let meter_h = if rail { 40.0 } else { 46.0 };
     let top = (bottom - meter_h).max(ui.cursor().top() + 8.0);
+    // With materials the wide sidebar carries the instrument's display: throughput in
+    // seven-segment figures, where there is room for it between the views and the meter.
+    if let (Some(m), false) = (&pal.metal, rail) {
+        let lcd_top = top - 14.0 - LCD_H;
+        if lcd_top >= ui.cursor().top() + 12.0 {
+            let r = Rect::from_min_size(Pos2::new(ui.max_rect().left() + 4.0, lcd_top), Vec2::new(ui.max_rect().width() - 8.0, LCD_H));
+            throughput_lcd(ui, pal, m, data, r);
+        }
+    }
     let rect = Rect::from_min_max(Pos2::new(ui.max_rect().left(), top), Pos2::new(ui.max_rect().right(), bottom));
     if disk_meter(ui, pal, data, rect, rail).clicked() {
         actions.push(Action::OpenDownloadFolder);
     }
+}
+
+/// Height of the throughput display.
+const LCD_H: f32 = 86.0;
+
+/// The throughput display's figures and unit for `bps` bytes per second: four places,
+/// blank-padded, in the units the rest of the window uses (`"  2.4"` `MB/s`, `" 512"` `KB/s`).
+pub fn lcd_speed(bps: u64) -> (String, &'static str) {
+    const UNITS: [&str; 6] = ["KB/s", "MB/s", "GB/s", "TB/s", "PB/s", "EB/s"];
+    if bps < 1024 {
+        return (format!("{bps:>4}"), "B/s");
+    }
+    let mut v = bps as f64 / 1024.0;
+    let mut i = 0;
+    while v >= 1024.0 && i < UNITS.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    // One decimal while it fits in four places.
+    if (v * 10.0).round() / 10.0 >= 100.0 {
+        (format!("{v:>4.0}"), UNITS[i])
+    } else {
+        (format!("{v:>5.1}"), UNITS[i])
+    }
+}
+
+/// The instrument's display, let into the plate: the current download speed in
+/// seven-segment figures with its unit, annunciators for what the queue is doing (RX
+/// while it runs, HOLD while it is paused), and how much is left to fetch. Every figure
+/// is the same one the status bar and the header give in words.
+fn throughput_lcd(ui: &mut Ui, pal: &Palette, m: &super::theme::Metal, data: &Data, r: Rect) {
+    let resp = ui.interact(r, ui.id().with("throughput-lcd"), Sense::hover());
+    let paused = data.status.paused;
+    // A job reported as downloading counts as running, as its row shows it.
+    let running = data.status.running || data.jobs.iter().any(|j| j.state == newskite_service::JobState::Downloading);
+    let bps = if running { data.speed() } else { 0 };
+    let left = format::bytes(data.bytes_left());
+    if ui.is_rect_visible(r) {
+        let painter = ui.painter();
+        let lit = m.lcd_lit;
+        let dim = super::theme::Metal::lerp(m.lcd_glass, lit, 0.62);
+        super::metal::lcd_back(painter, m, r, if running { 1.0 } else { 0.35 });
+        let inner = r.shrink2(Vec2::new(10.0, 8.0));
+        // Annunciators along the top, the unit at its right end.
+        let tag_font = FontId::new(10.0, fonts::mono_semibold());
+        let mut x = inner.left();
+        for (word, on, color) in [("RX", running && !paused, lit), ("HOLD", paused, pal.warning)] {
+            let g = painter.layout_no_wrap(word.to_owned(), tag_font.clone(), lit);
+            let tag = Rect::from_min_size(Pos2::new(x, inner.top()), Vec2::new(g.size().x + 10.0, 15.0));
+            super::metal::lcd_tag(painter, m, tag, g, color, on);
+            x = tag.right() + 6.0;
+        }
+        let (figures, unit) = lcd_speed(bps);
+        painter.text(Pos2::new(inner.right(), inner.top() + 7.5), Align2::RIGHT_CENTER, unit, fonts::mono_id(10.5), dim);
+        // The figures, right-aligned as a meter's are; dimmer while nothing moves.
+        let h = 30.0;
+        let w = super::metal::lcd_digits_width(&figures, h);
+        let o = Pos2::new(inner.right() - w - h * 0.07, inner.top() + 21.0);
+        super::metal::lcd_digits(painter, o, &figures, h, if bps > 0 { lit } else { dim });
+        // What is left to fetch.
+        let foot = inner.bottom() - 5.0;
+        painter.text(Pos2::new(inner.left(), foot), Align2::LEFT_CENTER, "TO GO", fonts::mono_id(10.0), dim);
+        painter.text(Pos2::new(inner.right(), foot), Align2::RIGHT_CENTER, &left, FontId::new(11.0, fonts::mono_semibold()), lit);
+        super::metal::lcd_glass(painter, r);
+    }
+    let label = format!("Throughput display: {}, {left} to go", format::speed(bps));
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, &label));
+    resp.on_hover_text(if paused {
+        "The queue is paused"
+    } else if running {
+        "Download speed now, and how much the queue still has to fetch"
+    } else {
+        "Nothing is downloading"
+    });
 }
 
 /// The mark (beating while Newskite works) and, when wide, the wordmark.
@@ -137,7 +220,11 @@ fn brand_button(ui: &mut Ui, pal: &Palette, data: &Data, view: &ViewState, rail:
                 Pos2::new(mark.right() + 9.0, (rect.center().y - wm_h / 2.0).round()),
                 Vec2::new(WORDMARK_W, wm_h),
             );
-            icons::paint_svg(painter, icons::WORDMARK_URI, wm, pal.text);
+            match &pal.metal {
+                // The chrome lockup: the flat mark beside the wordmark in brushed steel.
+                Some(m) => super::metal::steel_svg(painter, pal, m, icons::WORDMARK_URI, wm),
+                None => icons::paint_svg(painter, icons::WORDMARK_URI, wm, pal.text),
+            }
         }
         if resp.has_focus() {
             focus_ring(ui, pal, rect, 6);
@@ -161,7 +248,18 @@ fn entry(ui: &mut Ui, pal: &Palette, e: &Entry, rail: bool) -> bool {
         let painter = ui.painter();
         // On the rail the slot is a square, with room in its corner for the count.
         let slot = rect.shrink2(Vec2::new(if rail { 2.0 } else { 0.0 }, 2.0));
-        if e.current {
+        if let Some(m) = &pal.metal {
+            // The views are keys: the current one latched and lit, the others rising out
+            // of the plate under the pointer.
+            let k = super::metal::KeyState { hover: 1.0, on: if e.current { 1.0 } else { 0.0 }, press: 0.0, color: pal.accent };
+            if e.current {
+                super::metal::key_body(painter, m, slot.shrink(1.0), 4, k);
+            } else if hover > 0.0 {
+                let mut p = painter.clone();
+                p.multiply_opacity(hover);
+                super::metal::key_body(&p, m, slot.shrink(1.0), 4, k);
+            }
+        } else if e.current {
             painter.rect_filled(slot, CornerRadius::same(8), pal.hover);
         } else if hover > 0.0 {
             painter.rect_filled(slot, CornerRadius::same(8), Palette::fade(pal.hover, 0.6 * hover));
@@ -239,4 +337,24 @@ fn disk_meter(ui: &mut Ui, pal: &Palette, data: &Data, rect: Rect, rail: bool) -
     let label = format!("Downloads disk: {text}");
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &label));
     resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(tip)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_display_keeps_four_places_in_the_window_units() {
+        assert_eq!(lcd_speed(0), ("   0".to_owned(), "B/s"));
+        assert_eq!(lcd_speed(1023), ("1023".to_owned(), "B/s"));
+        assert_eq!(lcd_speed(1024), ("  1.0".to_owned(), "KB/s"));
+        assert_eq!(lcd_speed(1024 * 1024 * 24 + 419_430), (" 24.4".to_owned(), "MB/s"));
+        // 99.96 would round to five places with a decimal: it drops the decimal instead.
+        assert_eq!(lcd_speed((99.96 * 1024.0 * 1024.0) as u64), (" 100".to_owned(), "MB/s"));
+        assert_eq!(lcd_speed(512 * 1024 * 1024), (" 512".to_owned(), "MB/s"));
+        for bps in [0, 1, 999, 1024, 1_500_000, 123_456_789, u64::MAX] {
+            let (figures, _) = lcd_speed(bps);
+            assert_eq!(figures.chars().filter(|c| *c != '.').count(), 4, "{figures:?}");
+        }
+    }
 }
