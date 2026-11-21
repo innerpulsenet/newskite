@@ -30,7 +30,9 @@
       Server passwords are stored unencrypted in the local database.
     </p>
   </description>
-  <url type="homepage">https://github.com/innerpulsenet/newskite</url>
+  <url type="homepage">https://newskite.innerpulse.net/</url>
+  <url type="bugtracker">https://github.com/innerpulsenet/newskite/issues</url>
+  <url type="vcs-browser">https://github.com/innerpulsenet/newskite</url>
   <launchable type="desktop-id">net.innerpulse.Newskite.desktop</launchable>
   <categories>
     <category>Network</category>
