@@ -1,11 +1,15 @@
 //! The innerpulse brand token sets: the one place (besides [`super::theme`]) where the
 //! GUI holds literal color values.
 //!
-//! Values are copied from the innerpulse brand kit (`innerpulse-tokens.css`): the ink and
-//! paper grounds with their three surfaces and three text steps, the desktop-family violet
-//! accent (phosphor on ink, the deep step on paper), the status colors and the ember
-//! signals (the mark, the action fill and focus). [`ink`] and [`paper`] build ordinary
-//! [`newskite_theme::Theme`]s, so the rest of the GUI treats them like a desktop theme.
+//! Values are copied from the innerpulse brand kit (`innerpulse-tokens.css`, and
+//! `innerpulse-warm.css` for the optional warm ink): the ink and paper grounds with their
+//! three surfaces and three text steps, the desktop-family violet accent (phosphor on ink,
+//! the deep step on paper), the status colors and the ember signals (the mark, the action
+//! fill and focus). Ink is carbon since the kit of 2026-11-05: the neutral cool-grey ground
+//! with steel text. The two ink sets also carry a [`MetalSet`]: the plate the window is cut
+//! from and the smoked glass of its keys, the materials the studio's desktop apps share.
+//! [`ink`], [`warm`] and [`paper`] build ordinary [`newskite_theme::Theme`]s, so the rest of
+//! the GUI treats them like a desktop theme.
 
 use newskite_theme::{Rgb, Theme, ThemeSource, Tokens};
 
@@ -40,10 +44,69 @@ pub struct BrandSet {
     pub warn: Rgb,
     /// Status: error.
     pub err: Rgb,
+    /// The window's materials, on the grounds that have them (the two inks).
+    pub metal: Option<MetalSet>,
 }
 
-/// The ink set (`#0a0908` ground, the violet phosphor).
+/// The materials of an ink ground: one plate the whole window is cut from, with dark glass
+/// let into it. Carbon's plate is brushed and its wordmark is steel; the warm plate is
+/// plain, since gunmetal tones would fight the warm ground.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MetalSet {
+    /// The plate.
+    pub plate: Rgb,
+    /// A hairline that reads on the plate and on the glass (the steel text at 16% over
+    /// the plate).
+    pub line: Rgb,
+    /// A key's smoked glass: at rest (top, foot), then held down (top, foot).
+    pub key: [Rgb; 4],
+    /// The steel ramp of the wordmark, top to foot: bright above the crease, dark through
+    /// it, a lighter band below. `None` paints the wordmark in the text color.
+    pub steel: Option<[Rgb; 5]>,
+    /// Whether the plate carries a brushed grain.
+    pub brushed: bool,
+}
+
+/// The ink set: carbon (`#0b0d10` ground, steel text, the violet phosphor).
 pub const INK: BrandSet = BrandSet {
+    dark: true,
+    ground: Rgb::new(0x0b, 0x0d, 0x10),
+    surface_1: Rgb::new(0x11, 0x13, 0x17),
+    surface_2: Rgb::new(0x17, 0x1a, 0x1f),
+    surface_3: Rgb::new(0x1f, 0x23, 0x29),
+    text: Rgb::new(0xe3, 0xe6, 0xe9),
+    text_2: Rgb::new(0xb9, 0xbd, 0xc3),
+    text_3: Rgb::new(0x8f, 0x94, 0x9b),
+    // rgba(227, 230, 233, .16) over the ground.
+    line: Rgb::new(0x2e, 0x30, 0x33),
+    accent: Rgb::new(0xb3, 0x8c, 0xff),
+    accent_text: Rgb::new(0x0b, 0x0d, 0x10),
+    ok: Rgb::new(0x7d, 0xff, 0xb0),
+    warn: Rgb::new(0xff, 0xb3, 0x47),
+    err: Rgb::new(0xff, 0x9a, 0x8f),
+    metal: Some(MetalSet {
+        plate: Rgb::new(0x26, 0x2a, 0x30),
+        line: Rgb::new(0x44, 0x48, 0x4e),
+        key: [
+            Rgb::new(0x1b, 0x1e, 0x23),
+            Rgb::new(0x0e, 0x10, 0x13),
+            Rgb::new(0x0c, 0x0d, 0x10),
+            Rgb::new(0x14, 0x16, 0x1a),
+        ],
+        steel: Some([
+            Rgb::new(0xf4, 0xf6, 0xf8),
+            Rgb::new(0xcf, 0xd3, 0xd8),
+            Rgb::new(0x8b, 0x90, 0x97),
+            Rgb::new(0xd5, 0xd9, 0xde),
+            Rgb::new(0x9d, 0xa2, 0xa9),
+        ]),
+        brushed: true,
+    }),
+};
+
+/// The optional warm ink set (`#0a0908` ground, warm greys), the brown-black ground of the
+/// 2026-10-25 kit. Never mixed with carbon on one screen.
+pub const WARM: BrandSet = BrandSet {
     dark: true,
     ground: Rgb::new(0x0a, 0x09, 0x08),
     surface_1: Rgb::new(0x10, 0x0e, 0x0c),
@@ -59,6 +122,18 @@ pub const INK: BrandSet = BrandSet {
     ok: Rgb::new(0x7d, 0xff, 0xb0),
     warn: Rgb::new(0xff, 0xb3, 0x47),
     err: Rgb::new(0xff, 0x9a, 0x8f),
+    metal: Some(MetalSet {
+        plate: Rgb::new(0x21, 0x1b, 0x14),
+        line: Rgb::new(0x42, 0x3c, 0x34),
+        key: [
+            Rgb::new(0x22, 0x1c, 0x15),
+            Rgb::new(0x13, 0x10, 0x0b),
+            Rgb::new(0x11, 0x0d, 0x09),
+            Rgb::new(0x1a, 0x15, 0x0f),
+        ],
+        steel: None,
+        brushed: false,
+    }),
 };
 
 /// The paper set (`#f4f1ec` ground, the deep violet step).
@@ -78,6 +153,7 @@ pub const PAPER: BrandSet = BrandSet {
     ok: Rgb::new(0x0d, 0x6d, 0x3d),
     warn: Rgb::new(0x8b, 0x51, 0x09),
     err: Rgb::new(0xa3, 0x22, 0x1a),
+    metal: None,
 };
 
 /// Ember signals. They are the same for every theme the window can wear (the desktop's
@@ -148,45 +224,64 @@ pub fn chart_set(dark: bool) -> [Rgb; 7] {
 /// step, slot 3 (charts.md §2: the phosphors are for text and dots, not series).
 pub const CHART_SERIES_SLOT: usize = 3;
 
-/// Scheme names the two brand themes carry (shown in diagnostics, used to look the set
-/// back up from a [`Theme`]).
-pub const INK_NAME: &str = "innerpulse ink";
+/// Scheme names the brand themes carry (shown in diagnostics).
+pub const INK_NAME: &str = "innerpulse carbon";
+/// See [`INK_NAME`].
+pub const WARM_NAME: &str = "innerpulse warm";
 /// See [`INK_NAME`].
 pub const PAPER_NAME: &str = "innerpulse paper";
 
 impl BrandSet {
-    /// The set as desktop-style tokens: the ground is the window surface, surface 1 the
-    /// raised surface (cards) and surface 2 the sunken one (inputs, wells).
+    /// The set as desktop-style tokens. On paper the ground is the window surface,
+    /// surface 1 the raised surface (cards) and surface 2 the sunken one (inputs, wells).
+    /// On a ground with materials the window surface is the plate, and what was raised is
+    /// glass let into it: cards are surface 1 and wells the ground itself.
     pub fn tokens(&self) -> Tokens {
+        let (surface, raised, sunken, line) = match &self.metal {
+            Some(m) => (m.plate, self.surface_1, self.ground, m.line),
+            None => (self.ground, self.surface_1, self.surface_2, self.line),
+        };
         Tokens {
-            surface: self.ground,
-            surface_raised: self.surface_1,
-            surface_sunken: self.surface_2,
+            surface,
+            surface_raised: raised,
+            surface_sunken: sunken,
             text: self.text,
             text_muted: self.text_2,
             accent: self.accent,
             accent_text: self.accent_text,
-            border: self.line,
+            border: line,
             positive: self.ok,
             warning: self.warn,
             negative: self.err,
         }
     }
 
-    /// The set as a [`Theme`] named [`INK_NAME`] or [`PAPER_NAME`].
+    /// The set as a [`Theme`] named [`INK_NAME`], [`WARM_NAME`] or [`PAPER_NAME`].
     pub fn theme(&self) -> Theme {
+        let name = if !self.dark {
+            PAPER_NAME
+        } else if self.ground == WARM.ground {
+            WARM_NAME
+        } else {
+            INK_NAME
+        };
         Theme {
             tokens: self.tokens(),
             dark: self.dark,
             source: ThemeSource::Fallback,
-            scheme_name: Some(if self.dark { INK_NAME } else { PAPER_NAME }.to_owned()),
+            scheme_name: Some(name.to_owned()),
         }
     }
 }
 
-/// The innerpulse ink theme.
+/// The innerpulse ink theme (carbon).
 pub fn ink() -> Theme {
     INK.theme()
+}
+
+/// The optional warm ink theme.
+pub fn warm() -> Theme {
+    WARM.theme()
 }
 
 /// The innerpulse paper theme.
@@ -194,9 +289,9 @@ pub fn paper() -> Theme {
     PAPER.theme()
 }
 
-/// The brand set a theme was built from, if it is one of the two brand themes.
+/// The brand set a theme was built from, if it is one of the brand themes.
 pub fn brand_set_of(theme: &Theme) -> Option<&'static BrandSet> {
-    [&INK, &PAPER]
+    [&INK, &WARM, &PAPER]
         .into_iter()
         .find(|s| s.dark == theme.dark && s.tokens() == theme.tokens)
 }
@@ -208,9 +303,14 @@ mod tests {
     #[test]
     fn hairlines_match_the_kit_alpha() {
         // line-2 is a translucent text color; the opaque value is that alpha over the ground.
-        let ink_line = INK.ground.mix(Rgb::new(244, 241, 236), 0.16);
+        let ink_line = INK.ground.mix(INK.text, 0.16);
+        let warm_line = WARM.ground.mix(Rgb::new(244, 241, 236), 0.16);
         let paper_line = PAPER.ground.mix(Rgb::new(20, 23, 28), 0.2);
-        for (got, want) in [(INK.line, ink_line), (PAPER.line, paper_line)] {
+        let plates = [&INK, &WARM].map(|s| {
+            let m = s.metal.expect("the inks have materials");
+            (m.line, m.plate.mix(s.text, 0.16))
+        });
+        for (got, want) in [(INK.line, ink_line), (WARM.line, warm_line), (PAPER.line, paper_line)].into_iter().chain(plates) {
             for (a, b) in [(got.r, want.r), (got.g, want.g), (got.b, want.b)] {
                 assert!(a.abs_diff(b) <= 1, "{got:?} vs {want:?}");
             }
@@ -219,8 +319,9 @@ mod tests {
 
     #[test]
     fn brand_text_is_readable_on_every_surface() {
-        for set in [INK, PAPER] {
-            for surface in [set.ground, set.surface_1, set.surface_2, set.surface_3] {
+        for set in [INK, WARM, PAPER] {
+            let plate = set.metal.map(|m| m.plate);
+            for surface in [set.ground, set.surface_1, set.surface_2, set.surface_3].into_iter().chain(plate) {
                 for text in [set.text, set.text_2, set.text_3, set.accent] {
                     assert!(
                         text.contrast(surface) >= 4.5,
@@ -252,8 +353,10 @@ mod tests {
     #[test]
     fn brand_themes_are_recognized() {
         assert_eq!(brand_set_of(&ink()), Some(&INK));
+        assert_eq!(brand_set_of(&warm()), Some(&WARM));
         assert_eq!(brand_set_of(&paper()), Some(&PAPER));
+        assert_ne!(ink().scheme_name, warm().scheme_name);
         assert_eq!(brand_set_of(&newskite_theme::fallback(true)), None);
-        assert!(ink().dark && !paper().dark);
+        assert!(ink().dark && warm().dark && !paper().dark);
     }
 }

@@ -144,7 +144,8 @@ Each feature lists: what it does, rules, and edge cases the implementation must 
 - An account/summary pane showing cumulative downloaded bytes and job counts (done/pending).
 
 ### F10. Theming
-- Follow the **desktop's** light/dark scheme; do not ship a fixed palette.
+- Offer the **desktop's** light/dark scheme (below) beside the product's own themes; a new
+  install wears the product's default theme until the user chooses, the same on every platform.
 - Derive a small token set: surface, surface-raised, surface-sunken, text, text-muted, accent,
   accent-text, border, positive, warning, negative.
 - On KDE: read `~/.config/kdeglobals` (`[General] ColorScheme`, `[Colors:Window]

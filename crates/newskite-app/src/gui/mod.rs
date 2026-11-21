@@ -19,6 +19,7 @@ pub mod events;
 pub mod fonts;
 pub mod icons;
 pub mod inspector;
+pub mod metal;
 pub mod motion;
 pub mod queue;
 pub mod repair;

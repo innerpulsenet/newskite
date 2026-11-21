@@ -375,11 +375,10 @@ fn list(ui: &mut Ui, pal: &Palette, data: &Data, jobs: &[&Job], view: &mut ViewS
     if kind == RowKind::Queue {
         view.queue.row_rects.clear();
     }
-    let frame = egui::Frame::new()
-        .fill(pal.raised)
-        .stroke(egui::Stroke::new(1.0, pal.border))
-        .corner_radius(egui::CornerRadius::same(12))
-        .show(ui, |ui| {
+    let frame = egui::Frame::new().fill(pal.raised).corner_radius(egui::CornerRadius::same(pal.radius(12)));
+    // Flat: a hairline card. With materials: a well of dark glass let into the plate.
+    let frame = if pal.metal.is_some() { frame } else { frame.stroke(egui::Stroke::new(1.0, pal.border)) };
+    let frame = super::widgets::sunk(ui, pal, frame, |ui| {
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing.y = 0.0;
             let last = jobs.len().saturating_sub(1);

@@ -1,11 +1,12 @@
-//! The Appearance choice (Settings › Appearance): follow the desktop (the default, outline
-//! F10) or wear one of the two innerpulse themes.
+//! The Appearance choice (Settings › Appearance): wear one of the innerpulse themes
+//! (carbon, the studio's ground, until the user chooses otherwise) or follow the desktop
+//! (outline F10).
 //!
 //! `Settings` belongs to `newskite-types` and is shared with the headless CLI, so the
 //! choice is a GUI preference stored on its own: a small JSON document,
-//! `<data dir>/appearance.json`, next to the database (`{"theme": "follow-desktop"}`,
-//! `"innerpulse-ink"` or `"innerpulse-paper"`). A missing or unreadable file means
-//! "follow desktop".
+//! `<data dir>/appearance.json`, next to the database (`{"theme": "innerpulse-ink"}`,
+//! `"innerpulse-warm"`, `"innerpulse-paper"` or `"follow-desktop"`). A missing or
+//! unreadable file means nothing was chosen: carbon, on Linux and Windows alike.
 
 use std::path::Path;
 
@@ -22,25 +23,33 @@ pub enum Appearance {
     /// The desktop color scheme (kdeglobals / portal / fallback), live.
     #[default]
     FollowDesktop,
-    /// innerpulse ink: the warm near-black ground with the violet accent.
+    /// innerpulse carbon (the kit's ink): the brushed plate on cool blacks, steel text
+    /// and the violet accent. Stored as `innerpulse-ink`.
     Ink,
+    /// The kit's optional warm ink: the same materials on the brown-black ground.
+    Warm,
     /// innerpulse paper: the warm off-white ground with the deep violet.
     Paper,
 }
 
 impl Appearance {
     /// Every choice, in menu order.
-    pub const ALL: [Appearance; 3] = [
-        Appearance::FollowDesktop,
+    pub const ALL: [Appearance; 4] = [
         Appearance::Ink,
+        Appearance::Warm,
         Appearance::Paper,
+        Appearance::FollowDesktop,
     ];
+
+    /// What a window wears until its user chooses: carbon.
+    pub const UNCHOSEN: Appearance = Appearance::Ink;
 
     /// The label shown in Settings.
     pub fn label(self) -> &'static str {
         match self {
             Appearance::FollowDesktop => "Follow desktop",
-            Appearance::Ink => "innerpulse ink",
+            Appearance::Ink => "innerpulse carbon",
+            Appearance::Warm => "innerpulse warm",
             Appearance::Paper => "innerpulse paper",
         }
     }
@@ -50,6 +59,7 @@ impl Appearance {
         match self {
             Appearance::FollowDesktop => "follow-desktop",
             Appearance::Ink => "innerpulse-ink",
+            Appearance::Warm => "innerpulse-warm",
             Appearance::Paper => "innerpulse-paper",
         }
     }
@@ -64,6 +74,7 @@ impl Appearance {
         match self {
             Appearance::FollowDesktop => desktop.clone(),
             Appearance::Ink => brand_tokens::ink(),
+            Appearance::Warm => brand_tokens::warm(),
             Appearance::Paper => brand_tokens::paper(),
         }
     }
@@ -80,12 +91,12 @@ impl Appearance {
     }
 }
 
-/// Reads the choice from `path` (follow desktop when missing or unreadable).
+/// Reads the choice from `path` ([`Appearance::UNCHOSEN`] when missing or unreadable).
 pub fn load(path: &Path) -> Appearance {
     std::fs::read_to_string(path)
         .ok()
         .and_then(|t| Appearance::from_json(&t))
-        .unwrap_or_default()
+        .unwrap_or(Appearance::UNCHOSEN)
 }
 
 /// Whether the document at `path` asks for reduced motion (`"reduce_motion": true`;
@@ -135,8 +146,10 @@ mod tests {
         assert_eq!(Appearance::from_json("not json"), None);
         let dir = tempfile::tempdir().expect("tempdir");
         let p = dir.path().join("sub").join(FILE_NAME);
-        assert_eq!(load(&p), Appearance::FollowDesktop, "missing file");
+        assert_eq!(load(&p), Appearance::Ink, "missing file: carbon");
         assert!(!load_reduce_motion(&p), "missing file");
+        save(&p, Appearance::FollowDesktop, false).expect("save");
+        assert_eq!(load(&p), Appearance::FollowDesktop, "a stored choice is kept");
         save(&p, Appearance::Paper, false).expect("save");
         assert_eq!(load(&p), Appearance::Paper);
         assert!(!load_reduce_motion(&p));
@@ -144,7 +157,7 @@ mod tests {
         assert_eq!(load(&p), Appearance::Ink);
         assert!(load_reduce_motion(&p));
         std::fs::write(&p, "garbage").expect("write");
-        assert_eq!(load(&p), Appearance::FollowDesktop, "unreadable file");
+        assert_eq!(load(&p), Appearance::Ink, "unreadable file");
     }
 
     #[test]
@@ -152,6 +165,8 @@ mod tests {
         let desktop = newskite_theme::fallback(false);
         assert_eq!(Appearance::FollowDesktop.resolve(&desktop), desktop);
         assert!(Appearance::Ink.resolve(&desktop).dark);
+        assert!(Appearance::Warm.resolve(&desktop).dark);
+        assert_ne!(Appearance::Warm.resolve(&desktop), Appearance::Ink.resolve(&desktop));
         assert!(!Appearance::Paper.resolve(&desktop).dark);
         assert_eq!(
             Appearance::Ink.resolve(&desktop).scheme_name.as_deref(),

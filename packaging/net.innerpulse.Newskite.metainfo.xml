@@ -22,7 +22,7 @@
       <li>Built-in PAR2 verify and repair plus RAR, 7z and ZIP extraction, including split and spanned volumes and passwords</li>
       <li>Watch folder, speed limit, scheduler window and optional shutdown when done</li>
       <li>Live throughput graph, activity log and bookmarks</li>
-      <li>Follows the desktop light or dark color scheme</li>
+      <li>The innerpulse carbon look, a warm ink and a paper theme, or the desktop light or dark color scheme</li>
       <li>Headless command-line mode that drives the same queue engine</li>
     </ul>
     <p>
@@ -58,6 +58,11 @@
     <release version="1.5.0" date="2026-11-21">
       <description>
         <p>Faster and quieter: downloads reserve half the memory per article, keep every connection fetching while finished files are flushed to disk, and request the first article of every file ahead; verification reads damaged files once; and an idle window no longer redraws. Long queues and histories stay smooth. Canceling a download no longer makes later articles look missing. A first-run guide leads to the server settings, Settings asks before discarding changes, and the keyboard reaches more (Ctrl+1/2/3, Ctrl+S, Enter to confirm).</p>
+      </description>
+    </release>
+    <release version="1.0.0" date="2026-11-10">
+      <description>
+        <p>A new look on Linux and Windows: the innerpulse carbon theme, with a brushed plate, keys of smoked glass, frosted sheets, toasts and menus, and a seven-segment display of the download speed in the sidebar. A warm ink theme joins paper, and following the desktop color scheme stays available in Settings. The app icons are redrawn on the carbon ground.</p>
       </description>
     </release>
     <release version="0.9.0" date="2026-11-02">
