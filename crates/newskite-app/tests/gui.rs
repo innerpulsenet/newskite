@@ -1953,3 +1953,44 @@ fn an_empty_state_filter_names_itself() {
     h.run_steps(2);
     assert_eq!(app(&h).view.list_filter, ListFilter::All);
 }
+
+/// A long history costs what fits on screen: prints the frame time of the History view
+/// with 2,000 finished jobs (each with a saved article map). Run by hand:
+/// `cargo test -p newskite --release --test gui long_history -- --ignored --nocapture`.
+#[test]
+#[ignore = "a measurement, not a check"]
+fn long_history_frame_time() {
+    let fx = Fixture::new(|store, dir| {
+        for i in 0..2000 {
+            let name = format!("Finished.Job.{i:04}");
+            let job = store
+                .insert_job_at(
+                    &NewJob {
+                        name: name.clone(),
+                        bytes_total: 700 * 1024 * 1024,
+                        dest_dir: dir.join(&name),
+                        source_path: dir.join(format!("{name}.nzb")),
+                        password: None,
+                    },
+                    now() - 100_000 + i,
+                )
+                .expect("job");
+            store.set_job_progress(job.id, 700 * 1024 * 1024).expect("progress");
+            store.set_job_state(job.id, JobState::Done, None).expect("state");
+            seed_map(store, job.id, &[("a.bin", 900)], |_| newskite_types::ArticleState::Done);
+        }
+    });
+    let mut h = fx.harness(true, SIZE);
+    h.state_mut();
+    let started = std::time::Instant::now();
+    h.run_steps(3);
+    println!("first three frames: {:?}", started.elapsed());
+    h.state_mut().as_mut().expect("app").push_action(Action::SetTab(Tab::History));
+    // Let every article map load (they are read within a per-frame budget).
+    h.run_steps(400);
+    let frames = 200;
+    let started = std::time::Instant::now();
+    h.run_steps(frames);
+    println!("History, 2,000 jobs: {:?} per frame", started.elapsed() / frames as u32);
+    assert_eq!(app(&h).data.strips.len(), 2000, "every strip was read");
+}

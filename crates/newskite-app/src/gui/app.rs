@@ -494,6 +494,8 @@ pub struct NewskiteApp {
     last_history_reload: Instant,
     /// A background history read is on its way.
     history_loading: bool,
+    /// The window title as last set.
+    title: String,
 }
 
 fn now_secs() -> i64 {
@@ -594,6 +596,7 @@ impl NewskiteApp {
             pending,
             last_history_reload: Instant::now(),
             history_loading: false,
+            title: newskite_types::APP_NAME.to_owned(),
         };
         app.reload_all();
         app.finished_seen = app.finished_ids();
@@ -1655,6 +1658,11 @@ impl NewskiteApp {
             self.refresh_history();
         }
         self.refresh_article_maps();
+        let title = window_title(&self.data);
+        if title != self.title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.title = title;
+        }
         self.shortcuts(ctx);
         self.dropped_files(ctx);
         self.animate_marks(ctx);
@@ -2084,10 +2092,31 @@ pub fn expand_drop(paths: &[PathBuf]) -> (Vec<PathBuf>, Vec<PathBuf>) {
 /// Drops from `seen` the jobs that are no longer done or failed (retried, removed), so
 /// their next completion notifies again.
 fn forget_unfinished(seen: &mut HashSet<i64>, jobs: &[Job]) {
-    seen.retain(|id| {
-        jobs.iter()
-            .any(|j| j.id == *id && matches!(j.state, JobState::Done | JobState::Failed))
-    });
+    if seen.is_empty() {
+        return;
+    }
+    let finished: HashSet<i64> =
+        jobs.iter().filter(|j| matches!(j.state, JobState::Done | JobState::Failed)).map(|j| j.id).collect();
+    seen.retain(|id| finished.contains(id));
+}
+
+/// The window's title: while a run is active, how far the pending bytes are and the
+/// measured speed, so a minimized window still says how it is going; the name alone
+/// otherwise.
+pub fn window_title(data: &Data) -> String {
+    let st = &data.status;
+    let name = newskite_types::APP_NAME;
+    if st.running && !st.paused {
+        let pct = (statusbar::pending_fraction(data) * 100.0).floor() as u32;
+        match data.speed() {
+            0 => format!("{pct}% · {name}"),
+            speed => format!("{pct}% · {} · {name}", newskite_types::format::speed(speed)),
+        }
+    } else if st.paused {
+        format!("Paused · {name}")
+    } else {
+        name.to_owned()
+    }
 }
 
 /// The notification text for jobs finished (done or failed) and not yet in `seen`, if
@@ -2228,6 +2257,23 @@ mod tests {
         ));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn the_title_reports_a_run_and_rests_otherwise() {
+        let mut d = Data::default();
+        assert_eq!(window_title(&d), "Newskite");
+        let mut a = job(1, JobState::Downloading);
+        a.bytes_total = 1000;
+        a.bytes_done = 425;
+        d.jobs = vec![a];
+        d.status.running = true;
+        assert_eq!(window_title(&d), "42% · Newskite", "no measured speed, none shown");
+        d.status.speed_bps = 2 * 1024 * 1024;
+        assert_eq!(window_title(&d), "42% · 2.0 MB/s · Newskite");
+        d.status.running = false;
+        d.status.paused = true;
+        assert_eq!(window_title(&d), "Paused · Newskite");
     }
 
     #[test]
