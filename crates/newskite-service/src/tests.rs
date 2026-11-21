@@ -429,6 +429,24 @@ async fn bytes_of_a_short_run_reach_the_lifetime_total_and_history() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn log_file_counts_what_it_holds_and_rotates() {
+    let tmp = TempDir::new().unwrap();
+    let data = tmp.path().join("db");
+    std::fs::create_dir_all(&data).unwrap();
+    // A log left by an earlier session, just under the limit: its size counts.
+    std::fs::write(data.join(crate::LOG_FILE_NAME), vec![b'x'; crate::LOG_FILE_MAX as usize - 10]).unwrap();
+    let svc = Service::open(ServiceOptions::new(&data), tokio::runtime::Handle::current()).unwrap();
+    svc.log(LogLevel::Info, "first after start");
+    let rotated = data.join(format!("{}.1", crate::LOG_FILE_NAME));
+    assert!(rotated.exists(), "the old file was rotated once the limit was passed");
+    assert!(std::fs::read_to_string(&rotated).unwrap().ends_with("first after start\n"));
+    svc.log(LogLevel::Warn, "second");
+    let current = std::fs::read_to_string(svc.log_file_path()).unwrap();
+    assert_eq!(current.lines().count(), 1, "{current}");
+    assert!(current.ends_with(" warn  second\n"), "{current}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cached_settings_follow_every_write() {
     let tmp = TempDir::new().unwrap();
     let svc = open_service(tmp.path(), test_settings(tmp.path(), vec![]));
