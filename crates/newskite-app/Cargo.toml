@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "Desktop Usenet (NZB) download client"
+homepage = "https://newskite.innerpulse.net"
 
 [[bin]]
 name = "newskite"
