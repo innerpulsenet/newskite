@@ -293,7 +293,7 @@ pub(crate) fn recovery_intact(r: &RecoveryRef) -> io::Result<bool> {
     f.seek(SeekFrom::Start(r.packet_offset + 32))?;
     let mut h = Md5::new();
     let mut left = r.packet_len - 32;
-    let mut buf = vec![0u8; 1 << 20];
+    let mut buf = vec![0u8; left.min(1 << 20) as usize];
     while left > 0 {
         let n = (left as usize).min(buf.len());
         f.read_exact(&mut buf[..n])?;
