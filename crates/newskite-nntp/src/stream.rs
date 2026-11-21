@@ -22,7 +22,7 @@ pub(crate) enum Stream {
 impl Stream {
     /// Wraps `tcp` in TLS, verifying the certificate against `host` (also sent as SNI).
     pub(crate) async fn tls(tcp: TcpStream, host: &str) -> Result<Self, NntpError> {
-        let config = client_config()?;
+        let config = shared_client_config().await?;
         let name = ServerName::try_from(host.to_owned())
             .map_err(|e| NntpError::Tls(format!("invalid server name {host:?}: {e}")))?;
         let tls = TlsConnector::from(config)
@@ -40,10 +40,23 @@ fn tls_error_text(e: &io::Error) -> String {
     }
 }
 
+/// [`client_config`] without blocking an async thread: the first call reads the platform's
+/// certificate store, which may take a while, so it runs on the blocking pool (and every
+/// connection opened meanwhile waits there rather than on a runtime thread).
+async fn shared_client_config() -> Result<Arc<rustls::ClientConfig>, NntpError> {
+    match CONFIG.get() {
+        Some(built) => built.clone().map_err(NntpError::Tls),
+        None => tokio::task::spawn_blocking(client_config)
+            .await
+            .map_err(|e| NntpError::Tls(format!("loading the TLS configuration failed: {e}")))?,
+    }
+}
+
+static CONFIG: OnceLock<Result<Arc<rustls::ClientConfig>, String>> = OnceLock::new();
+
 /// Builds (once per process) the rustls client config: `ring` provider, safe default
 /// protocol versions, roots = platform store plus bundled Mozilla roots.
 fn client_config() -> Result<Arc<rustls::ClientConfig>, NntpError> {
-    static CONFIG: OnceLock<Result<Arc<rustls::ClientConfig>, String>> = OnceLock::new();
     CONFIG
         .get_or_init(build_client_config)
         .clone()
@@ -130,5 +143,11 @@ mod tests {
         // Building twice returns the cached instance.
         let again = client_config().expect("config");
         assert!(Arc::ptr_eq(&cfg, &again));
+    }
+
+    #[tokio::test]
+    async fn shared_config_is_the_cached_one() {
+        let from_async = shared_client_config().await.expect("config");
+        assert!(Arc::ptr_eq(&from_async, &client_config().expect("config")));
     }
 }
