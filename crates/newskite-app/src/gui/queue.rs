@@ -145,10 +145,14 @@ impl QueueState {
                 }
             }
         }
-        self.last_states
-            .retain(|id, _| jobs.iter().any(|j| j.id == *id));
-        self.flashes
-            .retain(|id, (_, at)| jobs.iter().any(|j| j.id == *id) && now - *at < FLASH_SECS);
+        // Every job was just inserted, so only a shorter list can leave stale entries (a
+        // per-frame scan of jobs × jobs would cost milliseconds on a long history).
+        if self.last_states.len() != jobs.len() {
+            let ids: std::collections::HashSet<i64> = jobs.iter().map(|j| j.id).collect();
+            self.last_states.retain(|id, _| ids.contains(id));
+        }
+        let states = &self.last_states;
+        self.flashes.retain(|id, (_, at)| states.contains_key(id) && now - *at < FLASH_SECS);
     }
 
     /// 1 → 0 over [`FLASH_SECS`] for a row that just finished, with its state.
