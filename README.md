@@ -8,6 +8,9 @@
 
 # Newskite
 
+**Website and downloads: [newskite.innerpulse.net](https://newskite.innerpulse.net)** ·
+[Latest release](https://github.com/innerpulsenet/newskite/releases/latest)
+
 Newskite is a desktop Usenet (NZB) download client written in Rust. You give it an NZB file;
 it downloads the listed articles from your news server (NNTP, usually over TLS), decodes the
 yEnc payloads, writes the original files to disk byte for byte, then verifies, repairs and
