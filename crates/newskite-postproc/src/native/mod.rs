@@ -230,6 +230,8 @@ pub(crate) struct Sink<'a> {
     summary: Summary,
     /// Last folder verified or created (relative), to skip re-checking siblings.
     last_dir: Option<PathBuf>,
+    /// Copy buffer for entry data, allocated on first use and kept for every entry.
+    buf: Vec<u8>,
 }
 
 /// Copy buffer size for entry data.
@@ -250,6 +252,7 @@ impl<'a> Sink<'a> {
             progress: Progress { total: 0, done: 0, next_pct: PROGRESS_STEP_PCT },
             summary: Summary::default(),
             last_dir: None,
+            buf: Vec::new(),
         }
     }
 
@@ -338,7 +341,8 @@ impl<'a> Sink<'a> {
     /// partially written file is removed when reading or writing fails.
     pub fn write_entry(&mut self, rel: &Path, reader: &mut dyn Read) -> Result<(PathBuf, u64), CopyError> {
         let (path, mut file) = self.create_file(rel).map_err(CopyError::Write)?;
-        let mut buf = vec![0u8; CHUNK];
+        let mut buf = std::mem::take(&mut self.buf);
+        buf.resize(CHUNK, 0);
         let mut written = 0u64;
         let res = loop {
             let n = match reader.read(&mut buf) {
@@ -353,6 +357,7 @@ impl<'a> Sink<'a> {
             written += n as u64;
             self.advance(n as u64);
         };
+        self.buf = buf;
         if let Err(e) = res {
             drop(file);
             let _ = std::fs::remove_file(&path);

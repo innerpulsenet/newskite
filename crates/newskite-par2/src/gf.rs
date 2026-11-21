@@ -2,6 +2,7 @@
 //! x^16 + x^12 + x^3 + x + 1 (0x1100B), generator 2, slice data read as little-endian
 //! 16-bit words.
 
+use std::cell::OnceCell;
 use std::sync::OnceLock;
 
 const POLY: u32 = 0x1100B;
@@ -34,7 +35,8 @@ fn tables() -> &'static Tables {
     })
 }
 
-pub(crate) fn mul(a: u16, b: u16) -> u16 {
+#[cfg(test)]
+fn mul(a: u16, b: u16) -> u16 {
     if a == 0 || b == 0 {
         return 0;
     }
@@ -83,10 +85,17 @@ pub(crate) fn input_constants(count: usize) -> Vec<u16> {
 /// Products of one constant `c` with every nibble of a word: `nib[i][x]` is the low byte
 /// of `c * (x << 4i)` and `nib[4 + i][x]` its high byte, for nibble position `i` in `0..4`.
 /// Each 16-entry table fits one SIMD shuffle register; the scalar path widens them to
-/// byte tables.
+/// byte tables once, on its first long run with this table.
 #[repr(align(64))]
 pub(crate) struct MulTable {
     nib: [[u8; 16]; 8],
+    wide: OnceCell<Box<ByteTables>>,
+}
+
+/// Products with every low byte and every high byte of a word.
+struct ByteTables {
+    lo: [u16; 256],
+    hi: [u16; 256],
 }
 
 impl MulTable {
@@ -111,7 +120,13 @@ impl MulTable {
                 nib[4 + i][x] = (v[x] >> 8) as u8;
             }
         }
-        Self { nib }
+        Self { nib, wide: OnceCell::new() }
+    }
+
+    /// The constant `c` this table multiplies by (`c * 1`).
+    #[inline]
+    fn constant(&self) -> u16 {
+        u16::from_le_bytes([self.nib[0][1], self.nib[4][1]])
     }
 
     /// `c * w` from the nibble tables (eight lookups).
@@ -124,15 +139,18 @@ impl MulTable {
         u16::from_le_bytes([lo, hi])
     }
 
-    /// Products with every low byte and every high byte of a word (two lookups per word).
-    fn bytes(&self) -> ([u16; 256], [u16; 256]) {
-        let mut lo = [0u16; 256];
-        let mut hi = [0u16; 256];
-        for b in 0..256usize {
-            lo[b] = self.word(b as u16);
-            hi[b] = self.word((b as u16) << 8);
-        }
-        (lo, hi)
+    /// Products with every low byte and every high byte of a word (two lookups per word),
+    /// built on first use.
+    fn bytes(&self) -> &ByteTables {
+        self.wide.get_or_init(|| {
+            let part = |i: usize, x: usize| u16::from_le_bytes([self.nib[i][x], self.nib[4 + i][x]]);
+            let mut t = Box::new(ByteTables { lo: [0; 256], hi: [0; 256] });
+            for b in 0..256usize {
+                t.lo[b] = part(0, b & 15) ^ part(1, b >> 4);
+                t.hi[b] = part(2, b & 15) ^ part(3, b >> 4);
+            }
+            t
+        })
     }
 }
 
@@ -187,20 +205,31 @@ impl Kernel {
     }
 
     /// Bytes per [`mul_acc`](Self::mul_acc) call that make its fixed cost negligible
-    /// while staying small enough for the first-level cache. The scalar path widens its
-    /// tables on every call, so it wants longer runs.
+    /// while staying small enough for the first-level cache.
     pub(crate) fn block(self) -> usize {
-        match self.0 {
-            KernelKind::Scalar => 32 << 10,
-            #[cfg(target_arch = "x86_64")]
-            KernelKind::Ssse3 | KernelKind::Avx2 => 4 << 10,
-        }
+        4 << 10
     }
 
     /// `dst ^= c * src` word by word (`t` is `c`'s table). Lengths must match and be even.
+    /// Multiplying by 0 changes nothing and by 1 is a plain XOR, so neither goes through
+    /// the tables.
     pub(crate) fn mul_acc(self, dst: &mut [u8], src: &[u8], t: &MulTable) {
         assert_eq!(dst.len(), src.len(), "mul_acc needs equal lengths");
         debug_assert!(dst.len().is_multiple_of(2), "mul_acc works on whole words");
+        match t.constant() {
+            0 => {}
+            1 => match self.0 {
+                // SAFETY: as for `mul_acc_tables`.
+                #[cfg(target_arch = "x86_64")]
+                KernelKind::Avx2 => unsafe { x86::xor_avx2(dst, src) },
+                _ => xor_into(dst, src),
+            },
+            _ => self.mul_acc_tables(dst, src, t),
+        }
+    }
+
+    /// [`mul_acc`](Self::mul_acc) through the tables whatever the constant.
+    fn mul_acc_tables(self, dst: &mut [u8], src: &[u8], t: &MulTable) {
         match self.0 {
             KernelKind::Scalar => mul_acc_scalar(dst, src, t),
             // SAFETY: a `Kernel` with this kind exists only when `available` saw the CPU
@@ -219,10 +248,18 @@ pub(crate) fn mul_acc(dst: &mut [u8], src: &[u8], t: &MulTable) {
     Kernel::best().mul_acc(dst, src, t);
 }
 
-/// The portable path. Long runs widen the nibble tables to byte tables first (two
-/// lookups per word, four words per step); short ones (SIMD tails) use the nibble tables.
+/// `dst ^= src`.
+#[inline(always)]
+fn xor_into(dst: &mut [u8], src: &[u8]) {
+    for (d, s) in dst.iter_mut().zip(src) {
+        *d ^= s;
+    }
+}
+
+/// The portable path. Long runs use the byte tables (two lookups per word, four words per
+/// step); short ones (SIMD tails) use the nibble tables.
 fn mul_acc_scalar(dst: &mut [u8], src: &[u8], t: &MulTable) {
-    if dst.len() < 1024 {
+    if dst.len() < 1024 && t.wide.get().is_none() {
         for (d, s) in dst.chunks_exact_mut(2).zip(src.chunks_exact(2)) {
             let p = t.word(u16::from_le_bytes([s[0], s[1]]));
             d[0] ^= p as u8;
@@ -230,7 +267,7 @@ fn mul_acc_scalar(dst: &mut [u8], src: &[u8], t: &MulTable) {
         }
         return;
     }
-    let (lo, hi) = t.bytes();
+    let ByteTables { lo, hi } = t.bytes();
     let mut d8 = dst.chunks_exact_mut(8);
     let mut s8 = src.chunks_exact(8);
     for (d, s) in (&mut d8).zip(&mut s8) {
@@ -258,7 +295,15 @@ fn mul_acc_scalar(dst: &mut [u8], src: &[u8], t: &MulTable) {
 mod x86 {
     use std::arch::x86_64::*;
 
-    use super::{mul_acc_scalar, MulTable};
+    use super::{mul_acc_scalar, xor_into, MulTable};
+
+    /// `dst ^= src` with 32-byte vectors.
+    ///
+    /// Only call this when the CPU supports AVX2 (`Kernel` guarantees it).
+    #[target_feature(enable = "avx2")]
+    pub(super) fn xor_avx2(dst: &mut [u8], src: &[u8]) {
+        xor_into(dst, src);
+    }
 
     /// AVX2: 64 bytes (32 words) per step; the rest goes through the scalar path.
     ///
@@ -374,6 +419,48 @@ mod x86 {
 /// Inverts the `n`x`n` row-major matrix `m` by Gauss-Jordan elimination. `None` when it
 /// is singular.
 pub(crate) fn invert(m: &[u16], n: usize) -> Option<Vec<u16>> {
+    invert_with(Kernel::best(), m, n)
+}
+
+/// [`invert`] with a given kernel. The rows of `[m | I]` are kept as little-endian words,
+/// so every row operation is one [`Kernel::mul_acc`]. The pivot row of column `col` is
+/// zero left of it (earlier columns were cleared in every row but their own), so the row
+/// operations for `col` start there.
+pub(crate) fn invert_with(kernel: Kernel, m: &[u16], n: usize) -> Option<Vec<u16>> {
+    let row_bytes = 4 * n;
+    let mut rows = vec![0u8; n * row_bytes];
+    for (i, row) in rows.chunks_exact_mut(row_bytes.max(1)).enumerate() {
+        for (j, w) in row[..2 * n].chunks_exact_mut(2).enumerate() {
+            w.copy_from_slice(&m[i * n + j].to_le_bytes());
+        }
+        row[2 * (n + i)] = 1;
+    }
+    let at = |rows: &[u8], r: usize, c: usize| u16::from_le_bytes([rows[r * row_bytes + 2 * c], rows[r * row_bytes + 2 * c + 1]]);
+    let mut pivot_row = vec![0u8; row_bytes];
+    for col in 0..n {
+        let pivot = (col..n).find(|&r| at(&rows, r, col) != 0)?;
+        if pivot != col {
+            let (head, tail) = rows.split_at_mut(pivot * row_bytes);
+            head[col * row_bytes..(col + 1) * row_bytes].swap_with_slice(&mut tail[..row_bytes]);
+        }
+        let from = 2 * col;
+        let p = &mut pivot_row[from..];
+        p.fill(0);
+        kernel.mul_acc(p, &rows[col * row_bytes + from..(col + 1) * row_bytes], &MulTable::new(inv(at(&rows, col, col))));
+        rows[col * row_bytes + from..(col + 1) * row_bytes].copy_from_slice(p);
+        for (r, row) in rows.chunks_exact_mut(row_bytes).enumerate() {
+            let g = u16::from_le_bytes([row[from], row[from + 1]]);
+            if r != col && g != 0 {
+                kernel.mul_acc(&mut row[from..], p, &MulTable::new(g));
+            }
+        }
+    }
+    Some(rows.chunks_exact(row_bytes.max(1)).flat_map(|row| row[2 * n..].chunks_exact(2).map(|w| u16::from_le_bytes([w[0], w[1]]))).collect())
+}
+
+/// The plain Gauss-Jordan elimination [`invert_with`] must agree with.
+#[cfg(test)]
+fn invert_reference(m: &[u16], n: usize) -> Option<Vec<u16>> {
     let mut a = m.to_vec();
     let mut r = vec![0u16; n * n];
     for i in 0..n {
@@ -468,7 +555,8 @@ mod tests {
                     assert_eq!(u16::from_le_bytes([t.nib[i][x as usize], t.nib[4 + i][x as usize]]), p);
                 }
             }
-            let (lo, hi) = t.bytes();
+            assert_eq!(t.constant(), c);
+            let ByteTables { lo, hi } = t.bytes();
             for b in 0..256u16 {
                 assert_eq!(lo[b as usize], mul(c, b));
                 assert_eq!(hi[b as usize], mul(c, b << 8));
@@ -505,7 +593,6 @@ mod tests {
                     2 => 0xffff,
                     _ => rng.next() as u16,
                 };
-                let t = MulTable::new(c);
                 let off_s = (rng.next() % 32) as usize;
                 let off_d = (rng.next() % 32) as usize;
                 let src_buf = rng.bytes(len + off_s);
@@ -513,10 +600,22 @@ mod tests {
                 let src = &src_buf[off_s..];
                 let want = reference(&dst_buf[off_d..], src, c);
                 for k in &kernels {
-                    let mut d = dst_buf.clone();
-                    k.mul_acc(&mut d[off_d..], src, &t);
-                    assert_eq!(&d[off_d..], &want[..], "{} c={c:#x} len={len}", k.name());
-                    assert_eq!(&d[..off_d], &dst_buf[..off_d], "{} wrote before the slice", k.name());
+                    // The dispatching entry point, the table path whatever the constant
+                    // (also for 0 and 1), and the table path with the byte tables built.
+                    for path in ["mul_acc", "tables", "wide tables"] {
+                        let t = MulTable::new(c);
+                        let mut d = dst_buf.clone();
+                        match path {
+                            "mul_acc" => k.mul_acc(&mut d[off_d..], src, &t),
+                            "tables" => k.mul_acc_tables(&mut d[off_d..], src, &t),
+                            _ => {
+                                t.bytes();
+                                k.mul_acc_tables(&mut d[off_d..], src, &t);
+                            }
+                        }
+                        assert_eq!(&d[off_d..], &want[..], "{} {path} c={c:#x} len={len}", k.name());
+                        assert_eq!(&d[..off_d], &dst_buf[..off_d], "{} {path} wrote before the slice", k.name());
+                    }
                 }
             }
         }
@@ -538,6 +637,9 @@ mod tests {
                 let mut d = zero.clone();
                 k.mul_acc(&mut d, &words, &t);
                 assert!(d == want, "{} c={c:#x}", k.name());
+                let mut d = zero.clone();
+                k.mul_acc_tables(&mut d, &words, &t);
+                assert!(d == want, "{} tables c={c:#x}", k.name());
             }
         }
         let src = rng.bytes(192);
@@ -576,6 +678,16 @@ mod tests {
                 }
                 println!("{:>6} {:>8} KiB: {:6.2} GB/s", k.name(), size >> 10, (size * reps) as f64 / best / 1e9);
             }
+            let one = MulTable::new(1);
+            let mut best = f64::MAX;
+            for _ in 0..3 {
+                let t0 = Instant::now();
+                for _ in 0..reps {
+                    Kernel::best().mul_acc(&mut dst, &src, &one);
+                }
+                best = best.min(t0.elapsed().as_secs_f64());
+            }
+            println!("{:>6} {:>8} KiB: {:6.2} GB/s", "c=1", size >> 10, (size * reps) as f64 / best / 1e9);
         }
         let t0 = Instant::now();
         let mut x = 0u16;
@@ -583,6 +695,66 @@ mod tests {
             x ^= u16::from(std::hint::black_box(MulTable::new(c as u16)).nib[1][3]);
         }
         println!("MulTable::new: {:.0} ns ({x})", t0.elapsed().as_secs_f64() / 1e5 * 1e9);
+        for n in [100, 300, 1000] {
+            let m = par2_matrix(n, 0);
+            let t0 = Instant::now();
+            let a = invert_reference(&m, n);
+            let old = t0.elapsed().as_secs_f64();
+            let t0 = Instant::now();
+            let b = invert(&m, n);
+            let new = t0.elapsed().as_secs_f64();
+            assert_eq!(a, b);
+            println!("invert {n}x{n}: reference {:.1} ms, row operations {:.1} ms", old * 1e3, new * 1e3);
+        }
+    }
+
+    /// The matrix a repair with `n` missing slices inverts: rows are recovery exponents
+    /// `first..first + n`, columns the constants of `n` input slices spread over a set.
+    fn par2_matrix(n: usize, first: u32) -> Vec<u16> {
+        let c = input_constants(3 * n);
+        (0..n).flat_map(|e| (0..n).map(move |i| (e, i))).map(|(e, i)| pow(c[3 * i + 1], first + e as u32)).collect()
+    }
+
+    /// The row-operation inverse equals the plain elimination with every kernel, for
+    /// PAR2 matrices and random ones (singular ones included), and inverts.
+    #[test]
+    fn invert_matches_reference() {
+        let mut rng = Rng(0x5eed);
+        let mut cases: Vec<(usize, Vec<u16>)> = Vec::new();
+        for n in [1, 2, 3, 5, 8, 17, 40] {
+            cases.push((n, par2_matrix(n, 0)));
+            cases.push((n, par2_matrix(n, 7)));
+            cases.push((n, (0..n * n).map(|_| rng.next() as u16).collect()));
+            // Sparse: zero pivots force row swaps, and some of these are singular.
+            cases.push((n, (0..n * n).map(|_| if rng.next().is_multiple_of(3) { rng.next() as u16 } else { 0 }).collect()));
+            // Duplicate rows: always singular from n = 2.
+            let mut dup: Vec<u16> = (0..n * n).map(|_| rng.next() as u16).collect();
+            if n > 1 {
+                let (a, b) = dup.split_at_mut(n);
+                b[..n].copy_from_slice(a);
+            }
+            cases.push((n, dup));
+        }
+        let (mut singular, mut regular) = (0, 0);
+        for (n, m) in &cases {
+            let want = invert_reference(m, *n);
+            match &want {
+                Some(r) => {
+                    regular += 1;
+                    for i in 0..*n {
+                        for j in 0..*n {
+                            let s = (0..*n).fold(0u16, |s, k| s ^ mul(m[i * n + k], r[k * n + j]));
+                            assert_eq!(s, u16::from(i == j));
+                        }
+                    }
+                }
+                None => singular += 1,
+            }
+            for k in Kernel::available() {
+                assert_eq!(invert_with(k, m, *n), want, "{} n={n}", k.name());
+            }
+        }
+        assert!(singular >= 6 && regular >= 20, "{singular} singular, {regular} regular");
     }
 
     #[test]
