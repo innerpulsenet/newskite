@@ -844,14 +844,17 @@ async fn wait_cooldown(shared: &Shared, server: usize) -> Result<(), ConnFail> {
 async fn process_segment(shared: &Arc<Shared>, held: &mut Option<Held>, st: &mut SegmentState) -> Flow {
     let (fi, si) = (st.fi, st.si);
     let file = &shared.files[fi];
-    if file.is_skipped() {
-        return finish_segment(shared, fi, si, None).await;
-    }
     let seg = &file.segments[si];
 
     loop {
         if shared.abort.is_cancelled() {
             return Flow::Stop;
+        }
+        // A file's first article may be requested ahead before the file turns out to be
+        // complete from an earlier run; its reply is still read (and dropped by
+        // `store_part`) so the next reply on the connection is the next segment's.
+        if file.is_skipped() && held.as_ref().is_none_or(|h| h.conn.outstanding_bodies() == 0) {
+            return finish_segment(shared, fi, si, None).await;
         }
         // A connection with a pipelined reply pending can only be used for that reply:
         // step aside when it cannot serve this segment any more.
@@ -1008,10 +1011,12 @@ async fn fetch(shared: &Arc<Shared>, h: &mut Held, message_id: &str) -> Result<V
 
 /// Sends the `BODY` request for the next queued segment while the current body is still
 /// streaming. Only on the primary server, so a worker that spilled over to a fallback
-/// returns to the primary as soon as it has room, and only for files whose output is
-/// already decided: the first decoded part of a file may reveal it as complete from an
-/// earlier run, and then no second part should have been requested. Segments of skipped
-/// files are completed on the spot instead.
+/// returns to the primary as soon as it has room, and only for a file's first article or
+/// files whose output is already decided: the first decoded part of a file may reveal it
+/// as complete from an earlier run, and then no second part should have been requested,
+/// but the first article is needed either way (the queue starts with the first article
+/// of every file, which would otherwise all go unpipelined). Segments of skipped files
+/// are completed on the spot instead.
 async fn prefetch_next(shared: &Arc<Shared>, h: &mut Held) {
     if shared.primary_server() != Some(h.slot.server) {
         return;
@@ -1024,7 +1029,7 @@ async fn prefetch_next(shared: &Arc<Shared>, h: &mut Held) {
             }
             continue;
         }
-        if file.output.get().is_none() {
+        if item.1 != 0 && file.output.get().is_none() {
             shared.requeue(item);
             return;
         }
