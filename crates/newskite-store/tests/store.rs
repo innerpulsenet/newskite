@@ -810,3 +810,71 @@ fn job_file_rows_follow_a_rename() {
     assert_eq!((rows[0].name.as_str(), rows[0].state.as_str()), ("movie.mkv", "done"));
     assert!(!store.rename_job_file(job.id, "absent", "x").unwrap());
 }
+
+#[test]
+fn job_log_trim_keeps_each_jobs_newest_lines_when_jobs_interleave() {
+    let s = mem();
+    let a = s.insert_job(&new_job("a")).unwrap();
+    let b = s.insert_job(&new_job("b")).unwrap();
+    let keep = newskite_store::JOB_LOG_KEEP;
+    for i in 0..keep {
+        s.append_job_log(a.id, i, "info", &format!("a {i}")).unwrap();
+    }
+    // Another job's lines in between must not push job a's lines out.
+    for i in 0..(keep + 120) {
+        s.append_job_log(b.id, i, "info", &format!("b {i}")).unwrap();
+    }
+    for i in keep..(keep + 60) {
+        s.append_job_log(a.id, i, "info", &format!("a {i}")).unwrap();
+    }
+    let log = s.job_log(a.id).unwrap();
+    assert_eq!(log.len() as i64, keep);
+    assert_eq!(log.first().unwrap().text, "a 60");
+    assert_eq!(log.last().unwrap().text, format!("a {}", keep + 59));
+    let log = s.job_log(b.id).unwrap();
+    assert_eq!(log.len() as i64, keep);
+    assert_eq!(log.last().unwrap().text, format!("b {}", keep + 119));
+}
+
+#[test]
+fn source_known_covers_jobs_in_any_state_and_seen_fingerprints() {
+    let s = mem();
+    let job = s.insert_job(&new_job("x")).unwrap();
+    let p = Path::new("/nzbs/x.nzb");
+    assert!(s.source_known(p, 1, 1).unwrap());
+    s.set_job_state(job.id, JobState::Done, None).unwrap();
+    assert!(s.source_known(p, 1, 1).unwrap());
+    s.remove_job(job.id).unwrap();
+    assert!(!s.source_known(p, 1, 1).unwrap());
+    s.mark_source_seen(p, 10, 20).unwrap();
+    assert!(s.source_known(p, 10, 20).unwrap());
+    assert!(!s.source_known(p, 10, 21).unwrap());
+    assert!(!s.source_known(Path::new("/nzbs/other.nzb"), 10, 20).unwrap());
+}
+
+#[test]
+fn dest_dirs_lists_every_jobs_folder() {
+    let s = mem();
+    assert!(s.dest_dirs().unwrap().is_empty());
+    let a = s.insert_job(&new_job("a")).unwrap();
+    let b = s.insert_job(&new_job("b")).unwrap();
+    s.set_job_state(a.id, JobState::Failed, Some("x")).unwrap();
+    assert_eq!(s.dest_dirs().unwrap(), [a.dest_dir, b.dest_dir]);
+}
+
+#[test]
+fn file_store_reader_sees_writes_through_cached_statements() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = Store::open(dir.path()).unwrap();
+    let j = s.insert_job(&new_job("a")).unwrap();
+    for done in [10, 20, 30] {
+        s.set_job_progress(j.id, done).unwrap();
+        assert_eq!(s.get_job(j.id).unwrap().unwrap().bytes_done, done);
+    }
+    let mut settings = s.load_settings().unwrap();
+    for n in [3, 4] {
+        settings.max_connections = n;
+        s.save_settings(&settings).unwrap();
+        assert_eq!(s.load_settings().unwrap().max_connections, n);
+    }
+}
