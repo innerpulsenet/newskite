@@ -268,6 +268,7 @@ pub fn show(
             ui.set_opacity(t);
             ui.set_width(width);
             ui.spacing_mut().item_spacing.y = 0.0;
+            super::widgets::frost_sheen(ui, pal, 0.0);
             egui::Frame::new().inner_margin(egui::Margin { left: 22, right: 14, top: 16, bottom: 14 }).show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
@@ -377,7 +378,7 @@ fn section_nav(ui: &mut Ui, pal: &Palette, height: f32) {
         ui.painter().set(
             marker,
             egui::Shape::Vec(vec![
-                egui::Shape::rect_filled(pill, egui::CornerRadius::same(7), pal.accent_soft),
+                egui::Shape::rect_filled(pill, egui::CornerRadius::same(pal.radius(7)), pal.accent_soft),
                 egui::Shape::rect_filled(rail, egui::CornerRadius::same(2), pal.accent),
             ]),
         );
@@ -504,7 +505,7 @@ fn section(ui: &mut Ui, pal: &Palette, title: &str, body: impl FnOnce(&mut Ui)) 
     ui.ctx().data_mut(|d| d.insert_temp(section_top_id(title), top));
     section_title(ui, pal, title);
     ui.add_space(4.0);
-    card(pal).show(ui, |ui| {
+    super::widgets::sunk(ui, pal, card(pal), |ui| {
         ui.set_width(ui.available_width());
         body(ui);
     });
@@ -835,8 +836,8 @@ fn automation_section(ui: &mut Ui, pal: &Palette, s: &mut Settings) {
 
 fn appearance_section(ui: &mut Ui, pal: &Palette, appearance: &mut Appearance) {
     section(ui, pal, "Appearance", |ui| {
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 12.0;
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(12.0, 10.0);
             for a in Appearance::ALL {
                 if theme_swatch(ui, pal, a, *appearance == a).clicked() {
                     *appearance = a;
@@ -846,8 +847,9 @@ fn appearance_section(ui: &mut Ui, pal: &Palette, appearance: &mut Appearance) {
         ui.add_space(4.0);
         ui.label(
             RichText::new(
-                "Follow desktop uses your desktop color scheme and follows its changes. \
-                 The innerpulse themes are the studio's ink and paper grounds with the violet accent.",
+                "The innerpulse themes are the studio's grounds with the violet accent: carbon \
+                 (brushed steel on cool blacks), the warm ink and paper. Follow desktop uses your \
+                 desktop color scheme and follows its changes.",
             )
             .small()
             .color(pal.muted),
@@ -870,6 +872,7 @@ fn theme_swatch(ui: &mut Ui, pal: &Palette, choice: Appearance, selected: bool) 
         let paper = Palette::from_theme(&super::brand_tokens::paper());
         match choice {
             Appearance::Ink => mini_window(painter, &ink, preview),
+            Appearance::Warm => mini_window(painter, &Palette::from_theme(&super::brand_tokens::warm()), preview),
             Appearance::Paper => mini_window(painter, &paper, preview),
             Appearance::FollowDesktop => {
                 let (l, r) = preview.split_left_right_at_fraction(0.5);

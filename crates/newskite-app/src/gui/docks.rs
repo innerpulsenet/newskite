@@ -702,93 +702,99 @@ pub(crate) fn messages(
     let has_backup = backup_servers.len() >= 2;
     let mut offered: std::collections::HashSet<i64> = std::collections::HashSet::new();
     let mut marked = false;
-    egui::ScrollArea::vertical()
-        .id_salt("messages")
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            ui.spacing_mut().item_spacing.y = 4.0;
-            let text_w = (ui.available_width() - LEVEL_COL_W - TIME_COL_W - 12.0).max(40.0);
-            // The gutter columns are one text row tall, so glyph, clock and text share a center.
-            let row_h = ui.fonts_mut(|f| f.row_height(&fonts::mono_id(12.0))).max(14.0);
-            for line in shown {
-                let id = Id::new(("logline", line.ts, &line.text));
-                // When this line first showed; lines present on the first frame count as old.
-                let first_seen = ctx.data_mut(|d| {
-                    *d.get_temp_mut_or_insert_with(id, || if first_frame { f64::NEG_INFINITY } else { now })
-                });
-                let mark = new_mark(now - first_seen, animate);
-                marked |= mark > 0.0;
-                let job = line.job_id.and_then(|jid| data.jobs.iter().find(|j| j.id == jid));
-                let folded = split_id_list(&line.text);
-                let retry = has_backup
-                    && line.level != LogLevel::Info
-                    && job.is_some_and(|j| j.state == JobState::Failed && !offered.contains(&j.id));
-                if retry {
-                    offered.extend(job.map(|j| j.id));
-                }
-                // Reserve the backdrop's slot first so it paints under the row.
-                let backdrop = ui.painter().add(Shape::Noop);
-                let row = ui
-                    .horizontal_top(|ui| {
-                        ui.spacing_mut().item_spacing.x = 4.0;
-                        let (lr, _) = ui.allocate_exact_size(Vec2::new(LEVEL_COL_W, row_h), Sense::hover());
-                        let glyph = Rect::from_center_size(lr.center(), Vec2::splat(11.0));
-                        match line.level {
-                            LogLevel::Info => {
-                                ui.painter().circle_filled(glyph.center(), 2.0, pal.faint);
+    // With materials the log is read in a well of dark glass, not on the brushed plate.
+    let well = egui::Frame::new()
+        .corner_radius(CornerRadius::same(pal.radius(12)));
+    let well = if pal.metal.is_some() { well.fill(pal.raised).inner_margin(egui::Margin::symmetric(12, 10)) } else { well };
+    super::widgets::sunk(ui, pal, well, |ui| {
+        egui::ScrollArea::vertical()
+            .id_salt("messages")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 4.0;
+                let text_w = (ui.available_width() - LEVEL_COL_W - TIME_COL_W - 12.0).max(40.0);
+                // The gutter columns are one text row tall, so glyph, clock and text share a center.
+                let row_h = ui.fonts_mut(|f| f.row_height(&fonts::mono_id(12.0))).max(14.0);
+                for line in shown {
+                    let id = Id::new(("logline", line.ts, &line.text));
+                    // When this line first showed; lines present on the first frame count as old.
+                    let first_seen = ctx.data_mut(|d| {
+                        *d.get_temp_mut_or_insert_with(id, || if first_frame { f64::NEG_INFINITY } else { now })
+                    });
+                    let mark = new_mark(now - first_seen, animate);
+                    marked |= mark > 0.0;
+                    let job = line.job_id.and_then(|jid| data.jobs.iter().find(|j| j.id == jid));
+                    let folded = split_id_list(&line.text);
+                    let retry = has_backup
+                        && line.level != LogLevel::Info
+                        && job.is_some_and(|j| j.state == JobState::Failed && !offered.contains(&j.id));
+                    if retry {
+                        offered.extend(job.map(|j| j.id));
+                    }
+                    // Reserve the backdrop's slot first so it paints under the row.
+                    let backdrop = ui.painter().add(Shape::Noop);
+                    let row = ui
+                        .horizontal_top(|ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            let (lr, _) = ui.allocate_exact_size(Vec2::new(LEVEL_COL_W, row_h), Sense::hover());
+                            let glyph = Rect::from_center_size(lr.center(), Vec2::splat(11.0));
+                            match line.level {
+                                LogLevel::Info => {
+                                    ui.painter().circle_filled(glyph.center(), 2.0, pal.faint);
+                                }
+                                LogLevel::Warn => paint_icon(ui.painter(), glyph, Icon::StatusWarn, pal.warning),
+                                LogLevel::Error => paint_icon(ui.painter(), glyph, Icon::StatusErr, pal.negative),
                             }
-                            LogLevel::Warn => paint_icon(ui.painter(), glyph, Icon::StatusWarn, pal.warning),
-                            LogLevel::Error => paint_icon(ui.painter(), glyph, Icon::StatusErr, pal.negative),
-                        }
-                        let (tr, _) = ui.allocate_exact_size(Vec2::new(TIME_COL_W, row_h), Sense::hover());
-                        ui.painter().text(
-                            tr.left_center(),
-                            egui::Align2::LEFT_CENTER,
-                            clock(line.ts),
-                            fonts::mono_id(11.0),
-                            if mark > 0.0 { pal.text } else { pal.faint },
-                        );
-                        ui.vertical(|ui| {
-                            ui.set_max_width(text_w);
-                            ui.spacing_mut().item_spacing.y = 3.0;
-                            message_text(ui, pal, line, job, folded.as_ref(), id, actions);
-                            if retry {
-                                if let Some(job) = job {
-                                    let r = super::serverstrip::strip_button(
-                                        ui,
-                                        pal,
-                                        Some(Icon::RetryBackup),
-                                        "Retry on backup",
-                                        false,
-                                        true,
-                                    )
-                                    .on_hover_text(super::serverstrip::backup_retry_explainer(&backup_servers));
-                                    if r.clicked() {
-                                        actions.push(Action::RetryOnBackup(job.id));
+                            let (tr, _) = ui.allocate_exact_size(Vec2::new(TIME_COL_W, row_h), Sense::hover());
+                            ui.painter().text(
+                                tr.left_center(),
+                                egui::Align2::LEFT_CENTER,
+                                clock(line.ts),
+                                fonts::mono_id(11.0),
+                                if mark > 0.0 { pal.text } else { pal.faint },
+                            );
+                            ui.vertical(|ui| {
+                                ui.set_max_width(text_w);
+                                ui.spacing_mut().item_spacing.y = 3.0;
+                                message_text(ui, pal, line, job, folded.as_ref(), id, actions);
+                                if retry {
+                                    if let Some(job) = job {
+                                        let r = super::serverstrip::strip_button(
+                                            ui,
+                                            pal,
+                                            Some(Icon::RetryBackup),
+                                            "Retry on backup",
+                                            false,
+                                            true,
+                                        )
+                                        .on_hover_text(super::serverstrip::backup_retry_explainer(&backup_servers));
+                                        if r.clicked() {
+                                            actions.push(Action::RetryOnBackup(job.id));
+                                        }
                                     }
                                 }
-                            }
-                        });
-                    })
-                    .response
-                    .rect;
-                if mark > 0.0 {
-                    // Across the whole log width, so a short line reads as marked too.
-                    let band = Rect::from_min_max(
-                        Pos2::new(row.left() - 3.0, row.top() - 1.5),
-                        Pos2::new(ui.max_rect().right(), row.bottom() + 1.5),
-                    );
-                    let bar = Rect::from_min_size(band.min, Vec2::new(2.0, band.height()));
-                    ui.painter().set(
-                        backdrop,
-                        Shape::Vec(vec![
-                            Shape::rect_filled(band, CornerRadius::same(3), Palette::fade(pal.accent_soft, 0.85 * mark)),
-                            Shape::rect_filled(bar, CornerRadius::same(1), Palette::fade(pal.accent, mark)),
-                        ]),
-                    );
+                            });
+                        })
+                        .response
+                        .rect;
+                    if mark > 0.0 {
+                        // Across the whole log width, so a short line reads as marked too.
+                        let band = Rect::from_min_max(
+                            Pos2::new(row.left() - 3.0, row.top() - 1.5),
+                            Pos2::new(ui.max_rect().right(), row.bottom() + 1.5),
+                        );
+                        let bar = Rect::from_min_size(band.min, Vec2::new(2.0, band.height()));
+                        ui.painter().set(
+                            backdrop,
+                            Shape::Vec(vec![
+                                Shape::rect_filled(band, CornerRadius::same(3), Palette::fade(pal.accent_soft, 0.85 * mark)),
+                                Shape::rect_filled(bar, CornerRadius::same(1), Palette::fade(pal.accent, mark)),
+                            ]),
+                        );
+                    }
                 }
-            }
-        });
+            });
+    });
     if first_frame {
         ctx.data_mut(|d| d.insert_temp(seen_key, true));
     }
