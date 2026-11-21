@@ -58,6 +58,68 @@ fn best_contrast(bg: Rgb, a: Rgb, b: Rgb) -> Rgb {
     }
 }
 
+/// The materials of a brand ink ground (see [`super::brand_tokens::MetalSet`]): the plate,
+/// the keys' glass and the steel, plus the light and shade every relief is drawn with.
+/// [`super::metal`] paints with these; desktop themes and paper have none and stay flat.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Metal {
+    /// The plate the window is cut from.
+    pub plate: Color32,
+    /// A key's smoked glass: at rest (top, foot), then held down (top, foot).
+    pub key: [Color32; 4],
+    /// The wordmark's steel ramp, top to foot (`None`: the text color).
+    pub steel: Option<[Color32; 5]>,
+    /// Whether the plate is brushed.
+    pub brushed: bool,
+    /// Frosted glass: what floats over the window (sheets, toasts, menus, the drop card).
+    /// Smoked and a little translucent, so what is under it shows as a soft shape.
+    pub frost: Color32,
+    /// The black glass of a display let into the plate.
+    pub lcd_glass: Color32,
+    /// What is lit on a display: the family accent, a little toward white.
+    pub lcd_lit: Color32,
+}
+
+impl Metal {
+    /// The lit lip along an edge the light catches, as white alpha: soft under a groove
+    /// or along a quiet foot.
+    pub const LIP_SOFT: u8 = 16;
+    /// Along a panel's or a key's top.
+    pub const LIP: u8 = 24;
+    /// The hard edge of raised metal.
+    pub const LIP_HARD: u8 = 36;
+
+    /// Light at `alpha` (0…255): white, translucent.
+    pub fn light(alpha: u8) -> Color32 {
+        Color32::from_white_alpha(alpha)
+    }
+
+    /// Shade at `alpha` (0…255): black, translucent.
+    pub fn shade(alpha: u8) -> Color32 {
+        Color32::from_black_alpha(alpha)
+    }
+
+    /// White, for mixing a highlight into a color.
+    pub fn white() -> Color32 {
+        Color32::WHITE
+    }
+
+    /// `color` at `alpha` (0…1) of full opacity, whatever its own.
+    pub fn alpha(color: Color32, alpha: f32) -> Color32 {
+        let [r, g, b, _] = color.to_array();
+        Color32::from_rgba_unmultiplied(r, g, b, (alpha.clamp(0.0, 1.0) * 255.0) as u8)
+    }
+
+    /// Linear mix of two colors, premultiplied (so translucent ends mix cleanly).
+    pub fn lerp(a: Color32, b: Color32, t: f32) -> Color32 {
+        let t = t.clamp(0.0, 1.0);
+        let [ar, ag, ab, aa] = a.to_array();
+        let [br, bg, bb, ba] = b.to_array();
+        let m = |x: u8, y: u8| (f32::from(x) + (f32::from(y) - f32::from(x)) * t + 0.5) as u8;
+        Color32::from_rgba_premultiplied(m(ar, br), m(ag, bg), m(ab, bb), m(aa, ba))
+    }
+}
+
 /// Every color the GUI paints with, derived from the desktop [`Tokens`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Palette {
@@ -125,6 +187,8 @@ pub struct Palette {
     /// The single live series of the throughput graph: the family accent at its chart
     /// step on the brand themes, the desktop accent otherwise.
     pub series: Color32,
+    /// The window's materials on the brand ink grounds; `None` is the flat look.
+    pub metal: Option<Metal>,
 }
 
 impl Palette {
@@ -199,6 +263,7 @@ impl Palette {
             transparent: Color32::TRANSPARENT,
             chart: chart_set(dark).map(to_color32),
             series: to_color32(t.accent),
+            metal: None,
         }
     }
 
@@ -209,8 +274,37 @@ impl Palette {
         if let Some(set) = brand_set_of(theme) {
             p.faint = to_color32(set.text_3);
             p.series = p.chart[CHART_SERIES_SLOT - 1];
+            p.metal = set.metal.map(|m| Metal {
+                plate: to_color32(m.plate),
+                key: m.key.map(to_color32),
+                steel: m.steel.map(|s| s.map(to_color32)),
+                brushed: m.brushed,
+                frost: Metal::alpha(to_color32(set.surface_2.mix(set.text, 0.05)), 0.88),
+                lcd_glass: to_color32(set.ground.mix(Rgb::new(0, 0, 0), 0.35)),
+                lcd_lit: to_color32(set.accent.mix(Rgb::new(255, 255, 255), 0.18)),
+            });
         }
         p
+    }
+
+    /// The fill of a window panel: the flat look fills each panel with `flat`; with
+    /// materials every panel is the one plate, painted once behind them all.
+    pub fn panel(&self, flat: Color32) -> Color32 {
+        if self.metal.is_some() {
+            Color32::TRANSPARENT
+        } else {
+            flat
+        }
+    }
+
+    /// A corner radius: `flat` on the flat look, machined tighter (at most 5 px) with
+    /// materials.
+    pub fn radius(&self, flat: u8) -> u8 {
+        if self.metal.is_some() {
+            flat.min(5)
+        } else {
+            flat
+        }
     }
 
     /// `color` at `alpha` (0…1) of its opacity, for disabled and pressed states.
@@ -327,7 +421,15 @@ pub fn visuals(t: &Tokens, dark: bool) -> Visuals {
 /// egui never swap in a non-token palette) and returns the matching [`Palette`].
 /// Fonts are installed separately ([`fonts::install`]).
 pub fn apply(ctx: &egui::Context, theme: &Theme) -> Palette {
-    let vis = visuals(&theme.tokens, theme.dark);
+    let mut vis = visuals(&theme.tokens, theme.dark);
+    let palette = Palette::from_theme(theme);
+    if let Some(m) = &palette.metal {
+        // Menus and tooltips are frosted glass with a lit rim, cut to the keys' radius.
+        vis.window_fill = m.frost;
+        vis.window_stroke = Stroke::new(1.0, Metal::light(Metal::LIP_HARD));
+        vis.menu_corner_radius = CornerRadius::same(5);
+        vis.window_corner_radius = CornerRadius::same(6);
+    }
     for slot in [egui::Theme::Dark, egui::Theme::Light] {
         ctx.set_visuals_of(slot, vis.clone());
         ctx.style_mut_of(slot, tune_style);
@@ -337,7 +439,7 @@ pub fn apply(ctx: &egui::Context, theme: &Theme) -> Palette {
     } else {
         egui::Theme::Light
     });
-    Palette::from_theme(theme)
+    palette
 }
 
 /// Spacing and type scale shared by both schemes: Instrument Sans 13.5 px body,
@@ -454,6 +556,7 @@ mod tests {
             ("breeze dark", breeze(include_str!("../../../newskite-theme/tests/fixtures/breeze-dark.kdeglobals"))),
             ("breeze light", breeze(include_str!("../../../newskite-theme/tests/fixtures/breeze-light.kdeglobals"))),
             ("ink", super::super::brand_tokens::ink()),
+            ("warm", super::super::brand_tokens::warm()),
             ("paper", super::super::brand_tokens::paper()),
         ];
         let rgb = |c: Color32| Rgb::new(c.r(), c.g(), c.b());

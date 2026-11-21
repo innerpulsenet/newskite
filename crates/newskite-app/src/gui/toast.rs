@@ -99,13 +99,13 @@ pub fn show(ctx: &egui::Context, pal: &Palette, toasts: &mut Vec<Toast>, bottom:
             .interactable(true);
         let resp = area.show(ctx, |ui| {
             ui.set_opacity(enter.min(exit));
-            egui::Frame::new()
+            let frame = egui::Frame::new()
                 .fill(pal.raised)
                 .stroke(Stroke::new(1.0, pal.border_strong))
                 .corner_radius(CornerRadius::same(10))
                 .shadow(egui::Shadow { offset: [0, 10], blur: 28, spread: 0, color: pal.shadow })
-                .inner_margin(egui::Margin { left: 14, right: 8, top: 10, bottom: 10 })
-                .show(ui, |ui| {
+                .inner_margin(egui::Margin { left: 14, right: 8, top: 10, bottom: 10 });
+            super::widgets::frosted(ui, pal, frame, |ui| {
                     ui.set_width(WIDTH);
                     ui.horizontal_top(|ui| {
                         let (r, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());

@@ -11,7 +11,8 @@ use newskite_service::JobState;
 
 use super::brand;
 use super::fonts;
-use super::theme::Palette;
+use super::metal::{self, KeyState, LampShape};
+use super::theme::{Metal, Palette};
 
 pub use super::icons::{paint_icon, Icon};
 
@@ -84,6 +85,70 @@ pub fn copy_button(ui: &mut Ui, pal: &Palette, salt: &str, label: &str, enabled:
 
 /// Height of a toolbar button.
 pub const TOOL_H: f32 = 34.0;
+/// Height of a toolbar key on the material themes.
+const TOOL_KEY_H: f32 = 30.0;
+/// Letter spacing of a key's uppercase mono label.
+const KEY_TRACKING: f32 = 0.5;
+
+/// The font of a key's label on the material themes: the measuring mono, 600.
+fn key_font(size: f32) -> FontId {
+    FontId::new(size, fonts::mono_semibold())
+}
+
+/// How the key under `resp` stands this frame, its hover eased.
+fn key_state(ui: &Ui, resp: &Response, enabled: bool, on: f32, color: Color32) -> KeyState {
+    KeyState {
+        hover: ui.ctx().animate_bool(resp.id.with("hover"), enabled && resp.hovered()),
+        on,
+        press: if enabled && resp.is_pointer_button_down_on() { 1.0 } else { 0.0 },
+        color,
+    }
+}
+
+/// A toolbar button as a key of smoked glass: the current view's key is lit, the queue
+/// control glows faintly so it reads first, an unavailable one is dark.
+fn tool_key(ui: &mut Ui, pal: &Palette, m: &Metal, icon: Icon, label: &str, show_label: bool, state: ToolState) -> Response {
+    let galley = show_label
+        .then(|| ui.painter().layout_job(spaced(&label.to_uppercase(), key_font(11.0), pal.text, KEY_TRACKING)));
+    let size = match &galley {
+        Some(g) => Vec2::new(11.0 + 16.0 + 7.0 + g.size().x + 12.0, TOOL_KEY_H),
+        None => Vec2::splat(TOOL_KEY_H),
+    };
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    if ui.is_rect_visible(rect) {
+        let live = state != ToolState::Unavailable;
+        let on = match state {
+            ToolState::Active => 1.0,
+            ToolState::Accent => 0.4,
+            _ => 0.0,
+        };
+        let k = key_state(ui, &resp, live, on, pal.accent);
+        let painter = ui.painter();
+        metal::key_body(painter, m, rect, 4, k);
+        if resp.has_focus() {
+            focus_ring(ui, pal, rect, 4);
+        }
+        let fg = match state {
+            ToolState::Accent => pal.accent_fg,
+            _ => metal::key_text(pal, k, live),
+        };
+        let drop = Vec2::new(0.0, k.press);
+        let icon_center = match &galley {
+            Some(_) => Pos2::new(rect.left() + 11.0 + 8.0, rect.center().y),
+            None => rect.center(),
+        };
+        paint_icon(painter, Rect::from_center_size(icon_center + drop, Vec2::splat(16.0)), icon, fg);
+        if let Some(g) = galley {
+            painter.galley_with_override_text_color(
+                Pos2::new(rect.left() + 11.0 + 16.0 + 7.0, rect.center().y - g.size().y / 2.0) + drop,
+                g,
+                fg,
+            );
+        }
+    }
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, state != ToolState::Unavailable, label));
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
 
 /// A toolbar button: an 18 px icon and its label side by side in a rounded slot (the
 /// icon alone on narrow windows). Icons are text-2 at rest, text when hovered or
@@ -96,6 +161,9 @@ pub fn tool_button(
     show_label: bool,
     state: ToolState,
 ) -> Response {
+    if let Some(m) = pal.metal {
+        return tool_key(ui, pal, &m, icon, label, show_label, state);
+    }
     let accent = state == ToolState::Accent;
     let label_font = if accent { fonts::semibold_id(13.0) } else { FontId::proportional(13.0) };
     let galley = show_label.then(|| ui.painter().layout_no_wrap(label.to_owned(), label_font, pal.text));
@@ -211,7 +279,15 @@ pub fn icon_button_enabled(
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(ICON_BUTTON), Sense::click());
     if ui.is_rect_visible(rect) {
         let hover = ui.ctx().animate_bool(resp.id.with("hover"), resp.hovered());
-        if resp.is_pointer_button_down_on() {
+        if let Some(m) = pal.metal {
+            // A key that rises out of the surface under the pointer.
+            if hover > 0.0 {
+                let mut p = ui.painter().clone();
+                p.multiply_opacity(hover);
+                let press = if resp.is_pointer_button_down_on() { 1.0 } else { 0.0 };
+                metal::key_body(&p, &m, rect.shrink(1.0), 4, KeyState { hover: 1.0, on: 0.0, press, color: pal.accent });
+            }
+        } else if resp.is_pointer_button_down_on() {
             ui.painter()
                 .rect_filled(rect, CornerRadius::same(6), pal.sunken);
         } else if hover > 0.0 {
@@ -276,10 +352,15 @@ fn kit_button_sized(
     } else {
         kind
     };
-    let font = fonts::semibold_id(if compact { 11.0 } else { 12.0 });
+    // On the material themes every button but the bare one is a key, labeled in the mono.
+    let key = pal.metal.filter(|_| kind != ButtonKind::Text);
+    let (font, tracking) = match key {
+        Some(_) => (key_font(if compact { 10.5 } else { 11.0 }), KEY_TRACKING),
+        None => (fonts::semibold_id(if compact { 11.0 } else { 12.0 }), 0.72),
+    };
     let probe = ui
         .painter()
-        .layout_job(spaced(&text.to_uppercase(), font.clone(), pal.text, 0.72));
+        .layout_job(spaced(&text.to_uppercase(), font.clone(), pal.text, tracking));
     let icon_w = if icon.is_some() { 16.0 + 7.0 } else { 0.0 };
     let pad = match (kind, compact) {
         (ButtonKind::Text, true) => 5.0,
@@ -297,8 +378,8 @@ fn kit_button_sized(
     if ui.is_rect_visible(rect) {
         let hovered = enabled && resp.hovered();
         let pressed = enabled && resp.is_pointer_button_down_on();
-        let radius = CornerRadius::same(6);
-        let (fill, stroke, fg) = match kind {
+        let radius = CornerRadius::same(pal.radius(6));
+        let (fill, stroke, mut fg) = match kind {
             ButtonKind::Primary => {
                 let f = if hovered || pressed {
                     pal.action_hover
@@ -344,13 +425,37 @@ fn kit_button_sized(
             }
         };
         let painter = ui.painter();
-        if kind == ButtonKind::Primary {
-            // The call to action sits a little above the surface.
-            painter.add(egui::epaint::Shadow { offset: [0, 2], blur: 8, spread: 0, color: Palette::fade(pal.shadow, 0.5) }.as_shape(rect, radius));
+        let mut drop = 0.0;
+        match (key, kind) {
+            (Some(_), ButtonKind::Primary) => {
+                // The one filled key: ember, standing proud of the plate until pressed.
+                let press = if pressed { 1.0 } else { 0.0 };
+                painter.rect(rect, radius, fill, Stroke::new(1.0, Metal::shade(215)), StrokeKind::Outside);
+                metal::key_face(painter, rect, pal.radius(6), press);
+                drop = press;
+            }
+            (Some(m), _) => {
+                let danger = kind == ButtonKind::Danger;
+                let k = key_state(ui, &resp, enabled, 0.0, if danger { pal.negative } else { pal.accent });
+                // A destructive key warms to its color under the pointer.
+                let k = KeyState { on: if danger { 0.5 * k.hover } else { 0.0 }, ..k };
+                metal::key_body(painter, &m, rect, pal.radius(6), k);
+                if !danger {
+                    fg = metal::key_text(pal, k, enabled);
+                }
+                drop = k.press;
+            }
+            (None, _) => {
+                if kind == ButtonKind::Primary {
+                    // The call to action sits a little above the surface.
+                    painter.add(egui::epaint::Shadow { offset: [0, 2], blur: 8, spread: 0, color: Palette::fade(pal.shadow, 0.5) }.as_shape(rect, radius));
+                }
+                painter.rect(rect, radius, fill, stroke, StrokeKind::Inside);
+            }
         }
-        painter.rect(rect, radius, fill, stroke, StrokeKind::Inside);
+        let rect = rect.translate(Vec2::new(0.0, drop));
         if resp.has_focus() {
-            focus_ring(ui, pal, rect, 6);
+            focus_ring(ui, pal, rect, pal.radius(6));
         }
         let mut x = rect.left() + pad;
         if let Some(icon) = icon {
@@ -362,7 +467,7 @@ fn kit_button_sized(
             );
             x += icon_w;
         }
-        let galley = painter.layout_job(spaced(&text.to_uppercase(), font, fg, 0.72));
+        let galley = painter.layout_job(spaced(&text.to_uppercase(), font, fg, tracking));
         painter.galley(
             Pos2::new(x, rect.center().y - galley.size().y / 2.0),
             galley,
@@ -467,7 +572,7 @@ pub fn status_chip_live(
         let wash = if pal.dark { 0.16 } else { 0.11 };
         painter.rect(
             rect,
-            CornerRadius::same(11),
+            CornerRadius::same(pal.radius(11)),
             Palette::fade(color, wash),
             Stroke::new(1.0, Palette::fade(color, 0.34)),
             StrokeKind::Inside,
@@ -477,6 +582,18 @@ pub fn status_chip_live(
             Vec2::splat(11.0),
         );
         match status.glyph() {
+            // With materials the state is a lamp: its shape carries it as the glyph did,
+            // and the live lamp breathes.
+            _ if pal.metal.is_some() => {
+                let (shape, lit) = match status {
+                    Status::Ok => (LampShape::Round, 1.0),
+                    Status::Warn => (LampShape::Triangle, 1.0),
+                    Status::Err => (LampShape::Square, 1.0),
+                    Status::Idle => (LampShape::Round, 0.0),
+                    Status::Live => (LampShape::Round, breath.map_or(1.0, |b| 0.55 + 0.45 * b.clamp(0.0, 1.0))),
+                };
+                metal::lamp(painter, pal, glyph_rect.center(), 3.6, color, lit, shape);
+            }
             Some(g) => paint_icon(painter, glyph_rect, g, color),
             None => {
                 let c = glyph_rect.center();
@@ -813,13 +930,68 @@ pub fn article_grid_lit(ui: &mut Ui, pal: &Palette, wave: Option<f32>, lit: usiz
 
 /// A raised card frame used for docks and settings sections: surface 1, a hairline,
 /// a 10 px radius and a soft, short shadow that lifts it off the ground.
+///
+/// With materials the card is dark glass let into the plate: no hairline and no shadow
+/// (show it with [`sunk`], which draws its relief).
 pub fn card(pal: &Palette) -> egui::Frame {
-    egui::Frame::new()
-        .fill(pal.raised)
+    let frame = egui::Frame::new().fill(pal.raised).corner_radius(CornerRadius::same(pal.radius(10))).inner_margin(egui::Margin::same(12));
+    if pal.metal.is_some() {
+        return frame;
+    }
+    frame
         .stroke(Stroke::new(1.0, pal.border))
-        .corner_radius(CornerRadius::same(10))
         .shadow(egui::Shadow { offset: [0, 2], blur: 10, spread: 0, color: Palette::fade(pal.shadow, 0.4) })
-        .inner_margin(egui::Margin::same(12))
+}
+
+/// Shows `frame` with `add` inside it. With materials the frame is a well sunk into the
+/// plate: its collar, the shadow under its top wall and the lit lip below its foot are
+/// drawn over its fill and under its contents. On the flat look it is the frame alone.
+pub fn sunk<R>(ui: &mut Ui, pal: &Palette, frame: egui::Frame, add: impl FnOnce(&mut Ui) -> R) -> egui::InnerResponse<R> {
+    if pal.metal.is_none() {
+        return frame.show(ui, add);
+    }
+    let radius = frame.corner_radius.nw;
+    let mut relief = None;
+    let shown = frame.show(ui, |ui| {
+        relief = Some(ui.painter().add(egui::Shape::Noop));
+        add(ui)
+    });
+    if let Some(idx) = relief {
+        ui.painter().set(idx, metal::well(shown.response.rect, radius));
+    }
+    shown
+}
+
+/// Shows `frame` with `add` inside it as something that floats over the window. With
+/// materials it is frosted glass: smoked and a little translucent, with a sheen and a lit
+/// rim drawn over its fill and under its contents. On the flat look it is the frame alone.
+pub fn frosted<R>(ui: &mut Ui, pal: &Palette, frame: egui::Frame, add: impl FnOnce(&mut Ui) -> R) -> egui::InnerResponse<R> {
+    let Some(m) = pal.metal else {
+        return frame.show(ui, add);
+    };
+    let radius = pal.radius(frame.corner_radius.nw);
+    let frame = frame.fill(m.frost).stroke(Stroke::new(1.0, Metal::shade(200))).corner_radius(CornerRadius::same(radius));
+    let mut finish = None;
+    let shown = frame.show(ui, |ui| {
+        finish = Some(ui.painter().add(egui::Shape::Noop));
+        add(ui)
+    });
+    if let Some(idx) = finish {
+        ui.painter().set(idx, metal::frost(&m, shown.response.rect, radius));
+    }
+    shown
+}
+
+/// The sheen of a frosted sheet ([`dialog_frame`]), painted first thing inside it: `margin`
+/// is the frame's inner margin, so the finish covers the sheet edge to edge.
+pub fn frost_sheen(ui: &Ui, pal: &Palette, margin: f32) {
+    if let Some(m) = pal.metal {
+        let r = ui.max_rect().expand(margin);
+        let r = Rect::from_min_max(r.min, Pos2::new(r.right(), r.top() + 120.0));
+        let egui::Shape::Vec(parts) = metal::frost(&m, r, pal.radius(14) + 1) else { return };
+        // The haze and the sheen only: the sheet's own frame is its rim.
+        ui.painter().extend(parts.into_iter().take(2));
+    }
 }
 
 /// A circular progress ring: a quiet full track and an arc in `color` from twelve
@@ -847,11 +1019,13 @@ pub fn progress_ring(painter: &egui::Painter, pal: &Palette, center: Pos2, radiu
 
 /// The frame of a modal sheet: the window ground, a hairline, a 14 px radius and a deep,
 /// soft shadow. Sheets lay out their own header, body and footer padding.
+///
+/// With materials the sheet is frosted glass (call [`frost_sheen`] first thing inside it).
 pub fn dialog_frame(pal: &Palette) -> egui::Frame {
     egui::Frame::new()
-        .fill(pal.surface)
+        .fill(pal.metal.map_or(pal.surface, |m| m.frost))
         .stroke(Stroke::new(1.0, pal.border_strong))
-        .corner_radius(CornerRadius::same(14))
+        .corner_radius(CornerRadius::same(pal.radius(14) + if pal.metal.is_some() { 1 } else { 0 }))
         .shadow(egui::Shadow { offset: [0, 18], blur: 48, spread: 0, color: pal.shadow })
         .inner_margin(egui::Margin::ZERO)
 }
@@ -875,18 +1049,26 @@ pub fn toggle(ui: &mut Ui, pal: &Palette, on: &mut bool, label: &str) -> Respons
         let hover = ui.ctx().animate_bool(resp.id.with("hover"), resp.hovered());
         let painter = ui.painter();
         let tr = Rect::from_min_size(Pos2::new(rect.left(), rect.center().y - track.y / 2.0), track);
-        let fill = pal.sunken.lerp_to_gamma(pal.accent, t);
-        let edge = pal.border_strong.lerp_to_gamma(pal.accent, t);
-        painter.rect(tr, CornerRadius::same(9), fill, Stroke::new(1.0, edge), StrokeKind::Inside);
         let x = egui::lerp((tr.left() + 9.0)..=(tr.right() - 9.0), t);
         let knob = Pos2::new(x, tr.center().y);
-        if hover > 0.0 {
-            painter.circle_filled(knob, 11.0, Palette::fade(pal.accent, 0.16 * hover));
+        if let Some(m) = pal.metal {
+            // A slot cut into the plate, backlit in the accent when on, with a steel cap.
+            painter.rect_filled(tr, CornerRadius::same(9), pal.sunken.lerp_to_gamma(pal.accent, 0.45 * t));
+            painter.add(metal::well(tr, 9));
+            painter.rect_stroke(tr, CornerRadius::same(9), Stroke::new(1.0, Palette::fade(pal.accent, 0.55 * t)), StrokeKind::Inside);
+            metal::cap(painter, pal, &m, knob, 6.5, t.max(hover * 0.5));
+        } else {
+            let fill = pal.sunken.lerp_to_gamma(pal.accent, t);
+            let edge = pal.border_strong.lerp_to_gamma(pal.accent, t);
+            painter.rect(tr, CornerRadius::same(9), fill, Stroke::new(1.0, edge), StrokeKind::Inside);
+            if hover > 0.0 {
+                painter.circle_filled(knob, 11.0, Palette::fade(pal.accent, 0.16 * hover));
+            }
+            // The knob is light when on in every theme: the paper ground on light schemes,
+            // the text color (near white) on dark ones.
+            let lit = if pal.dark { pal.text } else { pal.surface };
+            painter.circle_filled(knob, 6.5, pal.muted.lerp_to_gamma(lit, t));
         }
-        // The knob is light when on in every theme: the paper ground on light schemes,
-        // the text color (near white) on dark ones.
-        let lit = if pal.dark { pal.text } else { pal.surface };
-        painter.circle_filled(knob, 6.5, pal.muted.lerp_to_gamma(lit, t));
         if resp.has_focus() {
             focus_ring(ui, pal, tr, 9);
         }
@@ -924,7 +1106,10 @@ pub fn segmented<T: Copy + PartialEq>(
     if !ui.is_rect_visible(rect) {
         return None;
     }
-    ui.painter().rect_filled(rect, CornerRadius::same(7), pal.sunken);
+    ui.painter().rect_filled(rect, CornerRadius::same(pal.radius(7)), pal.sunken);
+    if pal.metal.is_some() {
+        ui.painter().add(metal::well(rect, pal.radius(7)));
+    }
     let mut x = rect.left() + 2.0;
     let mut slots = Vec::with_capacity(options.len());
     for w in &widths {
@@ -938,8 +1123,13 @@ pub fn segmented<T: Copy + PartialEq>(
         let right = ctx.animate_value_with_time(id.with("pill-r"), slots[sel].right(), secs);
         let pill = Rect::from_x_y_ranges(left..=right, slots[sel].y_range());
         let painter = ui.painter();
-        painter.add(egui::epaint::Shadow { offset: [0, 1], blur: 3, spread: 0, color: Palette::fade(pal.shadow, 0.5) }.as_shape(pill, CornerRadius::same(5)));
-        painter.rect(pill, CornerRadius::same(5), pal.raised, Stroke::new(1.0, pal.border), StrokeKind::Inside);
+        if let Some(m) = pal.metal {
+            // The backlight slides to the chosen key.
+            metal::key_body(painter, &m, pill.shrink(1.0), 3, KeyState { hover: 0.0, on: 1.0, press: 0.0, color: pal.accent });
+        } else {
+            painter.add(egui::epaint::Shadow { offset: [0, 1], blur: 3, spread: 0, color: Palette::fade(pal.shadow, 0.5) }.as_shape(pill, CornerRadius::same(5)));
+            painter.rect(pill, CornerRadius::same(5), pal.raised, Stroke::new(1.0, pal.border), StrokeKind::Inside);
+        }
     }
     for (i, ((value, label), galley)) in options.iter().zip(galleys).enumerate() {
         let slot = slots[i];
@@ -991,15 +1181,31 @@ pub fn keycap(ui: &mut Ui, pal: &Palette, key: &str) -> Response {
     let (rect, resp) = ui.allocate_exact_size(size, Sense::hover());
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
-        painter.rect_filled(rect.translate(Vec2::new(0.0, 1.5)), CornerRadius::same(4), pal.border);
-        painter.rect(rect, CornerRadius::same(4), pal.raised, Stroke::new(1.0, pal.border), StrokeKind::Inside);
+        if let Some(m) = pal.metal {
+            metal::key_body(painter, &m, rect, 3, KeyState { hover: 0.0, on: 0.0, press: 0.0, color: pal.accent });
+        } else {
+            painter.rect_filled(rect.translate(Vec2::new(0.0, 1.5)), CornerRadius::same(4), pal.border);
+            painter.rect(rect, CornerRadius::same(4), pal.raised, Stroke::new(1.0, pal.border), StrokeKind::Inside);
+        }
         painter.galley(rect.center() - galley.size() / 2.0, galley, pal.muted);
     }
     resp
 }
 
 /// A mono uppercase eyebrow (11 px, 0.12em, text-3): section and dock titles.
+///
+/// With materials the title is engraved in the plate, a step brighter so the relief reads.
 pub fn section_title(ui: &mut Ui, pal: &Palette, text: &str) {
+    if let Some(m) = pal.metal {
+        let job = spaced(&text.to_uppercase(), fonts::mono_id(11.0), pal.muted, EYEBROW_TRACKING);
+        let galley = ui.painter().layout_job(job);
+        let (rect, resp) = ui.allocate_exact_size(galley.size(), Sense::hover());
+        resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, text.to_uppercase()));
+        if ui.is_rect_visible(rect) {
+            metal::engraved(ui.painter(), &m, rect.min, galley, pal.muted);
+        }
+        return;
+    }
     let job = spaced(
         &text.to_uppercase(),
         fonts::mono_id(11.0),
