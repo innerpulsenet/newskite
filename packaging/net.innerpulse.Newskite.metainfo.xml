@@ -55,6 +55,11 @@
   </requires>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.5.0" date="2026-11-21">
+      <description>
+        <p>Faster and quieter: downloads allocate less and keep every connection busy while files are finalized, repair and extraction do less work, and an idle window no longer redraws. Long queues and histories stay smooth. A first-run guide leads to the server settings, Settings asks before discarding changes, and the keyboard reaches more (Ctrl+1/2/3, Ctrl+S, Enter to confirm).</p>
+      </description>
+    </release>
     <release version="0.9.0" date="2026-11-02">
       <description>
         <p>Post-processing needs no external programs: PAR2 repair and RAR, 7z and zip extraction, including split zip sets, are built in. Repair, verification and downloading are faster, and the interface is redesigned with smoother motion and readable contrast in every theme.</p>
