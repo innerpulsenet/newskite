@@ -486,6 +486,35 @@ async fn slow_body_hits_read_timeout_and_breaks_connection() {
     assert!(matches!(conn.date().await, Err(NntpError::Protocol(_))));
 }
 
+/// A read cut short by dropping its future (a cancelled download) leaves part of a reply
+/// on the socket, so the connection must count as broken and never be reused; one that
+/// completes leaves it healthy.
+#[tokio::test]
+async fn reads_dropped_halfway_leave_the_connection_broken() {
+    let big = vec![b'a'; 100_000];
+    let mock = MockServer::start(MockConfig {
+        articles: articles(&[("big@x", &big), ("small@x", b"ok\r\n")]),
+        bandwidth_bps: 20_000,
+        ..Default::default()
+    })
+    .await;
+    let cfg = server_cfg(mock.addr, "", "");
+
+    let mut conn = NntpConnection::connect(&cfg, TIMEOUT).await.unwrap();
+    assert_eq!(conn.body("small@x").await.unwrap(), b"ok\r\n");
+    assert!(!conn.is_broken());
+    // The 100 kB body takes seconds at this rate: drop the read while it streams.
+    conn.send_body("big@x").await.unwrap();
+    conn.begin_body("big@x").await.unwrap();
+    assert!(tokio::time::timeout(Duration::from_millis(100), conn.finish_body()).await.is_err());
+    assert!(conn.is_broken());
+    assert!(matches!(conn.date().await, Err(NntpError::Protocol(_))));
+
+    let mut conn = NntpConnection::connect(&cfg, TIMEOUT).await.unwrap();
+    assert!(tokio::time::timeout(Duration::from_millis(100), conn.body("big@x")).await.is_err());
+    assert!(conn.is_broken());
+}
+
 #[tokio::test]
 async fn delay_is_applied_per_body() {
     let mock = MockServer::start(MockConfig {

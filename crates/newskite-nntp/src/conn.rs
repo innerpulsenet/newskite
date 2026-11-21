@@ -477,15 +477,19 @@ impl NntpConnection {
     }
 
     async fn send_line(&mut self, line: &str) -> Result<(), NntpError> {
-        let masked = mask_command(line);
-        tracing::trace!(address = %self.address, command = %masked, "->");
-        if let Some(t) = self.transcript.as_mut() {
-            t.push(format!("-> {masked}"));
+        // Masking copies the line; only worth it when someone will see it.
+        if self.transcript.is_some() || tracing::enabled!(tracing::Level::TRACE) {
+            let masked = mask_command(line);
+            tracing::trace!(address = %self.address, command = %masked, "->");
+            if let Some(t) = self.transcript.as_mut() {
+                t.push(format!("-> {masked}"));
+            }
         }
         let mut buf = std::mem::take(&mut self.write_buf);
         buf.clear();
         buf.extend_from_slice(line.as_bytes());
         buf.extend_from_slice(b"\r\n");
+        let was_broken = self.mark_in_flight();
         let stream = self.reader.get_mut();
         let write = async {
             stream.write_all(&buf).await?;
@@ -494,7 +498,10 @@ impl NntpConnection {
         let outcome = tokio::time::timeout(self.read_timeout, write).await;
         self.write_buf = buf;
         match outcome {
-            Ok(Ok(())) => Ok(()),
+            Ok(Ok(())) => {
+                self.broken = was_broken;
+                Ok(())
+            }
             Ok(Err(e)) => {
                 self.broken = true;
                 Err(NntpError::Io(e))
@@ -509,6 +516,7 @@ impl NntpConnection {
     async fn read_response(&mut self) -> Result<Response, NntpError> {
         let mut line = std::mem::take(&mut self.line_buf);
         line.clear();
+        let was_broken = self.mark_in_flight();
         let result = match self.read_line(&mut line, MAX_STATUS_LINE).await {
             Ok(()) => Response::parse(&line),
             Err(e) => Err(e),
@@ -516,6 +524,7 @@ impl NntpConnection {
         self.restore_line_buf(line);
         match result {
             Ok(r) => {
+                self.broken = was_broken;
                 tracing::trace!(address = %self.address, code = r.code, "<-");
                 if self.transcript.is_some() {
                     let shown = self.redact(&r.to_string());
@@ -546,6 +555,7 @@ impl NntpConnection {
         };
         let mut out: Vec<u8> = Vec::with_capacity(capacity);
         let mut state = Block::LineStart;
+        let was_broken = self.mark_in_flight();
         loop {
             let chunk = match self.fill_buf().await {
                 Ok(c) => c,
@@ -563,6 +573,7 @@ impl NntpConnection {
             };
             self.reader.consume(used);
             if done {
+                self.broken = was_broken;
                 return Ok(out);
             }
         }
@@ -571,6 +582,11 @@ impl NntpConnection {
     /// The reader's buffered bytes, filling it from the socket (bounded by the inactivity
     /// timeout) when empty. The returned slice is never empty.
     async fn fill_buf(&mut self) -> Result<&[u8], NntpError> {
+        // Bytes already buffered (the start of a body read along with its status line)
+        // need no socket read and so no timer.
+        if !self.reader.buffer().is_empty() {
+            return Ok(self.reader.buffer());
+        }
         let reader = &mut self.reader;
         match tokio::time::timeout(self.read_timeout, reader.fill_buf()).await {
             Err(_) => Err(NntpError::Timeout),
@@ -614,6 +630,14 @@ impl NntpConnection {
         };
         self.broken = true;
         Err(err)
+    }
+
+    /// Marks the session broken while a read or write is under way, returning the earlier
+    /// state to restore once it completes. A future dropped halfway (a cancelled download)
+    /// leaves a partly sent command or a partly read reply behind, so the connection must
+    /// not be reused (the pool closes broken connections).
+    fn mark_in_flight(&mut self) -> bool {
+        std::mem::replace(&mut self.broken, true)
     }
 
     fn restore_line_buf(&mut self, mut line: Vec<u8>) {
