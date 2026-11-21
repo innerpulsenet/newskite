@@ -714,6 +714,48 @@ async fn watch_timer_imports_and_auto_starts() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn watch_timer_follows_saved_settings_without_restart() {
+    let tmp = TempDir::new().unwrap();
+    let file = TestFile::random("wf", "wf.bin", 1024, 1, 93);
+    let watch = tmp.path().join("watch");
+    write_nzb(&watch, "one.nzb", None, &[&file]);
+    let mut settings = test_settings(tmp.path(), vec![]);
+    settings.watch_folder = watch.clone();
+    settings.watch_interval_secs = 1;
+    let svc = open_service(tmp.path(), settings);
+    let mut rx = svc.subscribe();
+
+    // Disabled: several intervals pass without a scan.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert!(svc.jobs().is_empty());
+
+    // Enabled by a save: it scans without waiting for a restart.
+    let mut s = svc.settings();
+    s.watch_enabled = true;
+    svc.save_settings(s).unwrap();
+    wait_event(&mut rx, 10, |e| matches!(e, ServiceEvent::WatchImported(n) if n == &vec!["one".to_string()])).await;
+
+    // Disabled again: a new file stays where it is.
+    let mut s = svc.settings();
+    s.watch_enabled = false;
+    svc.save_settings(s).unwrap();
+    write_nzb(&watch, "two.nzb", None, &[&file]);
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(svc.jobs().len(), 1);
+
+    // Enabled with a long interval: the first scan still comes at once, and the file
+    // imported before is not imported again.
+    let mut s = svc.settings();
+    s.watch_enabled = true;
+    s.watch_interval_secs = 3600;
+    svc.save_settings(s).unwrap();
+    wait_event(&mut rx, 10, |e| matches!(e, ServiceEvent::WatchImported(n) if n == &vec!["two".to_string()])).await;
+    let mut names: Vec<String> = svc.jobs().into_iter().map(|j| j.name).collect();
+    names.sort();
+    assert_eq!(names, ["one", "two"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn settings_bookmarks_passwords_and_server_test() {
     let tmp = TempDir::new().unwrap();
     let mock = mock_for(&[], &[], 0).await;

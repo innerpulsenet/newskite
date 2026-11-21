@@ -12,9 +12,9 @@
 //!   insensitive, not recursive) whose canonical path has no job in any state and was not
 //!   imported (or its job removed) before with the same size and mtime, so removing a job
 //!   does not bring it back.
-//!   A background timer scans every `watch_interval_secs` while `watch_enabled` (settings are
-//!   re-read every second, so changes apply without a restart). Manual scans work whenever a
-//!   watch folder is configured. Timer scans log only imports and new problems.
+//!   A background timer scans every `watch_interval_secs` while `watch_enabled`; saved
+//!   settings wake it, so changes apply at once without a restart. Manual scans work
+//!   whenever a watch folder is configured. Timer scans log only imports and new problems.
 //! * **Queue (F4).** One run at a time ([`Service::start`] is idempotent). A run processes
 //!   `queued` jobs in queue order (an explicit position set by [`Service::move_job`], then
 //!   oldest first); `paused` jobs are held by the user and skipped. [`Service::pause`] is
@@ -369,7 +369,15 @@ pub(crate) struct Inner {
     pub(crate) sampler_error_logged: AtomicBool,
     /// In-memory settings used instead of the stored document (never persisted); set by
     /// [`Service::set_runtime_settings_override`] (the headless CLI).
-    settings_override: Mutex<Option<Settings>>,
+    settings_override: Mutex<Option<Arc<Settings>>>,
+    /// The stored settings document as last loaded; `None` until it is loaded, after every
+    /// save, and while it cannot be loaded. Every write of the document goes through
+    /// [`Service::save_settings`], which clears it while holding this lock, so a load can
+    /// never put an older document back.
+    settings_cache: Mutex<Option<Arc<Settings>>>,
+    /// Bumped whenever the effective settings may have changed (a save or an override),
+    /// so the watch timer re-reads them at once instead of polling.
+    pub(crate) settings_changed: watch::Sender<u64>,
     /// The speed limit every job's engine reads as it runs; kept equal to the effective
     /// settings' limit (set on save, on override and at each job's start).
     pub(crate) speed_limit: SpeedLimit,
@@ -460,16 +468,33 @@ impl Inner {
 
     /// Effective settings for runs, imports and timers: the runtime override when one is
     /// set, otherwise the stored document.
-    pub(crate) fn settings(&self) -> Settings {
+    pub(crate) fn settings(&self) -> Arc<Settings> {
         if let Some(s) = lock(&self.settings_override).as_ref() {
             return s.clone();
         }
         self.stored_settings()
     }
 
-    /// The stored settings document; a load failure is logged once and defaults are used.
-    pub(crate) fn stored_settings(&self) -> Settings {
-        match self.store.load_settings() {
+    /// Tells the watch timer that the effective settings may have changed.
+    fn settings_changed(&self) {
+        self.settings_changed.send_modify(|n| *n = n.wrapping_add(1));
+    }
+
+    /// The stored settings document (cached, see `settings_cache`); a load failure is
+    /// logged once and defaults are used.
+    pub(crate) fn stored_settings(&self) -> Arc<Settings> {
+        let loaded = {
+            let mut cache = lock(&self.settings_cache);
+            if let Some(s) = cache.as_ref() {
+                return s.clone();
+            }
+            let loaded = self.store.load_settings().map(Arc::new);
+            if let Ok(s) = &loaded {
+                *cache = Some(s.clone());
+            }
+            loaded
+        };
+        match loaded {
             Ok(s) => s,
             Err(e) => {
                 if !self.settings_error_logged.swap(true, Ordering::Relaxed) {
@@ -481,7 +506,7 @@ impl Inner {
                         ),
                     );
                 }
-                Settings::default().normalized()
+                Arc::new(Settings::default().normalized())
             }
         }
     }
@@ -550,7 +575,7 @@ impl Inner {
     /// Watch-folder dedupe: `path` has a job in any state, or was imported (or its job
     /// removed) while it had this fingerprint.
     pub(crate) fn watch_source_known(&self, path: &Path, fp: Fingerprint) -> Result<bool, StoreError> {
-        Ok(self.store.job_by_source(path)?.is_some() || self.store.source_seen(path, fp.size, fp.mtime)?)
+        self.store.source_known(path, fp.size, fp.mtime)
     }
 }
 
@@ -569,13 +594,17 @@ pub(crate) struct Fingerprint {
 impl Fingerprint {
     /// The fingerprint of the file at `path`, or `None` if it cannot be read.
     pub(crate) fn of(path: &Path) -> Option<Self> {
-        let meta = std::fs::metadata(path).ok()?;
+        Some(Self::from_meta(&std::fs::metadata(path).ok()?))
+    }
+
+    /// The fingerprint of a file from its (link-following) metadata.
+    pub(crate) fn from_meta(meta: &std::fs::Metadata) -> Self {
         let mtime = meta
             .modified()
             .ok()
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
             .map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX));
-        Some(Self { size: meta.len(), mtime })
+        Self { size: meta.len(), mtime }
     }
 }
 
@@ -627,6 +656,7 @@ impl Service {
     pub fn with_store(store: Store, opts: ServiceOptions, rt: Handle) -> Self {
         let (events, _) = broadcast::channel(EVENT_CAPACITY);
         let (running_tx, _) = watch::channel(false);
+        let (settings_changed, _) = watch::channel(0);
         let inner = Arc::new(Inner {
             store,
             rt,
@@ -647,6 +677,8 @@ impl Service {
             settings_error_logged: AtomicBool::new(false),
             sampler_error_logged: AtomicBool::new(false),
             settings_override: Mutex::new(None),
+            settings_cache: Mutex::new(None),
+            settings_changed,
             speed_limit: SpeedLimit::default(),
             backup_first: Mutex::new(HashMap::new()),
             articles: Mutex::new(HashMap::new()),
@@ -1220,7 +1252,7 @@ impl Service {
     /// loaded). A runtime override ([`Service::set_runtime_settings_override`]) is not
     /// reflected here, so saving what this returns never persists override values.
     pub fn settings(&self) -> Settings {
-        self.inner.stored_settings()
+        Settings::clone(&self.inner.stored_settings())
     }
 
     /// Why the stored settings document cannot be loaded, or `None` when it loads. While
@@ -1238,8 +1270,9 @@ impl Service {
     /// by the headless CLI for `--server`/`--dest`. Like saved settings, it applies from
     /// the next job, except the speed limit, which applies at once.
     pub fn set_runtime_settings_override(&self, s: Option<Settings>) {
-        *lock(&self.inner.settings_override) = s.map(Settings::normalized);
+        *lock(&self.inner.settings_override) = s.map(|s| Arc::new(s.normalized()));
         self.inner.speed_limit.set(self.inner.settings().speed_limit_bps());
+        self.inner.settings_changed();
     }
 
     /// The speed limit in force now, in bytes per second (0 = unlimited).
@@ -1286,8 +1319,17 @@ impl Service {
     /// When the stored document cannot be loaded, it is kept as a backup row first (see
     /// [`Store::save_settings`]) and a warning names the backup key.
     pub fn save_settings(&self, s: Settings) -> Result<(), ServiceError> {
-        let was_unreadable = self.inner.store.load_settings().is_err();
-        match self.inner.store.save_settings(&s.normalized()) {
+        let (was_unreadable, saved) = {
+            // Held across the write, so no load in between can cache the old document.
+            let mut cache = lock(&self.inner.settings_cache);
+            let was_unreadable = self.inner.store.load_settings().is_err();
+            let saved = self.inner.store.save_settings(&s.normalized());
+            // Also after a failed save: whatever is stored now is read again.
+            *cache = None;
+            (was_unreadable, saved)
+        };
+        self.inner.settings_changed();
+        match saved {
             Ok(()) => {
                 // Running downloads follow a new limit at once (the rest from the next job).
                 self.inner.speed_limit.set(self.inner.settings().speed_limit_bps());

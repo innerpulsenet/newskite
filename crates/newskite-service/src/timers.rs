@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use newskite_store::ThroughputSample;
 use tokio::time::MissedTickBehavior;
@@ -95,39 +95,57 @@ fn sample(inner: &Inner, delta: u64, prune: bool) {
     }
 }
 
-/// Starts the watch-folder timer. Settings are re-read every second; while
-/// `watch_enabled` and `watch_interval_secs > 0`, the folder is scanned right away and then
-/// every interval.
+/// Starts the watch-folder timer. While `watch_enabled` and `watch_interval_secs > 0` (and
+/// a folder is set), the folder is scanned right away and then every interval, on a
+/// blocking thread. In between it sleeps until the next scan is due or the settings
+/// change, so a disabled watch folder costs nothing and a change applies at once.
 pub(crate) fn spawn_watch_timer(inner: &Arc<Inner>) {
     let weak = Arc::downgrade(inner);
     let token = inner.shutdown.clone();
+    let mut changed = inner.settings_changed.subscribe();
     inner.rt.spawn(async move {
-        // Seconds since the last scan; `None` = scan on the next enabled tick.
-        let mut since_scan: Option<u64> = None;
+        // The first scan waits a moment after startup, as it always has.
+        tokio::select! {
+            _ = token.cancelled() => return,
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
+        // When the last scan ended; `None` = scan as soon as the watch folder is enabled.
+        let mut last_scan: Option<Instant> = None;
         loop {
-            tokio::select! {
-                _ = token.cancelled() => break,
-                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
-            }
+            // Seen before reading, so a change made after this read wakes the wait below.
+            changed.borrow_and_update();
             let Some(inner) = weak.upgrade() else { break };
             let settings = inner.settings();
             let enabled = settings.watch_enabled
                 && settings.watch_interval_secs > 0
                 && !settings.watch_folder.as_os_str().is_empty();
-            if !enabled {
-                since_scan = None;
-                continue;
-            }
-            let due = match since_scan {
-                None => true,
-                Some(s) => s + 1 >= settings.watch_interval_secs,
-            };
-            if due {
-                since_scan = Some(0);
-                // Errors are logged by the scan itself.
-                let _ = scan_watch_folder(&inner, false);
+            let wait = if enabled {
+                let interval = Duration::from_secs(settings.watch_interval_secs);
+                match last_scan.map(|t| t.elapsed()) {
+                    Some(since) if since < interval => Some(interval - since),
+                    _ => {
+                        // Errors are logged by the scan itself.
+                        let scan = inner.clone();
+                        let _ = tokio::task::spawn_blocking(move || scan_watch_folder(&scan, false)).await;
+                        last_scan = Some(Instant::now());
+                        continue;
+                    }
+                }
             } else {
-                since_scan = since_scan.map(|s| s + 1);
+                last_scan = None;
+                None
+            };
+            drop((inner, settings));
+            let due = async {
+                match wait {
+                    Some(w) => tokio::time::sleep(w).await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                _ = token.cancelled() => break,
+                r = changed.changed() => if r.is_err() { break },
+                _ = due => {}
             }
         }
     });
@@ -160,18 +178,22 @@ pub(crate) fn scan_watch_folder(inner: &Arc<Inner>, manual: bool) -> Result<Vec<
         }
     };
 
-    let mut candidates: Vec<PathBuf> = entries
+    // With the (link-following) metadata read to find the files, which is also the
+    // fingerprint of the canonical path.
+    let mut candidates: Vec<(PathBuf, Fingerprint)> = entries
         .filter_map(Result::ok)
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("nzb")))
-        .filter(|p| std::fs::metadata(p).is_ok_and(|m| m.is_file()))
+        .filter_map(|p| {
+            let meta = std::fs::metadata(&p).ok().filter(std::fs::Metadata::is_file)?;
+            Some((p, Fingerprint::from_meta(&meta)))
+        })
         .collect();
-    candidates.sort();
+    candidates.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut imported = Vec::new();
-    for path in candidates {
+    for (path, fp) in candidates {
         let Ok(canonical) = std::fs::canonicalize(&path) else { continue };
-        let Some(fp) = Fingerprint::of(&canonical) else { continue };
         // Cheap check first, so known files are not parsed every interval; import_nzb
         // checks again under the import lock.
         match inner.watch_source_known(&canonical, fp) {
