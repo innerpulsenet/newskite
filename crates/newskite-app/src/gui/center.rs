@@ -65,6 +65,8 @@ const CONTROLS_W: f32 = 178.0;
 /// Width of the controls box while an archive password is typed in the row (less in a
 /// narrow list, so the name keeps some room).
 const PASSWORD_EDIT_W: f32 = 320.0;
+/// Room a job's name keeps before the row's figures give way to their brief form.
+const NAME_KEEP_W: f32 = 240.0;
 /// How far outside the list's visible part rows are still drawn.
 const CULL_MARGIN: f32 = 240.0;
 /// Gap between a row's figures and its controls box.
@@ -627,6 +629,9 @@ fn first_line(
     // The figure: progress and speed while queued or downloading; size and the finish
     // time once finished.
     let mut figures: Vec<(String, Option<String>)> = Vec::new();
+    // What the figures shrink to when the name would otherwise be cut (the inspector
+    // open beside a narrow list): the one number that matters most.
+    let mut brief: Vec<(String, Option<String>)> = Vec::new();
     match kind {
         RowKind::Queue => {
             if let Some(p) = data.status.post.as_ref().filter(|p| p.job_id == job.id) {
@@ -645,9 +650,14 @@ fn first_line(
                 } else {
                     format::bytes(done)
                 };
+                brief.push((format!("{}%  ·  {}", format::percent(done, job.bytes_total), format::speed(data.speed())), Some(format!("{progress}  ·  {live}"))));
                 figures.push((progress, None));
                 figures.push((live, None));
             } else if done > 0 {
+                brief.push((
+                    format!("{}%", format::percent(done, job.bytes_total)),
+                    Some(format!("{} of {}", format::bytes(done), format::bytes(job.bytes_total))),
+                ));
                 figures.push((
                     format!(
                         "{}%  ·  {} / {}",
@@ -663,10 +673,14 @@ fn first_line(
         }
         RowKind::Finished => match job.stats.finished_at {
             // Relative ("58 min ago"), the exact local and UTC times on hover.
-            Some(t) => figures.push((
-                format!("{}  ·  {}", format::bytes(job.bytes_total), format::ago(t, now_unix())),
-                Some(format!("Finished at {} · {}", clock_hm(t), format::timestamp_utc(t))),
-            )),
+            Some(t) => {
+                let when = format!("Finished {} at {} · {}", format::ago(t, now_unix()), clock_hm(t), format::timestamp_utc(t));
+                brief.push((format::bytes(job.bytes_total), Some(when)));
+                figures.push((
+                    format!("{}  ·  {}", format::bytes(job.bytes_total), format::ago(t, now_unix())),
+                    Some(format!("Finished at {} · {}", clock_hm(t), format::timestamp_utc(t))),
+                ));
+            }
             None => figures.push((format::bytes(job.bytes_total), None)),
         },
     }
@@ -681,9 +695,15 @@ fn first_line(
     let measure = |t: &str, f: &egui::FontId| ui.painter().layout_no_wrap(t.to_owned(), f.clone(), pal.text).size().x;
     // The figures end flush against the controls, so sizes and speeds line up down the
     // list whatever the names and state words before them take.
-    let figures_w = figures.iter().map(|(t, _)| measure(t, &mono) + 12.0).sum::<f32>();
-    let mid_w = status_chip_width(ui, &word) + figures_w + 16.0 + FIGURE_GAP;
-    let name_w = (w - controls_w - mid_w - 8.0).max(90.0);
+    let width_of = |f: &[(String, Option<String>)]| f.iter().map(|(t, _)| measure(t, &mono) + 12.0).sum::<f32>();
+    let chip_w = status_chip_width(ui, &word);
+    let room = |figures_w: f32| w - controls_w - (chip_w + figures_w + 16.0 + FIGURE_GAP) - 8.0;
+    let name_needs = measure(&job.name, &fonts::semibold_id(14.5)) + 2.0;
+    if !brief.is_empty() && !figures.is_empty() && room(width_of(&figures)) < name_needs.min(NAME_KEEP_W) {
+        figures = brief;
+    }
+    let figures_w = width_of(&figures);
+    let name_w = room(figures_w).max(90.0);
     ui.horizontal(|ui| {
         ui.set_min_height(24.0);
         ui.spacing_mut().item_spacing.x = 0.0;

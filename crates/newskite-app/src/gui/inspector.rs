@@ -145,7 +145,8 @@ pub fn timeline(job: &Job, post: Option<&PostProgress>, done: u64, speed: u64, n
         JobState::Done | JobState::Failed if download_failed => {
             let d = match outcome.and_then(|o| o.failure) {
                 Some(FailureKind::MissingArticles) => {
-                    format!("{} article(s) missing on every server", st.articles_missing)
+                    let n = st.articles_missing;
+                    format!("{n} article{} missing on every server", if n == 1 { "" } else { "s" })
                 }
                 Some(FailureKind::Unrepairable) => match outcome.and_then(|o| o.repair_outlook) {
                     Some(r) => format!("Stopped early: {} damaged slices, at most {} recovery blocks", r.needed, r.available),

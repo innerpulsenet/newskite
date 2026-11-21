@@ -351,7 +351,7 @@ const SECTIONS: [(&str, Icon); 6] = [
     ("Performance", Icon::Gear),
     ("Post-processing", Icon::Retry),
     ("Automation", Icon::Play),
-    ("Appearance", Icon::Info),
+    ("Appearance", Icon::Theme),
 ];
 
 /// Temp-data keys: the section the reader is in (scroll spy), a pending jump, and where
