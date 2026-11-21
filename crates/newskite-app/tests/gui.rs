@@ -1846,3 +1846,110 @@ fn failover_strip_wide_log_and_backup_retry_render() {
     assert_disjoint(&h, &strip_labels);
     snapshot(&mut h, "failover-light-wide");
 }
+
+/// Esc closes one thing at a time, innermost first: the row's password editor, then the
+/// selection; and the window's shortcuts rest while Settings is open over it.
+#[test]
+fn escape_closes_one_thing_and_shortcuts_rest_under_dialogs() {
+    let fx = Fixture::new(seed_populated);
+    let mut h = fx.harness(true, SIZE);
+    h.run_steps(3);
+    let id = app(&h).data.jobs.iter().find(|j| j.state.is_pending()).map(|j| j.id).expect("a pending job");
+    {
+        let a = h.state_mut().as_mut().expect("app");
+        a.push_action(Action::Select(Some(id)));
+        a.push_action(Action::EditPassword(id));
+    }
+    h.run_steps(3);
+    assert!(app(&h).view.queue.password_edit.is_some());
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(app(&h).view.queue.password_edit.is_none(), "the editor closes first");
+    assert_eq!(app(&h).view.queue.selected, Some(id), "and the selection stays");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert_eq!(app(&h).view.queue.selected, None, "the next Esc clears the selection");
+
+    // Under the Settings sheet, Ctrl+2 does not switch the view behind it.
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Num2);
+    h.run_steps(2);
+    assert_eq!(app(&h).view.tab, Tab::History, "Ctrl+2 shows History");
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Comma);
+    h.run_steps(3);
+    assert!(app(&h).view.settings.is_some());
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Num1);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::O);
+    h.run_steps(2);
+    assert_eq!(app(&h).view.tab, Tab::History);
+    assert!(!app(&h).view.dialog_open, "no file picker opens behind the sheet");
+}
+
+/// Closing a changed Settings sheet with Esc asks first; Esc again backs out of the
+/// question, Discard closes, and Ctrl+S saves.
+#[test]
+fn a_changed_settings_sheet_asks_before_closing_and_saves_from_the_keyboard() {
+    let fx = Fixture::new(|_, _| {});
+    let mut h = fx.harness(false, SIZE);
+    h.run_steps(2);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Comma);
+    h.run_steps(3);
+    // Unchanged: Esc closes at once.
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(app(&h).view.settings.is_none());
+
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Comma);
+    h.run_steps(3);
+    let change = |h: &mut Harness<'_, Option<NewskiteApp>>| {
+        let d = h.state_mut().as_mut().expect("app").view.settings.as_mut().expect("sheet");
+        d.settings.speed_limit_kbps = 4096;
+        assert!(d.dirty());
+    };
+    change(&mut h);
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(app(&h).view.settings.as_ref().is_some_and(|d| d.confirm_discard), "asks first");
+    h.get_by_label("Discard the changes you made here?");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(app(&h).view.settings.as_ref().is_some_and(|d| !d.confirm_discard), "Esc keeps editing");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    h.get_by_label("Discard").click();
+    h.run_steps(2);
+    assert!(app(&h).view.settings.is_none());
+    assert_eq!(fx.service.settings().speed_limit_kbps, 0, "discarded");
+
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Comma);
+    h.run_steps(3);
+    change(&mut h);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::S);
+    h.run_steps(3);
+    assert!(app(&h).view.settings.is_none(), "saved and closed");
+    assert_eq!(fx.service.settings().speed_limit_kbps, 4096);
+}
+
+/// An empty Active or Held list says which filter is empty (never empty quotes) and
+/// offers the way back.
+#[test]
+fn an_empty_state_filter_names_itself() {
+    use newskite_app::gui::center::ListFilter;
+    use newskite_app::gui::queue::no_match_text;
+    assert_eq!(no_match_text("", ListFilter::Held), "No held jobs.");
+    assert_eq!(no_match_text("  ", ListFilter::Active), "No active jobs.");
+    assert_eq!(no_match_text(" iso ", ListFilter::All), "No jobs match “iso”.");
+    assert_eq!(no_match_text("iso", ListFilter::Held), "No held jobs match “iso”.");
+
+    let fx = Fixture::new(seed_populated);
+    let mut h = fx.harness(true, SIZE);
+    h.run_steps(3);
+    h.state_mut().as_mut().expect("app").view.list_filter = ListFilter::Held;
+    h.run_steps(2);
+    if app(&h).data.jobs.iter().any(|j| j.state == newskite_service::JobState::Paused) {
+        return;
+    }
+    h.get_by_label("No held jobs.");
+    h.get_by_label("Show all jobs").click();
+    h.run_steps(2);
+    assert_eq!(app(&h).view.list_filter, ListFilter::All);
+}
