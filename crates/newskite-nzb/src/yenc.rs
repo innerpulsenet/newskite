@@ -187,11 +187,9 @@ pub fn decode(article_body: &[u8]) -> Result<YencPart, YencError> {
         None => (article_body.len(), None),
     };
 
-    // Never trust the header for allocation size beyond what the body could possibly hold.
-    let cap = usize::try_from(expected)
-        .unwrap_or(usize::MAX)
-        .min(data_end - pos);
-    let mut data = Vec::with_capacity(cap);
+    // Sized from the body (never from the header) with the room `decode_into` needs, so
+    // the buffer is allocated once instead of regrown on every segment.
+    let mut data = Vec::with_capacity(data_end - pos + WORD);
     decode_into(&article_body[pos..data_end], &mut data);
 
     let got = data.len() as u64;
@@ -530,6 +528,94 @@ mod tests {
                 assert_eq!(decode_data(&input), reference(&input), "{input:?}");
             }
         }
+    }
+
+    /// The data lines of an article (after `=ybegin`, before the first `=yend` line) by
+    /// the byte-at-a-time reference.
+    fn reference_article(body: &[u8]) -> Vec<u8> {
+        let pos = take_line(body, 0).1;
+        let end = (pos..body.len())
+            .find(|&p| body[p - 1] == b'\n' && is_keyword_line(&body[p..], b"=yend"))
+            .unwrap_or(body.len());
+        reference(&body[pos..end])
+    }
+
+    /// Articles whose data is dense in escapes, CR, LF and `=y` look-alikes (`=yend` inside
+    /// a line, `=yendx` and `=ypart` lines, CRLF split anywhere), with zero, one or two
+    /// `=yend` lines near the tail, decode exactly the data before the first `=yend` line.
+    #[test]
+    fn decode_stops_at_the_first_yend_line() {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let pieces: [&[u8]; 10] =
+            [b"=", b"\r", b"\n", b"\r\n", b"=yend", b"\r\n=yendx\r\n", b"\n=ypart x\n", b"\n=y", b"ab", b"=\r\n"];
+        for len in 0..200 {
+            for tail in 0..3 {
+                let mut data = Vec::new();
+                for _ in 0..len {
+                    if next() % 3 == 0 {
+                        data.extend_from_slice(pieces[(next() % pieces.len() as u64) as usize]);
+                    } else {
+                        data.push(next() as u8);
+                    }
+                }
+                let mut body = b"=ybegin line=128 size=1000 name=t\r\n".to_vec();
+                body.extend_from_slice(&data);
+                match tail {
+                    0 => {}
+                    1 => body.extend_from_slice(b"\r\n=yend part=1\r\n"),
+                    _ => body.extend_from_slice(b"\n=yend part=1\n=yend size=2\r\n"),
+                }
+                let want = reference_article(&body);
+                // Declare exactly what the reference decodes, so decode() must agree.
+                let size = format!("size={:<4}", want.len());
+                body[17..26].copy_from_slice(size.as_bytes());
+                let got = decode(&body).unwrap_or_else(|e| panic!("{e}: {body:?}"));
+                assert_eq!(got.data, want, "{body:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn decode_edge_cases() {
+        // `=yend` as the very first data line: an empty part.
+        let p = decode(b"=ybegin size=0 name=e\r\n=yend size=0\r\n").unwrap();
+        assert!(p.data.is_empty());
+        // Without a trailer the rest of the body is data and no CRC is checked.
+        let p = decode(b"=ybegin size=2 name=n\r\n+,\r\n").unwrap();
+        assert_eq!((p.data, p.crc_ok), (vec![1, 2], None));
+        // LF-only line endings and a trailer without a final line break.
+        let body = encode_article("lf.bin", 300, 1, 1, 1, &[7u8; 300], 64);
+        let lf: Vec<u8> = body.iter().copied().filter(|&b| b != b'\r').collect();
+        let p = decode(&lf[..lf.len() - 1]).unwrap();
+        assert_eq!((p.data, p.crc_ok), (vec![7u8; 300], Some(true)));
+        // An escape at the very end of the data, right before the trailer.
+        let p = decode(b"=ybegin size=1 name=x\r\n=}\r\n=yend size=1\r\n").unwrap();
+        assert_eq!(p.data, vec![b'}'.wrapping_sub(106)]);
+        // Junk after the trailer is ignored; a size mismatch is still caught.
+        assert!(decode(b"=ybegin size=1 name=x\r\n+\r\n=yend size=1\r\nmore junk\r\n").is_ok());
+        assert_eq!(
+            decode(b"=ybegin size=2 name=x\r\n+\r\n=yend size=2\r\n"),
+            Err(YencError::SizeMismatch { expected: 2, got: 1 })
+        );
+        assert_eq!(decode(b"no header"), Err(YencError::NoHeader));
+        assert!(matches!(decode(b"=ybegin name=x\r\n"), Err(YencError::BadHeader(_))));
+    }
+
+    /// The decoded buffer is sized once from the body: no regrowth, and no capacity much
+    /// past the encoded length (it used to double on every segment).
+    #[test]
+    fn decode_allocates_once() {
+        let data: Vec<u8> = (0..750_000u32).map(|i| (i * 7 + i / 13) as u8).collect();
+        let body = encode_article("a.bin", 75_000_000, 3, 100, 1_500_001, &data, 128);
+        let p = decode(&body).unwrap();
+        assert_eq!(p.data, data);
+        assert!(p.data.capacity() <= body.len() + WORD, "{} > {}", p.data.capacity(), body.len());
     }
 
     #[test]
