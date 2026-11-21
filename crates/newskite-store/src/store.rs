@@ -34,8 +34,58 @@ const SETTINGS_BACKUP_PREFIX: &str = "settings.unreadable-";
 /// Key of the lifetime downloaded-bytes counter in the `counters` table.
 const DOWNLOADED_BYTES_KEY: &str = "downloaded_bytes";
 
-const JOB_COLUMNS: &str = "id, name, state, bytes_total, bytes_done, dest_dir, source_path, created_at, error, password, \
-     started_at, finished_at, download_ms, post_ms, articles_total, articles_missing, outcome";
+/// Prepared statements kept per connection (see [`Connection::prepare_cached`]); more
+/// than the distinct statements either connection runs.
+const STATEMENT_CACHE: usize = 48;
+
+/// Column list read by [`job_from_row`] (a macro so it can be `concat!`ed into const SQL).
+macro_rules! job_columns {
+    () => {
+        "id, name, state, bytes_total, bytes_done, dest_dir, source_path, created_at, error, password, \
+         started_at, finished_at, download_ms, post_ms, articles_total, articles_missing, outcome"
+    };
+}
+
+/// Queue order: explicit position, then age, then id (the `jobs_queue` index order).
+macro_rules! queue_order {
+    () => {
+        "position ASC, created_at ASC, id ASC"
+    };
+}
+
+macro_rules! bookmark_columns {
+    () => {
+        "id, parent_id, name, newsgroup, color, expanded, ord"
+    };
+}
+
+const JOB_COLUMNS: &str = job_columns!();
+const QUEUE_ORDER: &str = queue_order!();
+
+const SQL_JOB_BY_ID: &str = concat!("SELECT ", job_columns!(), " FROM jobs WHERE id = ?1");
+const SQL_LIST_JOBS: &str = concat!("SELECT ", job_columns!(), " FROM jobs ORDER BY id ASC");
+const SQL_JOB_BY_SOURCE: &str =
+    concat!("SELECT ", job_columns!(), " FROM jobs WHERE source_path = ?1 ORDER BY id DESC LIMIT 1");
+const SQL_PENDING_JOB_BY_SOURCE: &str = concat!(
+    "SELECT ",
+    job_columns!(),
+    " FROM jobs WHERE source_path = ?1 AND state IN ('queued', 'downloading', 'paused') ORDER BY id ASC LIMIT 1"
+);
+pub(crate) const SQL_NEXT_RUNNABLE: &str =
+    concat!("SELECT ", job_columns!(), " FROM jobs WHERE state = 'queued' ORDER BY ", queue_order!(), " LIMIT 1");
+pub(crate) const SQL_QUEUE_ORDER: &str = concat!(
+    "SELECT id FROM jobs WHERE state IN ('queued', 'downloading', 'paused') ORDER BY ",
+    queue_order!()
+);
+/// Position 0 while the queue was never reordered (created_at order applies); after a move
+/// every pending job has a position and a new one goes last. `MAX` alone in its query, so
+/// SQLite answers it from the `jobs_position` index.
+pub(crate) const SQL_INSERT_JOB: &str =
+    "INSERT INTO jobs (name, state, bytes_total, bytes_done, dest_dir, source_path, created_at, error, password, position)
+     VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6, NULL, ?7,
+             (SELECT CASE WHEN m > 0 THEN m + 1 ELSE 0 END FROM (SELECT MAX(position) AS m FROM jobs)))";
+const SQL_LIST_BOOKMARKS: &str = concat!("SELECT ", bookmark_columns!(), " FROM bookmarks ORDER BY ord ASC, id ASC");
+const SQL_BOOKMARK_BY_ID: &str = concat!("SELECT ", bookmark_columns!(), " FROM bookmarks WHERE id = ?1");
 
 /// Lines kept per job in `job_log`.
 pub const JOB_LOG_KEEP: i64 = 500;
@@ -43,11 +93,6 @@ pub const JOB_LOG_KEEP: i64 = 500;
 /// Lifetime article counters in the `counters` table.
 const ARTICLES_FETCHED_KEY: &str = "articles_fetched";
 const ARTICLES_MISSING_KEY: &str = "articles_missing";
-
-/// Queue order: explicit position, then age, then id.
-const QUEUE_ORDER: &str = "position ASC, created_at ASC, id ASC";
-
-const BOOKMARK_COLUMNS: &str = "id, parent_id, name, newsgroup, color, expanded, ord";
 
 /// Thread-safe handle to the Newskite database.
 ///
@@ -165,9 +210,19 @@ fn require_changed(n: usize) -> Result<(), StoreError> {
 
 fn bookmark_exists(conn: &Connection, id: i64) -> Result<bool, StoreError> {
     Ok(conn
-        .query_row("SELECT 1 FROM bookmarks WHERE id = ?1", [id], |_| Ok(()))
+        .prepare_cached("SELECT 1 FROM bookmarks WHERE id = ?1")?
+        .query_row([id], |_| Ok(()))
         .optional()?
         .is_some())
+}
+
+/// Settings shared by both connections: the statement cache size and temporary tables
+/// (sorts, `IN` lists) in memory rather than in temporary files.
+fn tune(conn: &Connection) -> Result<(), StoreError> {
+    conn.busy_timeout(BUSY_TIMEOUT)?;
+    conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE);
+    conn.pragma_update(None, "temp_store", "MEMORY")?;
+    Ok(())
 }
 
 /// Create `dir` and its missing parents; on Unix the directories created here get mode
@@ -269,8 +324,10 @@ impl Store {
         let mut store = Self::init(conn, Some(path.clone()), lock)?;
         // Opened after the migrations, so it sees the finished schema. Read-only: it can
         // never hold a write lock, and a query that strays into writing fails instead.
+        // NO_MUTEX (like the writer, which gets it from rusqlite's default flags): a
+        // `Connection` is not `Sync`, and each one is only reached through its `Mutex`.
         let reader = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
-        reader.busy_timeout(BUSY_TIMEOUT)?;
+        tune(&reader)?;
         store.reader = Some(Mutex::new(reader));
         Ok(store)
     }
@@ -282,7 +339,7 @@ impl Store {
     }
 
     fn init(mut conn: Connection, path: Option<PathBuf>, lock: Option<File>) -> Result<Self, StoreError> {
-        conn.busy_timeout(BUSY_TIMEOUT)?;
+        tune(&conn)?;
         conn.pragma_update(None, "foreign_keys", true)?;
         // journal_mode returns the resulting mode as a row; in-memory databases report
         // "memory", which is fine.
@@ -300,7 +357,7 @@ impl Store {
     /// Lock the connection. A poisoned mutex only means another thread panicked while
     /// holding it; SQLite keeps the connection consistent (open transactions are rolled
     /// back on drop), so the guard is recovered instead of propagating the panic.
-    fn conn(&self) -> MutexGuard<'_, Connection> {
+    pub(crate) fn conn(&self) -> MutexGuard<'_, Connection> {
         self.conn.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
@@ -326,30 +383,31 @@ impl Store {
     /// importing history and by tests of queue ordering.
     pub fn insert_job_at(&self, j: &NewJob, created_at: i64) -> Result<Job, StoreError> {
         let conn = self.conn();
-        // Position 0 while the queue was never reordered (created_at order applies);
-        // after a move every pending job has a position and a new one goes last.
-        conn.execute(
-            "INSERT INTO jobs (name, state, bytes_total, bytes_done, dest_dir, source_path, created_at, error, password, position)
-             VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6, NULL, ?7,
-                     (SELECT CASE WHEN MAX(position) > 0 THEN MAX(position) + 1 ELSE 0 END FROM jobs))",
-            params![
-                j.name,
-                JobState::Queued.as_str(),
-                to_db(j.bytes_total),
-                path_to_db(&j.dest_dir),
-                path_to_db(&j.source_path),
-                created_at,
-                j.password,
-            ],
-        )?;
+        conn.prepare_cached(SQL_INSERT_JOB)?.execute(params![
+            j.name,
+            JobState::Queued.as_str(),
+            to_db(j.bytes_total),
+            path_to_db(&j.dest_dir),
+            path_to_db(&j.source_path),
+            created_at,
+            j.password,
+        ])?;
         let id = conn.last_insert_rowid();
         Self::get_job_locked(&conn, id)?.ok_or(StoreError::NotFound)
     }
 
     fn get_job_locked(conn: &Connection, id: i64) -> Result<Option<Job>, StoreError> {
-        Ok(conn
-            .query_row(&format!("SELECT {JOB_COLUMNS} FROM jobs WHERE id = ?1"), [id], job_from_row)
-            .optional()?)
+        Self::query_job(conn, SQL_JOB_BY_ID, [id])
+    }
+
+    /// The first job row of a cached query, if any.
+    fn query_job<P: rusqlite::Params>(conn: &Connection, sql: &str, params: P) -> Result<Option<Job>, StoreError> {
+        Ok(conn.prepare_cached(sql)?.query_row(params, job_from_row).optional()?)
+    }
+
+    /// One statement on the writer connection, from the statement cache.
+    fn write<P: rusqlite::Params>(&self, sql: &str, params: P) -> Result<usize, StoreError> {
+        Ok(self.conn().prepare_cached(sql)?.execute(params)?)
     }
 
     /// Fetch one job by id.
@@ -360,22 +418,36 @@ impl Store {
     /// All jobs, id ascending (queue and history).
     pub fn list_jobs(&self) -> Result<Vec<Job>, StoreError> {
         let conn = self.read();
-        let mut stmt = conn.prepare(&format!("SELECT {JOB_COLUMNS} FROM jobs ORDER BY id ASC"))?;
+        let mut stmt = conn.prepare_cached(SQL_LIST_JOBS)?;
         let rows = stmt.query_map([], job_from_row)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// The destination folder of every job (any state), id ascending. A cheap alternative
+    /// to [`Store::list_jobs`] when only the folders matter.
+    pub fn dest_dirs(&self) -> Result<Vec<PathBuf>, StoreError> {
+        let conn = self.read();
+        let mut stmt = conn.prepare_cached("SELECT dest_dir FROM jobs ORDER BY id ASC")?;
+        let rows = stmt.query_map([], |r| Ok(PathBuf::from(r.get::<_, String>(0)?)))?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     /// The most recently inserted job (highest id) whose source NZB path equals `p`, if any.
     /// Comparison is on the stored UTF-8 form of the path, without canonicalization.
     pub fn job_by_source(&self, p: &Path) -> Result<Option<Job>, StoreError> {
+        Self::query_job(&self.read(), SQL_JOB_BY_SOURCE, [path_to_db(p)])
+    }
+
+    /// `true` when `p` has a job in any state, or [`Store::mark_source_seen`] recorded it
+    /// with exactly this fingerprint (the watch folder's "already handled" check, as one
+    /// query). Comparison is on the stored UTF-8 form of the path.
+    pub fn source_known(&self, p: &Path, size: u64, mtime: i64) -> Result<bool, StoreError> {
         let conn = self.read();
-        Ok(conn
-            .query_row(
-                &format!("SELECT {JOB_COLUMNS} FROM jobs WHERE source_path = ?1 ORDER BY id DESC LIMIT 1"),
-                [path_to_db(p)],
-                job_from_row,
-            )
-            .optional()?)
+        let mut stmt = conn.prepare_cached(
+            "SELECT EXISTS (SELECT 1 FROM jobs WHERE source_path = ?1)
+                 OR EXISTS (SELECT 1 FROM seen_sources WHERE source_path = ?1 AND size = ?2 AND mtime = ?3)",
+        )?;
+        Ok(stmt.query_row(params![path_to_db(p), to_db(size), mtime], |r| r.get(0))?)
     }
 
     /// The oldest pending job (`queued`, `downloading` or `paused`) whose source NZB path
@@ -383,41 +455,25 @@ impl Store {
     /// path, not only the newest one, so it is the right check for "is this NZB already in
     /// the queue". Comparison is on the stored UTF-8 form of the path.
     pub fn pending_job_by_source(&self, p: &Path) -> Result<Option<Job>, StoreError> {
-        let conn = self.read();
-        Ok(conn
-            .query_row(
-                &format!(
-                    "SELECT {JOB_COLUMNS} FROM jobs
-                     WHERE source_path = ?1 AND state IN ('queued', 'downloading', 'paused')
-                     ORDER BY id ASC LIMIT 1"
-                ),
-                [path_to_db(p)],
-                job_from_row,
-            )
-            .optional()?)
+        Self::query_job(&self.read(), SQL_PENDING_JOB_BY_SOURCE, [path_to_db(p)])
     }
 
     /// Set a job's state and its error text (`None` clears the error).
     pub fn set_job_state(&self, id: i64, s: JobState, error: Option<&str>) -> Result<(), StoreError> {
-        let n = self.conn().execute(
-            "UPDATE jobs SET state = ?2, error = ?3 WHERE id = ?1",
-            params![id, s.as_str(), error],
-        )?;
+        let n = self.write("UPDATE jobs SET state = ?2, error = ?3 WHERE id = ?1", params![id, s.as_str(), error])?;
         require_changed(n)
     }
 
     /// Record decoded bytes written so far for a job.
     pub fn set_job_progress(&self, id: i64, bytes_done: u64) -> Result<(), StoreError> {
-        let n = self
-            .conn()
-            .execute("UPDATE jobs SET bytes_done = ?2 WHERE id = ?1", params![id, to_db(bytes_done)])?;
+        let n = self.write("UPDATE jobs SET bytes_done = ?2 WHERE id = ?1", params![id, to_db(bytes_done)])?;
         require_changed(n)
     }
 
     /// Records when a job first started downloading (later calls keep the first time) and
     /// how many articles its NZB has.
     pub fn mark_job_started(&self, id: i64, ts: i64, articles_total: u64) -> Result<(), StoreError> {
-        let n = self.conn().execute(
+        let n = self.write(
             "UPDATE jobs SET started_at = COALESCE(started_at, ?2), articles_total = ?3 WHERE id = ?1",
             params![id, ts, to_db(articles_total)],
         )?;
@@ -426,9 +482,7 @@ impl Store {
 
     /// Adds download time to a job.
     pub fn add_job_download_ms(&self, id: i64, ms: u64) -> Result<(), StoreError> {
-        let n = self
-            .conn()
-            .execute("UPDATE jobs SET download_ms = download_ms + ?2 WHERE id = ?1", params![id, to_db(ms)])?;
+        let n = self.write("UPDATE jobs SET download_ms = download_ms + ?2 WHERE id = ?1", params![id, to_db(ms)])?;
         require_changed(n)
     }
 
@@ -463,15 +517,22 @@ impl Store {
     /// Appends a line to a job's log, keeping the newest [`JOB_LOG_KEEP`] lines.
     pub fn append_job_log(&self, job_id: i64, ts: i64, level: &str, text: &str) -> Result<(), StoreError> {
         let conn = self.conn();
-        let n = conn.execute(
-            "INSERT INTO job_log (job_id, ts, level, text) SELECT ?1, ?2, ?3, ?4 WHERE EXISTS (SELECT 1 FROM jobs WHERE id = ?1)",
-            params![job_id, ts, level, text],
-        )?;
+        let n = conn
+            .prepare_cached(
+                "INSERT INTO job_log (job_id, ts, level, text) SELECT ?1, ?2, ?3, ?4 WHERE EXISTS (SELECT 1 FROM jobs WHERE id = ?1)",
+            )?
+            .execute(params![job_id, ts, level, text])?;
         require_changed(n)?;
         let id = conn.last_insert_rowid();
-        // Trim now and then rather than on every line.
+        // Trim now and then rather than on every line. Ids are shared by every job's
+        // lines, so the cut is this job's own JOB_LOG_KEEP-th newest line, not an id
+        // distance (which would drop this job's lines whenever other jobs logged too).
         if id % 50 == 0 {
-            conn.execute("DELETE FROM job_log WHERE job_id = ?1 AND id <= ?2", params![job_id, id - JOB_LOG_KEEP])?;
+            conn.prepare_cached(
+                "DELETE FROM job_log WHERE job_id = ?1 AND id < (
+                     SELECT id FROM job_log WHERE job_id = ?1 ORDER BY id DESC LIMIT 1 OFFSET ?2 - 1)",
+            )?
+            .execute(params![job_id, JOB_LOG_KEEP])?;
         }
         Ok(())
     }
@@ -479,7 +540,7 @@ impl Store {
     /// A job's log, oldest first.
     pub fn job_log(&self, job_id: i64) -> Result<Vec<JobLogLine>, StoreError> {
         let conn = self.read();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT ts, level, text FROM (SELECT id, ts, level, text FROM job_log WHERE job_id = ?1 ORDER BY id DESC LIMIT ?2) ORDER BY id ASC",
         )?;
         let rows = stmt.query_map(params![job_id, JOB_LOG_KEEP], |r| {
@@ -493,11 +554,11 @@ impl Store {
         let conn = self.conn();
         for (key, n) in [(ARTICLES_FETCHED_KEY, fetched), (ARTICLES_MISSING_KEY, missing)] {
             if n > 0 {
-                conn.execute(
+                conn.prepare_cached(
                     "INSERT INTO counters (key, value) VALUES (?1, ?2)
                      ON CONFLICT (key) DO UPDATE SET value = value + excluded.value",
-                    params![key, to_db(n)],
-                )?;
+                )?
+                .execute(params![key, to_db(n)])?;
             }
         }
         Ok(())
@@ -529,17 +590,7 @@ impl Store {
     /// the user and skipped), in queue order: `position`, then oldest `created_at`, ties
     /// broken by id.
     pub fn next_runnable_job(&self) -> Result<Option<Job>, StoreError> {
-        let conn = self.read();
-        Ok(conn
-            .query_row(
-                &format!(
-                    "SELECT {JOB_COLUMNS} FROM jobs WHERE state = 'queued'
-                     ORDER BY {QUEUE_ORDER} LIMIT 1"
-                ),
-                [],
-                job_from_row,
-            )
-            .optional()?)
+        Self::query_job(&self.read(), SQL_NEXT_RUNNABLE, [])
     }
 
     /// Like [`Store::next_runnable_job`], restricted to the jobs whose id is in `ids`
@@ -567,9 +618,7 @@ impl Store {
     /// Ids of the pending jobs (`queued`, `downloading`, `paused`) in queue order.
     pub fn queue_order(&self) -> Result<Vec<i64>, StoreError> {
         let conn = self.read();
-        let mut stmt = conn.prepare(&format!(
-            "SELECT id FROM jobs WHERE state IN ('queued', 'downloading', 'paused') ORDER BY {QUEUE_ORDER}"
-        ))?;
+        let mut stmt = conn.prepare_cached(SQL_QUEUE_ORDER)?;
         let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
@@ -579,8 +628,11 @@ impl Store {
     pub fn set_queue_order(&self, ids: &[i64]) -> Result<(), StoreError> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
-        for (i, id) in ids.iter().enumerate() {
-            tx.execute("UPDATE jobs SET position = ?2 WHERE id = ?1", params![id, i as i64 + 1])?;
+        {
+            let mut stmt = tx.prepare_cached("UPDATE jobs SET position = ?2 WHERE id = ?1")?;
+            for (i, id) in ids.iter().enumerate() {
+                stmt.execute(params![id, i as i64 + 1])?;
+            }
         }
         tx.commit()?;
         Ok(())
@@ -602,7 +654,7 @@ impl Store {
     pub fn upsert_job_file(&self, f: &JobFile) -> Result<(), StoreError> {
         // One statement: the row is written only while its job exists, and a missing job
         // shows as nothing changed.
-        let n = self.conn().execute(
+        let n = self.write(
             "INSERT INTO job_files (job_id, name, bytes_total, bytes_done, state)
              SELECT ?1, ?2, ?3, ?4, ?5 WHERE EXISTS (SELECT 1 FROM jobs WHERE id = ?1)
              ON CONFLICT (job_id, name) DO UPDATE SET
@@ -614,7 +666,6 @@ impl Store {
         require_changed(n)
     }
 
-    /// All file rows of a job, by name. Empty for unknown jobs.
     /// Renames a job's file row (post-processing moved the file); a row already under
     /// `to` is replaced. Returns whether a row was renamed.
     pub fn rename_job_file(&self, job_id: i64, from: &str, to: &str) -> Result<bool, StoreError> {
@@ -634,9 +685,10 @@ impl Store {
         Ok(true)
     }
 
+    /// All file rows of a job, by name. Empty for unknown jobs.
     pub fn job_files(&self, job_id: i64) -> Result<Vec<JobFile>, StoreError> {
         let conn = self.read();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT job_id, name, bytes_total, bytes_done, state FROM job_files WHERE job_id = ?1 ORDER BY name",
         )?;
         let rows = stmt.query_map([job_id], job_file_from_row)?;
@@ -646,24 +698,23 @@ impl Store {
     /// Saves a job's article map (encoded text, see the service), replacing an earlier
     /// one. [`StoreError::NotFound`] for unknown jobs.
     pub fn save_article_map(&self, job_id: i64, map: &str) -> Result<(), StoreError> {
-        let conn = self.conn();
-        if Self::get_job_locked(&conn, job_id)?.is_none() {
-            return Err(StoreError::NotFound);
-        }
-        conn.execute(
-            "INSERT INTO article_maps (job_id, map) VALUES (?1, ?2)
+        // One statement: written only while the job exists (as for upsert_job_file).
+        let n = self.write(
+            "INSERT INTO article_maps (job_id, map) SELECT ?1, ?2 WHERE EXISTS (SELECT 1 FROM jobs WHERE id = ?1)
              ON CONFLICT (job_id) DO UPDATE SET map = excluded.map",
             params![job_id, map],
         )?;
-        Ok(())
+        require_changed(n)
     }
 
     /// The saved article map of a job, if one was saved.
     pub fn article_map(&self, job_id: i64) -> Result<Option<String>, StoreError> {
         let conn = self.read();
-        Ok(conn
-            .query_row("SELECT map FROM article_maps WHERE job_id = ?1", [job_id], |r| r.get(0))
-            .optional()?)
+        let map = conn
+            .prepare_cached("SELECT map FROM article_maps WHERE job_id = ?1")?
+            .query_row([job_id], |r| r.get(0))
+            .optional()?;
+        Ok(map)
     }
 
     // -----------------------------------------------------------------------------------
@@ -675,8 +726,7 @@ impl Store {
     pub fn list_bookmarks(&self) -> Result<Vec<Bookmark>, StoreError> {
         let all: Vec<Bookmark> = {
             let conn = self.read();
-            let mut stmt =
-                conn.prepare(&format!("SELECT {BOOKMARK_COLUMNS} FROM bookmarks ORDER BY ord ASC, id ASC"))?;
+            let mut stmt = conn.prepare_cached(SQL_LIST_BOOKMARKS)?;
             let rows = stmt.query_map([], bookmark_from_row)?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
@@ -735,11 +785,7 @@ impl Store {
             params![b.parent_id, b.name, b.newsgroup, b.color, order],
         )?;
         let id = tx.last_insert_rowid();
-        let created = tx.query_row(
-            &format!("SELECT {BOOKMARK_COLUMNS} FROM bookmarks WHERE id = ?1"),
-            [id],
-            bookmark_from_row,
-        )?;
+        let created = tx.query_row(SQL_BOOKMARK_BY_ID, [id], bookmark_from_row)?;
         tx.commit()?;
         Ok(created)
     }
@@ -806,15 +852,15 @@ impl Store {
     }
 
     fn add_sample_in(conn: &Connection, s: &ThroughputSample) -> Result<(), StoreError> {
-        conn.execute(
+        conn.prepare_cached(
             "INSERT INTO throughput (ts, bytes_up, bytes_down) VALUES (?1, ?2, ?3)
              ON CONFLICT (ts) DO UPDATE SET
                  bytes_up = CASE WHEN bytes_up > 9223372036854775807 - excluded.bytes_up
                                  THEN 9223372036854775807 ELSE bytes_up + excluded.bytes_up END,
                  bytes_down = CASE WHEN bytes_down > 9223372036854775807 - excluded.bytes_down
                                    THEN 9223372036854775807 ELSE bytes_down + excluded.bytes_down END",
-            params![s.ts, to_db(s.bytes_up), to_db(s.bytes_down)],
-        )?;
+        )?
+        .execute(params![s.ts, to_db(s.bytes_up), to_db(s.bytes_down)])?;
         Ok(())
     }
 
@@ -835,7 +881,7 @@ impl Store {
     pub fn samples_since(&self, ts: i64) -> Result<Vec<ThroughputSample>, StoreError> {
         let conn = self.read();
         let mut stmt =
-            conn.prepare("SELECT ts, bytes_up, bytes_down FROM throughput WHERE ts >= ?1 ORDER BY ts ASC")?;
+            conn.prepare_cached("SELECT ts, bytes_up, bytes_down FROM throughput WHERE ts >= ?1 ORDER BY ts ASC")?;
         let rows = stmt.query_map([ts], |r| {
             Ok(ThroughputSample { ts: r.get(0)?, bytes_up: from_db(r.get(1)?), bytes_down: from_db(r.get(2)?) })
         })?;
@@ -853,13 +899,13 @@ impl Store {
     }
 
     fn add_downloaded_bytes_in(conn: &Connection, n: u64) -> Result<(), StoreError> {
-        conn.execute(
+        conn.prepare_cached(
             "INSERT INTO counters (key, value) VALUES (?1, ?2)
              ON CONFLICT (key) DO UPDATE SET
                  value = CASE WHEN value > 9223372036854775807 - excluded.value
                               THEN 9223372036854775807 ELSE value + excluded.value END",
-            params![DOWNLOADED_BYTES_KEY, to_db(n)],
-        )?;
+        )?
+        .execute(params![DOWNLOADED_BYTES_KEY, to_db(n)])?;
         Ok(())
     }
 
@@ -875,7 +921,8 @@ impl Store {
     pub fn load_settings(&self) -> Result<Settings, StoreError> {
         let raw: Option<String> = self
             .read()
-            .query_row("SELECT value FROM settings WHERE key = ?1", [SETTINGS_KEY], |r| r.get(0))
+            .prepare_cached("SELECT value FROM settings WHERE key = ?1")?
+            .query_row([SETTINGS_KEY], |r| r.get(0))
             .optional()?;
         match raw {
             None => Ok(Settings::default().normalized()),
@@ -951,7 +998,7 @@ impl Store {
     /// the same path. These rows are kept when jobs are removed, so the watch folder does
     /// not import the same file again.
     pub fn mark_source_seen(&self, p: &Path, size: u64, mtime: i64) -> Result<(), StoreError> {
-        self.conn().execute(
+        self.write(
             "INSERT INTO seen_sources (source_path, size, mtime, seen_at) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT (source_path) DO UPDATE SET
                  size = excluded.size, mtime = excluded.mtime, seen_at = excluded.seen_at",
@@ -964,11 +1011,8 @@ impl Store {
     pub fn source_seen(&self, p: &Path, size: u64, mtime: i64) -> Result<bool, StoreError> {
         Ok(self
             .read()
-            .query_row(
-                "SELECT 1 FROM seen_sources WHERE source_path = ?1 AND size = ?2 AND mtime = ?3",
-                params![path_to_db(p), to_db(size), mtime],
-                |_| Ok(()),
-            )
+            .prepare_cached("SELECT 1 FROM seen_sources WHERE source_path = ?1 AND size = ?2 AND mtime = ?3")?
+            .query_row(params![path_to_db(p), to_db(size), mtime], |_| Ok(()))
             .optional()?
             .is_some())
     }
@@ -977,32 +1021,29 @@ impl Store {
     // Totals
     // -----------------------------------------------------------------------------------
 
-    /// Lifetime downloaded bytes plus job counts by state.
+    /// Lifetime downloaded bytes plus job counts by state (one query).
     pub fn totals(&self) -> Result<Totals, StoreError> {
         let conn = self.read();
-        let (done, pending, failed): (i64, i64, i64) = conn.query_row(
+        let mut stmt = conn.prepare_cached(
             "SELECT COALESCE(SUM(state = 'done'), 0),
                     COALESCE(SUM(state IN ('queued', 'downloading', 'paused')), 0),
-                    COALESCE(SUM(state = 'failed'), 0)
+                    COALESCE(SUM(state = 'failed'), 0),
+                    (SELECT value FROM counters WHERE key = ?1),
+                    (SELECT value FROM counters WHERE key = ?2),
+                    (SELECT value FROM counters WHERE key = ?3)
              FROM jobs",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
-        let counter = |key: &str| -> Result<u64, StoreError> {
-            Ok(conn
-                .query_row("SELECT value FROM counters WHERE key = ?1", [key], |r| r.get::<_, i64>(0))
-                .optional()?
-                .map(from_db)
-                .unwrap_or(0))
-        };
-        Ok(Totals {
-            downloaded_bytes: counter(DOWNLOADED_BYTES_KEY)?,
-            articles_fetched: counter(ARTICLES_FETCHED_KEY)?,
-            articles_missing: counter(ARTICLES_MISSING_KEY)?,
-            jobs_done: from_db(done),
-            jobs_pending: from_db(pending),
-            jobs_failed: from_db(failed),
-        })
+        let counter = |v: Option<i64>| v.map_or(0, from_db);
+        Ok(stmt.query_row(params![DOWNLOADED_BYTES_KEY, ARTICLES_FETCHED_KEY, ARTICLES_MISSING_KEY], |r| {
+            Ok(Totals {
+                downloaded_bytes: counter(r.get(3)?),
+                articles_fetched: counter(r.get(4)?),
+                articles_missing: counter(r.get(5)?),
+                jobs_done: from_db(r.get(0)?),
+                jobs_pending: from_db(r.get(1)?),
+                jobs_failed: from_db(r.get(2)?),
+            })
+        })?)
     }
 }
 
