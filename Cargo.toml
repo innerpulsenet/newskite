@@ -32,7 +32,7 @@ directories = "6"
 
 [profile.release]
 lto = "thin"
-codegen-units = 4
+codegen-units = 1
 strip = true
 
 [profile.dev.package."*"]
