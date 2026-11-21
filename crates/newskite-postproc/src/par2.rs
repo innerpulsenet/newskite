@@ -1,6 +1,6 @@
 //! PAR2 verify/repair, natively through [`newskite_par2`].
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::detect::{is_par2, par2_key, par2_set_id};
@@ -191,7 +191,7 @@ pub(crate) fn run(
 ) -> Par2Outcome {
     use newskite_par2::{Event, FileStatus, Stage};
     let (partial_par2, partial_data): (Vec<PathBuf>, Vec<PathBuf>) = partials.iter().cloned().partition(|p| crate::is_par2_partial(p));
-    let mut par2_paths: Vec<PathBuf> = files.iter().filter(|f| newskite_par2::has_magic(f)).cloned().collect();
+    let (mut par2_paths, mut others): (Vec<PathBuf>, Vec<PathBuf>) = files.iter().cloned().partition(|f| newskite_par2::has_magic(f));
     par2_paths.extend(partial_par2);
     if par2_paths.is_empty() {
         return Par2Outcome { verdict: Some(Verdict::Skipped(crate::NO_PAR2.into())), ..Default::default() };
@@ -206,8 +206,9 @@ pub(crate) fn run(
         log("par2: no usable recovery set (main packet missing or corrupt); skipping verification".into());
         return Par2Outcome { verdict: Some(Verdict::Skipped("PAR2 files unreadable".into())), ..Default::default() };
     }
-    let mut others: Vec<PathBuf> = files.iter().filter(|f| !newskite_par2::has_magic(f)).cloned().collect();
     others.extend(partial_data);
+    let partial_set: HashSet<&Path> = partials.iter().map(PathBuf::as_path).collect();
+    let mut partials_used: HashSet<&Path> = HashSet::new();
 
     let mut out = Par2Outcome::default();
     let mut stats = Par2Stats { sets: sets.len(), ..Default::default() };
@@ -281,8 +282,10 @@ pub(crate) fn run(
             }
         }
         for s in ver.sources.iter().flatten() {
-            if partials.contains(&s.path) && !out.partials_used.contains(&s.path) {
-                out.partials_used.push(s.path.clone());
+            if let Some(&p) = partial_set.get(s.path.as_path()) {
+                if partials_used.insert(p) {
+                    out.partials_used.push(p.to_path_buf());
+                }
             }
         }
         let multi = sets.len() > 1;
