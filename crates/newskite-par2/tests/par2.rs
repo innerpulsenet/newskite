@@ -238,6 +238,37 @@ fn stray_slices_in_other_files_are_found() {
     assert_restored(&f);
 }
 
+/// A damaged renamed copy of one file also holds a slice another (missing) file needs:
+/// the copy is read once, for both searches.
+#[test]
+fn damaged_renamed_copy_supplies_slices_of_other_files() {
+    let f = fixture(&[("a.bin", 40_000), ("b.bin", 20_000)]);
+    let mut a = std::fs::read(f.dir.join("a.bin")).unwrap();
+    let mut b = std::fs::read(f.dir.join("b.bin")).unwrap();
+    b[8192..12288].copy_from_slice(&a[12288..16384]);
+    std::fs::write(f.dir.join("b.bin"), &b).unwrap();
+    let f = Fixture { originals: vec![("a.bin".into(), a.clone()), ("b.bin".into(), b)], ..f };
+    create(&f.dir, &["a.bin", "b.bin"], 4096, 8, &f.dir.join("set")).unwrap();
+    // Past the first 16 KiB, so the copy is still recognized as a's.
+    a[30_000] ^= 1;
+    std::fs::write(f.dir.join("x9f2"), &a).unwrap();
+    std::fs::remove_file(f.dir.join("a.bin")).unwrap();
+    std::fs::remove_file(f.dir.join("b.bin")).unwrap();
+    let (sets, _) = load(&par2_files(&f.dir));
+    let mut notes = Vec::new();
+    let ver = verify(&sets[0], &f.dir, &others(&f.dir), &mut |e| {
+        if let Event::Note(n) = e {
+            notes.push(n)
+        }
+    });
+    let status = |n: &str| ver.files.iter().find(|r| r.name == n).unwrap().status.clone();
+    assert_eq!(status("a.bin"), FileStatus::Missing { found: 9, total: 10 });
+    assert_eq!(status("b.bin"), FileStatus::Missing { found: 1, total: 5 });
+    assert_eq!(notes, ["found 1 good slice(s) in x9f2"]);
+    repair(&sets[0], &ver, &RepairOptions::default(), &mut |_| {}).unwrap();
+    assert_restored(&f);
+}
+
 /// Slices big enough that each pass is split over several threads, odd file lengths
 /// (short last slices), and a memory limit that makes passes shorter than a slice.
 #[test]
