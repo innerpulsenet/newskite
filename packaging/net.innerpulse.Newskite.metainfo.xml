@@ -57,6 +57,11 @@
   </requires>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.6.0" date="2026-11-24">
+      <description>
+        <p>A tidier interface: the queue's Start button matches Add NZB in every theme, a downloading job's progress, speed and time left read as one line, empty counts are hidden, the status bar names its connections plainly, the speed limit shows its unit, and the themes are named Carbon, Warm ink and Paper. The package links point at the new website, newskite.innerpulse.net.</p>
+      </description>
+    </release>
     <release version="1.5.0" date="2026-11-21">
       <description>
         <p>Faster and quieter: downloads reserve half the memory per article, keep every connection fetching while finished files are flushed to disk, and request the first article of every file ahead; verification reads damaged files once; and an idle window no longer redraws. Long queues and histories stay smooth. Canceling a download no longer makes later articles look missing. A first-run guide leads to the server settings, Settings asks before discarding changes, and the keyboard reaches more (Ctrl+1/2/3, Ctrl+S, Enter to confirm).</p>
