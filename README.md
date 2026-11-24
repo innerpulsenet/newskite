@@ -274,7 +274,7 @@ and manual runs (Actions → Packages → Run workflow) attach the packages to t
 artifacts; pushing a tag that matches the workspace version publishes a GitHub Release:
 
 ```sh
-git tag v1.6.0 && git push origin v1.6.0
+git tag v1.6.1 && git push origin v1.6.1
 ```
 
 ### Windows

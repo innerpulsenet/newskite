@@ -2558,7 +2558,7 @@ dependencies = [
 
 [[package]]
 name = "newskite"
-version = "1.6.0"
+version = "1.6.1"
 dependencies = [
  "chrono",
  "clap",
@@ -2590,7 +2590,7 @@ dependencies = [
 
 [[package]]
 name = "newskite-cli"
-version = "1.6.0"
+version = "1.6.1"
 dependencies = [
  "clap",
  "newskite-nntp",
@@ -2606,7 +2606,7 @@ dependencies = [
 
 [[package]]
 name = "newskite-engine"
-version = "1.6.0"
+version = "1.6.1"
 dependencies = [
  "md-5",
  "newskite-nntp",
@@ -2624,7 +2624,7 @@ dependencies = [
 
 [[package]]
 name = "newskite-nntp"
-version = "1.6.0"
+version = "1.6.1"
 dependencies = [
  "memchr",
  "newskite-nntp",
@@ -2640,7 +2640,7 @@ dependencies = [
 
 [[package]]
 name = "newskite-nzb"
-version = "1.6.0"
+version = "1.6.1"
 dependencies = [
  "crc32fast",
  "memchr",
@@ -2651,7 +2651,7 @@ dependencies = [
 
 [[package]]
 name = "newskite-par2"
-version = "1.6.0"
+version = "1.6.1"
 dependencies = [
  "crc32fast",
  "md-5",
@@ -2661,7 +2661,7 @@ dependencies = [
 
 [[package]]
 name = "newskite-postproc"
-version = "1.6.0"
+version = "1.6.1"
 dependencies = [
  "newskite-par2",
  "newskite-types",
@@ -2674,7 +2674,7 @@ dependencies = [
 
 [[package]]
 name = "newskite-service"
-version = "1.6.0"
+version = "1.6.1"
 dependencies = [
  "directories",
  "newskite-engine",
@@ -2696,7 +2696,7 @@ dependencies = [
 
 [[package]]
 name = "newskite-store"
-version = "1.6.0"
+version = "1.6.1"
 dependencies = [
  "newskite-types",
  "rusqlite",
@@ -2707,7 +2707,7 @@ dependencies = [
 
 [[package]]
 name = "newskite-theme"
-version = "1.6.0"
+version = "1.6.1"
 dependencies = [
  "directories",
  "thiserror 2.0.21",
@@ -2717,7 +2717,7 @@ dependencies = [
 
 [[package]]
 name = "newskite-types"
-version = "1.6.0"
+version = "1.6.1"
 dependencies = [
  "directories",
  "serde",

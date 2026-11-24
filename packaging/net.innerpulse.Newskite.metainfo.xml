@@ -57,6 +57,11 @@
   </requires>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.6.1" date="2026-11-24">
+      <description>
+        <p>When a download stops early because it cannot be repaired, the message counts the missing articles correctly; it no longer says 0 missing articles, and damage from corrupt articles alone is named as such.</p>
+      </description>
+    </release>
     <release version="1.6.0" date="2026-11-24">
       <description>
         <p>A tidier interface: the queue's Start button matches Add NZB in every theme, a downloading job's progress, speed and time left read as one line, empty counts are hidden, the status bar names its connections plainly, the speed limit shows its unit, and the themes are named Carbon, Warm ink and Paper. The package links point at the new website, newskite.innerpulse.net.</p>
