@@ -824,12 +824,16 @@ fn performance_section(ui: &mut Ui, pal: &Palette, s: &mut Settings) {
                 ui.label("Max connections");
                 ui.add(DragValue::new(&mut s.max_connections).range(1..=200));
                 ui.end_row();
-                ui.label("Speed limit (KiB/s, 0 = unlimited)");
-                ui.add(
-                    DragValue::new(&mut s.speed_limit_kbps)
-                        .range(0..=10_000_000)
-                        .speed(16),
-                );
+                ui.label("Speed limit");
+                ui.horizontal(|ui| {
+                    ui.add(
+                        DragValue::new(&mut s.speed_limit_kbps)
+                            .range(0..=10_000_000)
+                            .speed(16)
+                            .suffix(" KiB/s"),
+                    );
+                    ui.label(RichText::new("0 = unlimited").small().color(pal.muted));
+                });
                 ui.end_row();
                 ui.label("Retries per article");
                 ui.add(DragValue::new(&mut s.retries).range(0..=10));
@@ -913,9 +917,8 @@ fn appearance_section(ui: &mut Ui, pal: &Palette, appearance: &mut Appearance, r
         ui.add_space(4.0);
         ui.label(
             RichText::new(
-                "The innerpulse themes are the studio's grounds with the violet accent: carbon \
-                 (brushed steel on cool blacks), the warm ink and paper. Follow desktop uses your \
-                 desktop color scheme and follows its changes.",
+                "Carbon, warm ink and paper are the innerpulse looks, each with the violet accent. \
+                 Follow desktop takes your desktop's light or dark color scheme and changes with it.",
             )
             .small()
             .color(pal.muted),

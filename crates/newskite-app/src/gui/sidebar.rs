@@ -294,7 +294,7 @@ fn entry(ui: &mut Ui, pal: &Palette, e: &Entry, rail: bool) -> bool {
             paint_icon(painter, Rect::from_center_size(Pos2::new(slot.left() + 20.0, slot.center().y), Vec2::splat(16.0)), e.icon, fg);
             let font = if e.current { fonts::semibold_id(13.5) } else { FontId::proportional(13.5) };
             painter.text(Pos2::new(slot.left() + 38.0, slot.center().y), Align2::LEFT_CENTER, e.label, font, fg);
-            if let Some(n) = &e.count {
+            if let Some(n) = e.count.as_ref().filter(|n| n.as_str() != "0") {
                 let c = if e.count_warn { pal.warning } else if e.current { pal.text } else { pal.muted };
                 painter.text(Pos2::new(slot.right() - 12.0, slot.center().y), Align2::RIGHT_CENTER, n, fonts::mono_id(12.0), c);
             }

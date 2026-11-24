@@ -128,7 +128,7 @@ impl Pill {
     }
 }
 
-/// The left reading, e.g. `"2 servers · 20 TLS"`: the usable servers and the connections
+/// The left reading, e.g. `"2 servers · 20 conn, TLS"`: the usable servers and the connections
 /// a run opens, and how they connect. `None` without a usable server.
 pub fn servers_reading(data: &Data) -> Option<String> {
     let usable = data.settings.usable_servers();
@@ -138,9 +138,9 @@ pub fn servers_reading(data: &Data) -> Option<String> {
     let tls = usable.iter().filter(|s| s.tls).count();
     let conn = data.settings.effective_connections();
     let connections = if tls == usable.len() {
-        format!("{conn} TLS")
+        format!("{conn} conn, TLS")
     } else if tls == 0 {
-        format!("{conn} plain")
+        format!("{conn} conn, plain")
     } else {
         format!("{conn} conn, TLS + plain")
     };

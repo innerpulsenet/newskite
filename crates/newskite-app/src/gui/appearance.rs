@@ -47,9 +47,9 @@ impl Appearance {
     pub fn label(self) -> &'static str {
         match self {
             Appearance::FollowDesktop => "Follow desktop",
-            Appearance::Ink => "innerpulse carbon",
-            Appearance::Warm => "innerpulse warm",
-            Appearance::Paper => "innerpulse paper",
+            Appearance::Ink => "Carbon",
+            Appearance::Warm => "Warm ink",
+            Appearance::Paper => "Paper",
         }
     }
 

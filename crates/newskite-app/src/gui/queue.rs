@@ -558,7 +558,7 @@ pub fn live_subline(job: &Job, done: u64, speed_bps: u64) -> Option<String> {
         return Some(speed);
     }
     let eta = eta_secs(job.bytes_total.saturating_sub(done), speed_bps)?;
-    Some(format!("{speed} · {} left", format::duration_secs(eta)))
+    Some(format!("{speed}  ·  {} left", format::duration_secs(eta)))
 }
 
 /// The inline editors that take over a row's controls cell (password, remove
@@ -983,7 +983,7 @@ mod tests {
         assert_eq!(live_subline(&j, 500, 0), None);
         assert_eq!(
             live_subline(&j, 500, 100).as_deref(),
-            Some("100 B/s · 0:05 left")
+            Some("100 B/s  ·  0:05 left")
         );
         j.bytes_total = 0;
         assert_eq!(live_subline(&j, 0, 100).as_deref(), Some("100 B/s"));
