@@ -374,7 +374,10 @@ fn tabs(ui: &mut Ui, pal: &Palette, data: &Data, job: &Job, state: &mut Inspecto
         let warn = data.selected_log.iter().filter(|l| l.level != "info").count();
         let items = [
             (InspectorTab::Overview, "Overview".to_string(), (failed > 0).then_some(pal.negative)),
-            (InspectorTab::Log, format!("Log {}", data.selected_log.len()), (warn > 0).then_some(pal.warning)),
+            (InspectorTab::Log, match data.selected_log.len() {
+                0 => "Log".to_string(),
+                n => format!("Log {n}"),
+            }, (warn > 0).then_some(pal.warning)),
         ];
         for (tab, label, dot) in items {
             let on = state.tab == tab;

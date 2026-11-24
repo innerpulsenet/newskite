@@ -83,8 +83,9 @@ pub fn copy_button(ui: &mut Ui, pal: &Palette, salt: &str, label: &str, enabled:
     resp
 }
 
-/// Height of a toolbar button.
-pub const TOOL_H: f32 = 34.0;
+/// Height of a toolbar button on the flat themes: the kit button's, so the queue control
+/// and Add NZB stand the same height side by side.
+pub const TOOL_H: f32 = 30.0;
 /// Height of a toolbar key on the material themes.
 const TOOL_KEY_H: f32 = 30.0;
 /// Letter spacing of a key's uppercase mono label.
@@ -164,11 +165,14 @@ pub fn tool_button(
     if let Some(m) = pal.metal {
         return tool_key(ui, pal, &m, icon, label, show_label, state);
     }
-    let accent = state == ToolState::Accent;
-    let label_font = if accent { fonts::semibold_id(13.0) } else { FontId::proportional(13.0) };
-    let galley = show_label.then(|| ui.painter().layout_no_wrap(label.to_owned(), label_font, pal.text));
+    // Set like the kit button beside it: uppercase semibold 12 px, 0.06em tracking, a
+    // 16 px icon and the kit's corner (the accessible label keeps the sentence case).
+    // The label keeps the text color beside the accent outline and icon; an unavailable
+    // control's dims with its icon.
+    let label_color = if state == ToolState::Unavailable { pal.faint } else { pal.text };
+    let galley = show_label.then(|| ui.painter().layout_job(spaced(&label.to_uppercase(), fonts::semibold_id(12.0), label_color, 0.72)));
     let size = match &galley {
-        Some(g) => Vec2::new(12.0 + 18.0 + 8.0 + g.size().x + 14.0, TOOL_H),
+        Some(g) => Vec2::new(14.0 + 16.0 + 7.0 + g.size().x + 14.0, TOOL_H),
         None => Vec2::splat(TOOL_H),
     };
     // An unavailable button is not a click target: no hand cursor, no keyboard stop.
@@ -179,7 +183,7 @@ pub fn tool_button(
         let hover = ui.ctx().animate_bool(resp.id.with("hover"), live && resp.hovered());
         let pressed = live && resp.is_pointer_button_down_on();
         let painter = ui.painter();
-        let radius = CornerRadius::same(8);
+        let radius = CornerRadius::same(pal.radius(6));
         match state {
             ToolState::Accent => {
                 // The accent wash only under the pointer: at rest the slot is outlined, not
@@ -199,7 +203,7 @@ pub fn tool_button(
             _ => {}
         }
         if resp.has_focus() {
-            focus_ring(ui, pal, rect, 8);
+            focus_ring(ui, pal, rect, pal.radius(6));
         }
         let fg = match state {
             ToolState::Unavailable => pal.faint,
@@ -208,20 +212,15 @@ pub fn tool_button(
             ToolState::Normal => pal.muted.lerp_to_gamma(pal.text, hover),
         };
         let icon_center = match &galley {
-            Some(_) => Pos2::new(rect.left() + 12.0 + 9.0, rect.center().y),
+            Some(_) => Pos2::new(rect.left() + 14.0 + 8.0, rect.center().y),
             None => rect.center(),
         };
-        paint_icon(painter, Rect::from_center_size(icon_center, Vec2::splat(18.0)), icon, fg);
+        paint_icon(painter, Rect::from_center_size(icon_center, Vec2::splat(16.0)), icon, fg);
         if let Some(g) = galley {
-            let text_color = match state {
-                ToolState::Unavailable => pal.faint,
-                ToolState::Accent => pal.accent_fg,
-                _ => pal.text,
-            };
             painter.galley(
-                Pos2::new(rect.left() + 12.0 + 18.0 + 8.0, rect.center().y - g.size().y / 2.0),
+                Pos2::new(rect.left() + 14.0 + 16.0 + 7.0, rect.center().y - g.size().y / 2.0),
                 g,
-                text_color,
+                label_color,
             );
         }
         if state == ToolState::Active {

@@ -649,9 +649,9 @@ fn first_line(
                 } else {
                     format::bytes(done)
                 };
+                // One figure, so the speed follows the bytes behind the same separator.
                 brief.push((format!("{}%  ·  {}", format::percent(done, job.bytes_total), format::speed(data.speed())), Some(format!("{progress}  ·  {live}"))));
-                figures.push((progress, None));
-                figures.push((live, None));
+                figures.push((format!("{progress}  ·  {live}"), None));
             } else if done > 0 {
                 brief.push((
                     format!("{}%", format::percent(done, job.bytes_total)),
@@ -725,7 +725,7 @@ fn first_line(
         ui.add_space(12.0);
         let r = state_chip(ui, pal, data, job, view.reduced_motion);
         if job.state == JobState::Paused {
-            r.on_hover_text("Held: queue runs skip it until you start it");
+            r.on_hover_text("Held: the queue skips it until you start it");
         } else if job.state == JobState::Queued && !data.in_run(job) {
             r.on_hover_text("Waiting for Start");
         }
@@ -778,7 +778,7 @@ fn subline(ui: &mut Ui, pal: &Palette, data: &Data, job: &Job, kind: RowKind, qu
     } else {
         match (&job.error, job.state, kind) {
             (Some(e), JobState::Failed, _) => (e.clone(), pal.negative),
-            (_, JobState::Paused, _) => ("Held: queue runs skip it until you start it".to_owned(), quiet),
+            (_, JobState::Paused, _) => ("Held: the queue skips it until you start it".to_owned(), quiet),
             (_, JobState::Done, RowKind::Finished) => {
                 let mut s = if job.stats.download_ms >= 1000 { finished_subline(job) } else { home_relative(&job.dest_dir) };
                 if let Some((q, _)) = result_qualifier(pal, job) {

@@ -1032,9 +1032,9 @@ fn downloading_row_shows_eta_and_finish_flash() {
     }
     h.run_steps(1);
     // 100 MB left at 1 MB/s → 100 s.
-    h.get_by_label("1.0 MB/s · 1:40 left");
-    // The bytes stay in the row while they move.
-    h.get_by_label("50%  ·  100 MB / 200 MB");
+    // The bytes stay in the row while they move, then the speed and time left behind
+    // the same separator.
+    h.get_by_label("50%  ·  100 MB / 200 MB  ·  1.0 MB/s  ·  1:40 left");
     h.get_by_label("Articles of Live.Download.Now: 50% downloaded");
     assert_no_bad_numbers(&h);
     snapshot(&mut h, "downloading-dark");
@@ -1273,18 +1273,18 @@ fn appearance_switches_on_save_and_persists() {
 
     h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Comma);
     h.run_steps(2);
-    h.get_by_label("innerpulse carbon");
-    h.get_by_label("innerpulse warm");
+    h.get_by_label("Carbon");
+    h.get_by_label("Warm ink");
     h.get_by_label("Follow desktop");
     // Choosing in the sheet changes nothing until Save.
     // The Appearance section is at the end of the sheet: scroll it into view.
     for _ in 0..8 {
-        h.get_by_label("innerpulse paper").scroll_down();
+        h.get_by_label("Paper").scroll_down();
         h.run_steps(1);
     }
     // Let the scroll settle, so the click lands where the card now is.
     h.run_steps(6);
-    h.get_by_label("innerpulse paper").click();
+    h.get_by_label("Paper").click();
     h.run_steps(2);
     assert_eq!(app(&h).appearance, Appearance::Ink);
     assert_eq!(
