@@ -199,6 +199,9 @@ struct Shared {
     bad_articles: AtomicUsize,
     /// The repair outlook (see [`crate::repair`]).
     repair: Mutex<Tracker>,
+    /// Missing articles so far, every file included. Only grows: [`finalize`] drains a
+    /// file's `missing` list, so the lists alone undercount once a damaged file is done.
+    missing_articles: AtomicUsize,
     stop_unrepairable: bool,
     /// Complete files in `dest_dir` when the run started (see [`resume_candidates`]).
     on_disk: Vec<OnDisk>,
@@ -268,6 +271,17 @@ impl Shared {
         }
     }
 
+    /// Article `si` of file `fi` could not be fetched from any server. Counted before the
+    /// repair tracker sees the damage, so a stop it triggers counts this article too.
+    fn note_missing(&self, fi: usize, si: usize) {
+        let file = &self.files[fi];
+        let seg = &file.segments[si];
+        lock(&file.missing).push((seg.number, seg.message_id.clone()));
+        self.missing_articles.fetch_add(1, Ordering::SeqCst);
+        self.emit(EngineEvent::SegmentMissing { file: fi, index: si });
+        self.note_damaged(fi, si);
+    }
+
     /// Article `si` of file `fi` is missing or failed its CRC.
     fn note_damaged(&self, fi: usize, si: usize) {
         if lock(&self.repair).note_damaged(fi, si) {
@@ -292,7 +306,7 @@ impl Shared {
         }
         self.emit(EngineEvent::Repair(o));
         if o.hopeless() && self.stop_unrepairable && !self.abort.is_cancelled() {
-            let missing = self.files.iter().map(|f| lock(&f.missing).len()).sum();
+            let missing = self.missing_articles.load(Ordering::SeqCst);
             self.warn(format!(
                 "Stopping: the damage needs at least {} recovery block(s), but at most {} can still arrive ({} posted); the download cannot be repaired",
                 o.needed, o.available, o.posted
@@ -523,6 +537,7 @@ pub(crate) async fn run(
         failovers: AtomicUsize::new(0),
         bad_articles: AtomicUsize::new(0),
         repair: Mutex::new(tracker),
+        missing_articles: AtomicUsize::new(0),
         stop_unrepairable: options.stop_unrepairable,
         on_disk,
         finalizing: Mutex::new(JoinSet::new()),
@@ -1114,14 +1129,10 @@ fn skip_server(shared: &Shared, tried: &mut [bool], server: usize, message_id: &
 }
 
 async fn record_missing(shared: &Arc<Shared>, fi: usize, si: usize, reason: Option<String>) -> Flow {
-    let file = &shared.files[fi];
-    let seg = &file.segments[si];
     if let Some(r) = reason {
         tracing::debug!(target: "newskite_engine", reason = %r, "segment failed");
     }
-    lock(&file.missing).push((seg.number, seg.message_id.clone()));
-    shared.emit(EngineEvent::SegmentMissing { file: fi, index: si });
-    shared.note_damaged(fi, si);
+    shared.note_missing(fi, si);
     finish_segment(shared, fi, si, None).await
 }
 
@@ -1518,33 +1529,71 @@ fn sync_dir(dir: &Path) {
 mod tests {
     use super::*;
 
-    #[test]
-    fn missing_preview_format() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let shared = Shared {
+    /// A job's shared state with no work queued.
+    fn bare(servers: Vec<ServerSlot>, files: Vec<FileJob>, repair: Tracker, stop_unrepairable: bool, events: UnboundedSender<EngineEvent>) -> Shared {
+        Shared {
             dest_dir: PathBuf::from("."),
-            servers: Vec::new(),
+            servers,
             pool: Arc::new(ConnectionPool::new()),
             released: Notify::new(),
-            files: Vec::new(),
+            files,
             queue: Mutex::new(VecDeque::new()),
             claimed: Mutex::new(HashSet::new()),
             skip_files: HashSet::new(),
             retries: 0,
             connect_timeout: Duration::from_secs(1),
             limiter: RateLimiter::new(crate::SpeedLimit::default()),
-            events: tx,
+            events,
             progress: Arc::new(Progress::new()),
             abort: CancellationToken::new(),
             fatal: Mutex::new(None),
             bytes_written: AtomicU64::new(0),
             failovers: AtomicUsize::new(0),
             bad_articles: AtomicUsize::new(0),
-            repair: Mutex::new(Tracker::new(Vec::new(), 0)),
-            stop_unrepairable: false,
+            repair: Mutex::new(repair),
+            missing_articles: AtomicUsize::new(0),
+            stop_unrepairable,
             on_disk: Vec::new(),
             finalizing: Mutex::new(JoinSet::new()),
+        }
+    }
+
+    /// The order that made a v1.6.0 release run report "0 missing articles": the data
+    /// file's articles go missing and the file finishes (draining its list) before the
+    /// PAR2 index is read and shows the damage is past repair.
+    #[test]
+    fn an_unrepairable_stop_counts_articles_of_files_already_finished() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let job = |label: &str, n: u32, bytes: u64| {
+            let segments = (1..=n).map(|number| Segment { number, bytes, message_id: format!("{label}{number}@x") }).collect();
+            FileJob::new(label.into(), segments)
         };
+        let specs = [("d.rar", 10, 520), ("d.par2", 1, 900), ("d.vol00+02.par2", 2, 1100)];
+        let tracker = Tracker::new(specs.iter().map(|&(l, n, b)| (l.into(), (1..=n).collect(), vec![b; n as usize])).collect(), 0);
+        let files = specs.iter().map(|&(l, n, b)| job(l, n, b)).collect();
+        let shared = bare(Vec::new(), files, tracker, true, tx);
+
+        lock(&shared.repair).note_part(0, 1, "d.rar", 5000, (501, 1000), None);
+        for si in [0, 2, 4] {
+            shared.note_missing(0, si);
+        }
+        assert!(lock(&shared.fatal).is_none(), "nothing known before the PAR2 index is read");
+        // `finalize` takes the finished file's list for its report.
+        assert_eq!(std::mem::take(&mut *lock(&shared.files[0].missing)).len(), 3);
+
+        lock(&shared.repair).note_par2(1, &[crate::repair::tests::set(1, &[("d.rar", 5000)], 0)]);
+        shared.update_outlook();
+        match lock(&shared.fatal).take() {
+            Some(EngineError::Unrepairable { needed, available, missing }) => assert_eq!((needed, available, missing), (3, 2, 3)),
+            other => panic!("expected Unrepairable, got {other:?}"),
+        }
+        assert!(shared.abort.is_cancelled());
+    }
+
+    #[test]
+    fn missing_preview_format() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let shared = bare(Vec::new(), Vec::new(), Tracker::new(Vec::new(), 0), false, tx);
         let ids: Vec<String> = (1..=5).map(|i| format!("id{i}@x")).collect();
         fail_file(&shared, "f.bin", &ids);
         match rx.try_recv().unwrap() {
@@ -1557,30 +1606,7 @@ mod tests {
     #[test]
     fn bad_article_lines_are_capped_and_summarized() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let shared = Shared {
-            dest_dir: PathBuf::from("."),
-            servers: Vec::new(),
-            pool: Arc::new(ConnectionPool::new()),
-            released: Notify::new(),
-            files: Vec::new(),
-            queue: Mutex::new(VecDeque::new()),
-            claimed: Mutex::new(HashSet::new()),
-            skip_files: HashSet::new(),
-            retries: 0,
-            connect_timeout: Duration::from_secs(1),
-            limiter: RateLimiter::new(crate::SpeedLimit::default()),
-            events: tx,
-            progress: Arc::new(Progress::new()),
-            abort: CancellationToken::new(),
-            fatal: Mutex::new(None),
-            bytes_written: AtomicU64::new(0),
-            failovers: AtomicUsize::new(0),
-            bad_articles: AtomicUsize::new(0),
-            repair: Mutex::new(Tracker::new(Vec::new(), 0)),
-            stop_unrepairable: false,
-            on_disk: Vec::new(),
-            finalizing: Mutex::new(JoinSet::new()),
-        };
+        let shared = bare(Vec::new(), Vec::new(), Tracker::new(Vec::new(), 0), false, tx);
         for i in 0..60 {
             shared.log_bad_article(&format!("f.bin: article <{i}@x> could not be decoded"));
         }
@@ -1600,30 +1626,7 @@ mod tests {
     fn order_rotates_and_filters() {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let mk = |h: &str| ServerSlot::new(ServerConfig { host: h.into(), connections: 1, ..Default::default() });
-        let shared = Shared {
-            dest_dir: PathBuf::from("."),
-            servers: vec![mk("a"), mk("b"), mk("c")],
-            pool: Arc::new(ConnectionPool::new()),
-            released: Notify::new(),
-            files: Vec::new(),
-            queue: Mutex::new(VecDeque::new()),
-            claimed: Mutex::new(HashSet::new()),
-            skip_files: HashSet::new(),
-            retries: 0,
-            connect_timeout: Duration::from_secs(1),
-            limiter: RateLimiter::new(crate::SpeedLimit::default()),
-            events: tx,
-            progress: Arc::new(Progress::new()),
-            abort: CancellationToken::new(),
-            fatal: Mutex::new(None),
-            bytes_written: AtomicU64::new(0),
-            failovers: AtomicUsize::new(0),
-            bad_articles: AtomicUsize::new(0),
-            repair: Mutex::new(Tracker::new(Vec::new(), 0)),
-            stop_unrepairable: false,
-            on_disk: Vec::new(),
-            finalizing: Mutex::new(JoinSet::new()),
-        };
+        let shared = bare(vec![mk("a"), mk("b"), mk("c")], Vec::new(), Tracker::new(Vec::new(), 0), false, tx);
         assert_eq!(shared.order(&[false, false, false], 0), vec![0, 1, 2]);
         assert_eq!(shared.order(&[false, false, false], 2), vec![2, 0, 1]);
         assert_eq!(shared.order(&[true, false, false], 0), vec![1, 2]);

@@ -378,13 +378,14 @@ impl Tracker {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use newskite_par2::FileEntry;
 
     const S: u64 = 1000;
 
-    fn set(id: u8, files: &[(&str, u64)], recovery: usize) -> RecoverySet {
+    /// A recovery set of `files` in 1000-byte slices with `recovery` blocks.
+    pub(crate) fn set(id: u8, files: &[(&str, u64)], recovery: usize) -> RecoverySet {
         let mut first = 0;
         let entries = files
             .iter()
