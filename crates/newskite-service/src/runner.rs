@@ -478,12 +478,7 @@ async fn download_job(
             None
         }
         Err(EngineError::Unrepairable { needed, available, missing }) => {
-            let reason = format!(
-                "stopped early: {missing} missing article{} damaged {needed} slice{}, but at most {available} recovery block{} can arrive",
-                if missing == 1 { "" } else { "s" },
-                if needed == 1 { "" } else { "s" },
-                if available == 1 { "" } else { "s" },
-            );
+            let reason = unrepairable_message(needed, available, missing);
             fail_job(inner, &job, &reason, Finish::failed(FailureKind::Unrepairable).missing(missing));
             None
         }
@@ -826,6 +821,21 @@ pub(crate) fn missing_message(ids: &[String]) -> String {
     s
 }
 
+/// Why a job stopped early as unrepairable. Damage with no missing article came from
+/// articles that failed their CRC check, so it is not put down to "0 missing articles".
+pub(crate) fn unrepairable_message(needed: u64, available: u64, missing: usize) -> String {
+    let plural = |n: u64| if n == 1 { "" } else { "s" };
+    let cause = match missing {
+        0 => "corrupt articles".to_string(),
+        n => format!("{n} missing article{}", plural(n as u64)),
+    };
+    format!(
+        "stopped early: {cause} damaged {needed} slice{}, but at most {available} recovery block{} can arrive",
+        plural(needed),
+        plural(available)
+    )
+}
+
 /// Rebroadcasts engine events, keeps `job_files` and `bytes_done` current and turns
 /// file-level events into log lines. Returns the articles fetched and missing, and the
 /// missing articles of each file that had some. Blocking: it runs on its own thread for
@@ -1005,7 +1015,7 @@ fn upsert_file(inner: &Inner, job_id: i64, name: &str, bytes_total: u64, bytes_d
 
 #[cfg(test)]
 mod tests {
-    use super::missing_message;
+    use super::{missing_message, unrepairable_message};
 
     #[test]
     fn missing_message_lists_at_most_five() {
@@ -1016,5 +1026,21 @@ mod tests {
         );
         assert_eq!(missing_message(&ids[..1]), "1 missing article: id1@x");
         assert_eq!(missing_message(&[]), "0 missing articles");
+    }
+
+    #[test]
+    fn unrepairable_message_never_blames_zero_missing_articles() {
+        assert_eq!(
+            unrepairable_message(10, 8, 2),
+            "stopped early: 2 missing articles damaged 10 slices, but at most 8 recovery blocks can arrive"
+        );
+        assert_eq!(
+            unrepairable_message(1, 0, 1),
+            "stopped early: 1 missing article damaged 1 slice, but at most 0 recovery blocks can arrive"
+        );
+        assert_eq!(
+            unrepairable_message(3, 1, 0),
+            "stopped early: corrupt articles damaged 3 slices, but at most 1 recovery block can arrive"
+        );
     }
 }
