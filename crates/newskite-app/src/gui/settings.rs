@@ -917,8 +917,9 @@ fn appearance_section(ui: &mut Ui, pal: &Palette, appearance: &mut Appearance, r
         ui.add_space(4.0);
         ui.label(
             RichText::new(
-                "Carbon, warm ink and paper are the innerpulse looks, each with the violet accent. \
-                 Follow desktop takes your desktop's light or dark color scheme and changes with it.",
+                "Steel and aluminum are one brushed panel on a dark and a light ground. Warm ink and \
+                 paper are the flat alternatives. Follow desktop takes your desktop's light or dark \
+                 color scheme and changes with it.",
             )
             .small()
             .color(pal.muted),
@@ -934,7 +935,7 @@ fn appearance_section(ui: &mut Ui, pal: &Palette, appearance: &mut Appearance, r
 /// option shows ink and paper side by side, since it follows whichever the desktop
 /// uses) above its name; the chosen card is ringed in the accent.
 fn theme_swatch(ui: &mut Ui, pal: &Palette, choice: Appearance, selected: bool) -> egui::Response {
-    let size = egui::vec2(148.0, 112.0);
+    let size = egui::vec2(118.0, 112.0);
     let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
     if ui.is_rect_visible(rect) {
         let hover = ui.ctx().animate_bool(resp.id.with("hover"), resp.hovered());
@@ -945,6 +946,7 @@ fn theme_swatch(ui: &mut Ui, pal: &Palette, choice: Appearance, selected: bool) 
         let paper = Palette::from_theme(&super::brand_tokens::paper());
         match choice {
             Appearance::Ink => mini_window(painter, &ink, preview),
+            Appearance::Aluminum => mini_window(painter, &Palette::from_theme(&super::brand_tokens::aluminum()), preview),
             Appearance::Warm => mini_window(painter, &Palette::from_theme(&super::brand_tokens::warm()), preview),
             Appearance::Paper => mini_window(painter, &paper, preview),
             Appearance::FollowDesktop => {
@@ -990,9 +992,9 @@ fn mini_window(painter: &egui::Painter, p: &Palette, r: egui::Rect) {
     painter.rect_filled(Rect::from_min_size(pos2(r.right() - 34.0, bar.top() + 5.0), vec2(24.0, 8.0)), CornerRadius::same(4), p.accent_soft);
     for row in 0..2 {
         let y = bar.bottom() + 12.0 + row as f32 * 26.0;
-        painter.rect_filled(Rect::from_min_size(pos2(r.left() + 10.0, y), vec2(54.0, 5.0)), CornerRadius::same(2), p.text);
-        painter.rect_filled(Rect::from_min_size(pos2(r.left() + 10.0, y + 9.0), vec2(36.0, 4.0)), CornerRadius::same(2), p.muted);
-        let track = Rect::from_min_size(pos2(r.left() + 74.0, y + 3.0), vec2(r.width() - 86.0, 4.0));
+        painter.rect_filled(Rect::from_min_size(pos2(r.left() + 10.0, y), vec2(44.0, 5.0)), CornerRadius::same(2), p.text);
+        painter.rect_filled(Rect::from_min_size(pos2(r.left() + 10.0, y + 9.0), vec2(30.0, 4.0)), CornerRadius::same(2), p.muted);
+        let track = Rect::from_min_size(pos2(r.left() + 64.0, y + 3.0), vec2(r.width() - 76.0, 4.0));
         super::widgets::paint_segments(painter, p, track, if row == 0 { 0.62 } else { 0.25 }, p.accent, None);
     }
 }

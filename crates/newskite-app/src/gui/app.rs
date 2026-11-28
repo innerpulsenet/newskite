@@ -1702,8 +1702,8 @@ impl NewskiteApp {
             .show(ctx, |ui| super::sidebar::show(ui, &pal, &self.data, &self.view, rail, &mut actions))
             .response
             .rect;
-        if pal.metal.is_some() {
-            super::metal::groove_v(&plate, side.right() - 2.0, side.top(), side.bottom());
+        if let Some(m) = &pal.metal {
+            super::metal::groove_v(&plate, m, side.right() - 2.0, side.top(), side.bottom());
         }
 
         let bar = egui::TopBottomPanel::bottom("statusbar")
@@ -1714,8 +1714,8 @@ impl NewskiteApp {
             })
             .response
             .rect;
-        if pal.metal.is_some() {
-            super::metal::groove_h(&plate, bar.left(), bar.right(), bar.top());
+        if let Some(m) = &pal.metal {
+            super::metal::groove_h(&plate, m, bar.left(), bar.right(), bar.top());
         }
 
         // The server readings: one quiet line above the status bar. Toasts stack from its
@@ -1728,8 +1728,8 @@ impl NewskiteApp {
             })
             .response
             .rect;
-        if pal.metal.is_some() {
-            super::metal::groove_h(&plate, strip.left(), strip.right(), strip.top());
+        if let Some(m) = &pal.metal {
+            super::metal::groove_h(&plate, m, strip.left(), strip.right(), strip.top());
         }
         let strip_top = strip.top();
 
@@ -1748,9 +1748,9 @@ impl NewskiteApp {
                 .max_width((width * 0.45).max(super::inspector::PANEL_MIN_W))
                 .frame(edge(pal.raised).inner_margin(egui::Margin::symmetric(20, 18)))
                 .show_animated(ctx, inspecting, |ui| {
-                    if pal.metal.is_some() {
+                    if let Some(m) = &pal.metal {
                         let r = ui.max_rect().expand2(egui::vec2(20.0, 18.0));
-                        super::metal::groove_v(ui.painter(), r.left(), r.top(), r.bottom());
+                        super::metal::groove_v(ui.painter(), m, r.left(), r.top(), r.bottom());
                     }
                     super::inspector::show(
                         ui,

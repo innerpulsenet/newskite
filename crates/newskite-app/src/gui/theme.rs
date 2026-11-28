@@ -13,7 +13,7 @@ use eframe::egui::{
 };
 use newskite_theme::{Rgb, Theme, Tokens};
 
-use super::brand_tokens::{brand_set_of, chart_set, CHART_SERIES_SLOT, EMBER};
+use super::brand_tokens::{brand_set_of, chart_set, CHART_SERIES_SLOT, EMBER, INK};
 use super::fonts;
 
 /// Converts a token color to an opaque egui color.
@@ -58,26 +58,45 @@ fn best_contrast(bg: Rgb, a: Rgb, b: Rgb) -> Rgb {
     }
 }
 
-/// The materials of a brand ink ground (see [`super::brand_tokens::MetalSet`]): the plate,
-/// the keys' glass and the steel, plus the light and shade every relief is drawn with.
+/// The materials of a brand ground (see [`super::brand_tokens::MetalSet`]): the plate, the
+/// keys' caps and the steel, plus the light and shade every relief is drawn with.
 /// [`super::metal`] paints with these; desktop themes and paper have none and stay flat.
+///
+/// Steel and aluminum are one material on two grounds. On aluminum (`light`) the plate,
+/// its grooves, wells, legends and resting keys are pale and cut dark; what is lit or
+/// behind glass (a display, a lamp, a latched key) is the same as on steel, since light is
+/// emitted, not reflected.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Metal {
     /// The plate the window is cut from.
     pub plate: Color32,
-    /// A key's smoked glass: at rest (top, foot), then held down (top, foot).
+    /// A key's cap: at rest (top, foot), then held down (top, foot).
     pub key: [Color32; 4],
+    /// The smoked glass of a lit key, in the same order. On the dark grounds every key is
+    /// this glass, so it equals `key`.
+    pub glass: [Color32; 4],
+    /// The letters on a key at rest.
+    pub key_ink: Color32,
+    /// The plate a shade deeper: a slot that is switched off.
+    pub rail: Color32,
     /// The wordmark's steel ramp, top to foot (`None`: the text color).
     pub steel: Option<[Color32; 5]>,
     /// Whether the plate is brushed.
     pub brushed: bool,
-    /// Frosted glass: what floats over the window (sheets, toasts, menus, the drop card).
-    /// Smoked and a little translucent, so what is under it shows as a soft shape.
+    /// Whether the plate is bare aluminum, the light ground.
+    pub light: bool,
+    /// What floats over the window (sheets, toasts, menus, the drop card). Smoked glass on
+    /// the dark grounds, a little translucent; a paler sheet of the plate on aluminum.
     pub frost: Color32,
     /// The black glass of a display let into the plate.
     pub lcd_glass: Color32,
     /// What is lit on a display: the family accent, a little toward white.
     pub lcd_lit: Color32,
+    /// An unlit lamp's bulb: its core and its edge.
+    pub bulb: [Color32; 2],
+    /// Colors as they are written on the plate, each with the light it is when lit. On
+    /// the dark grounds the two are the same.
+    pub lit: [(Color32, Color32); 4],
 }
 
 impl Metal {
@@ -88,6 +107,63 @@ impl Metal {
     pub const LIP: u8 = 24;
     /// The hard edge of raised metal.
     pub const LIP_HARD: u8 = 36;
+
+    /// The lit lip under a cut in this plate: a well's foot, a groove.
+    pub fn lip(&self) -> Color32 {
+        Self::light(if self.light { 230 } else { Self::LIP })
+    }
+
+    /// The softer lip: under a groove on aluminum, along a quiet foot.
+    pub fn lip_soft(&self) -> Color32 {
+        Self::light(if self.light { 153 } else { Self::LIP_SOFT })
+    }
+
+    /// The lip under a groove: the hard one on steel, the soft one on aluminum.
+    pub fn groove_lip(&self) -> Color32 {
+        if self.light {
+            self.lip_soft()
+        } else {
+            self.lip()
+        }
+    }
+
+    /// The cut of a groove in this plate.
+    pub fn cut(&self) -> Color32 {
+        Self::shade(if self.light { 71 } else { 158 })
+    }
+
+    /// The rim of a well sunk into this plate.
+    pub fn rim(&self) -> Color32 {
+        Self::shade(if self.light { 87 } else { 190 })
+    }
+
+    /// The collar around a key.
+    pub fn key_rim(&self) -> Color32 {
+        Self::shade(if self.light { 117 } else { 215 })
+    }
+
+    /// The edge of what floats over the plate.
+    pub fn float_rim(&self) -> Color32 {
+        Self::shade(if self.light { 66 } else { 200 })
+    }
+
+    /// The legend's lip: the light a letter stamped into this plate catches under it.
+    pub fn legend_lip(&self) -> Color32 {
+        Self::light(if self.light { 217 } else if self.brushed { 30 } else { 20 })
+    }
+
+    /// `written` as light: the color a lamp, a latched key or a display glows in. Colors
+    /// are written dark on aluminum and nothing written glows, so what is lit takes the
+    /// dark ground's phosphor; on steel a color is its own light.
+    pub fn glow(&self, written: Color32) -> Color32 {
+        self.lit.iter().find(|(w, _)| *w == written).map_or(written, |(_, lit)| *lit)
+    }
+
+    /// `c` at `f` times its brightness, as a stylesheet's `brightness()` filter gives it.
+    pub fn brighten(c: Color32, f: f32) -> Color32 {
+        let m = |v: u8| (f32::from(v) * f + 0.5).clamp(0.0, 255.0) as u8;
+        Color32::from_rgb(m(c.r()), m(c.g()), m(c.b()))
+    }
 
     /// Light at `alpha` (0…255): white, translucent.
     pub fn light(alpha: u8) -> Color32 {
@@ -274,14 +350,47 @@ impl Palette {
         if let Some(set) = brand_set_of(theme) {
             p.faint = to_color32(set.text_3);
             p.series = p.chart[CHART_SERIES_SLOT - 1];
-            p.metal = set.metal.map(|m| Metal {
-                plate: to_color32(m.plate),
-                key: m.key.map(to_color32),
-                steel: m.steel.map(|s| s.map(to_color32)),
-                brushed: m.brushed,
-                frost: Metal::alpha(to_color32(set.surface_2.mix(set.text, 0.05)), 0.88),
-                lcd_glass: to_color32(set.ground.mix(Rgb::new(0, 0, 0), 0.35)),
-                lcd_lit: to_color32(set.accent.mix(Rgb::new(255, 255, 255), 0.18)),
+            let same = |c: Color32| (c, c);
+            p.metal = set.metal.map(|m| {
+                let white = Rgb::new(255, 255, 255);
+                let key = m.key.map(to_color32);
+                // What is lit or behind glass on aluminum is carbon's.
+                let dark = if m.light { &INK } else { set };
+                let glass = match (m.light, INK.metal) {
+                    (true, Some(steel)) => steel.key.map(to_color32),
+                    _ => key,
+                };
+                Metal {
+                    plate: to_color32(m.plate),
+                    key,
+                    glass,
+                    key_ink: to_color32(m.key_ink),
+                    rail: to_color32(m.rail),
+                    steel: m.steel.map(|s| s.map(to_color32)),
+                    brushed: m.brushed,
+                    light: m.light,
+                    frost: if m.light {
+                        Metal::alpha(to_color32(m.plate.mix(white, 0.38)), 0.97)
+                    } else {
+                        Metal::alpha(to_color32(set.surface_2.mix(set.text, 0.05)), 0.88)
+                    },
+                    lcd_glass: to_color32(dark.ground.mix(Rgb::new(0, 0, 0), 0.35)),
+                    lcd_lit: to_color32(dark.accent.mix(white, 0.18)),
+                    bulb: [
+                        to_color32(dark.surface_1.mix(dark.text, 0.09)),
+                        to_color32(dark.ground),
+                    ],
+                    lit: if m.light {
+                        [
+                            (p.accent, to_color32(INK.accent)),
+                            (p.positive, to_color32(INK.ok)),
+                            (p.warning, to_color32(INK.warn)),
+                            (p.negative, to_color32(INK.err)),
+                        ]
+                    } else {
+                        [same(p.accent), same(p.positive), same(p.warning), same(p.negative)]
+                    },
+                }
             });
         }
         p
@@ -424,9 +533,10 @@ pub fn apply(ctx: &egui::Context, theme: &Theme) -> Palette {
     let mut vis = visuals(&theme.tokens, theme.dark);
     let palette = Palette::from_theme(theme);
     if let Some(m) = &palette.metal {
-        // Menus and tooltips are frosted glass with a lit rim, cut to the keys' radius.
+        // Menus and tooltips are frosted glass with a lit rim, cut to the keys' radius; on
+        // aluminum, a paler sheet of the plate in a thin dark rim.
         vis.window_fill = m.frost;
-        vis.window_stroke = Stroke::new(1.0, Metal::light(Metal::LIP_HARD));
+        vis.window_stroke = Stroke::new(1.0, if m.light { m.float_rim() } else { Metal::light(Metal::LIP_HARD) });
         vis.menu_corner_radius = CornerRadius::same(5);
         vis.window_corner_radius = CornerRadius::same(6);
     }
@@ -556,6 +666,7 @@ mod tests {
             ("breeze dark", breeze(include_str!("../../../newskite-theme/tests/fixtures/breeze-dark.kdeglobals"))),
             ("breeze light", breeze(include_str!("../../../newskite-theme/tests/fixtures/breeze-light.kdeglobals"))),
             ("ink", super::super::brand_tokens::ink()),
+            ("aluminum", super::super::brand_tokens::aluminum()),
             ("warm", super::super::brand_tokens::warm()),
             ("paper", super::super::brand_tokens::paper()),
         ];
@@ -570,7 +681,8 @@ mod tests {
                 ("warning", p.warning),
                 ("negative", p.negative),
             ] {
-                for (ground, bg) in [("surface", p.surface), ("raised", p.raised), ("sunken", p.sunken)] {
+                let rail = p.metal.map(|m| ("rail", m.rail));
+                for (ground, bg) in [("surface", p.surface), ("raised", p.raised), ("sunken", p.sunken)].into_iter().chain(rail) {
                     let c = rgb(fg).contrast(rgb(bg));
                     assert!(c >= TEXT_CONTRAST - 0.01, "{name}: {what} on {ground} is {c:.2}:1");
                 }

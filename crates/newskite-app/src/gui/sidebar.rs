@@ -177,7 +177,7 @@ fn throughput_lcd(ui: &mut Ui, pal: &Palette, m: &super::theme::Metal, data: &Da
         // Annunciators along the top, the unit at its right end.
         let tag_font = FontId::new(10.0, fonts::mono_semibold());
         let mut x = inner.left();
-        for (word, on, color) in [("RX", running && !paused, lit), ("HOLD", paused, pal.warning)] {
+        for (word, on, color) in [("RX", running && !paused, lit), ("HOLD", paused, m.glow(pal.warning))] {
             let g = painter.layout_no_wrap(word.to_owned(), tag_font.clone(), lit);
             let tag = Rect::from_min_size(Pos2::new(x, inner.top()), Vec2::new(g.size().x + 10.0, 15.0));
             super::metal::lcd_tag(painter, m, tag, g, color, on);
@@ -271,7 +271,15 @@ fn entry(ui: &mut Ui, pal: &Palette, e: &Entry, rail: bool) -> bool {
         if resp.has_focus() {
             focus_ring(ui, pal, slot, 8);
         }
-        let fg = if e.current { pal.text } else { pal.muted.lerp_to_gamma(pal.text, hover) };
+        // On aluminum the current view's key is lit glass on a pale plate: what is written
+        // on it takes the key's light, not the plate's ink.
+        let glass = pal.metal.filter(|m| m.light && e.current);
+        let fg = match &glass {
+            Some(m) => super::metal::key_text(pal, m, super::metal::KeyState { hover: 0.0, on: 1.0, press: 0.0, color: pal.accent }, true),
+            None if e.current => pal.text,
+            None => pal.muted.lerp_to_gamma(pal.text, hover),
+        };
+        let warn = glass.map_or(pal.warning, |m| m.glow(pal.warning));
         if rail {
             let icon = Rect::from_center_size(slot.center(), Vec2::splat(18.0));
             paint_icon(painter, icon, e.icon, fg);
@@ -279,12 +287,21 @@ fn entry(ui: &mut Ui, pal: &Palette, e: &Entry, rail: bool) -> bool {
                 // A pill over the icon's top-right corner, cut out of it by a ring in the
                 // color behind, so the numerals never sit on the icon's strokes.
                 let n = if n.parse::<u64>().is_ok_and(|v| v > 99) { "99+" } else { n.as_str() };
-                let (tint, c) = if e.count_warn { (pal.warning_soft, pal.warning) } else { (pal.sunken, fg) };
+                let (tint, c) = match (&glass, e.count_warn) {
+                    (Some(m), true) => (m.glass[1], warn),
+                    (Some(m), false) => (m.glass[1], fg),
+                    (None, true) => (pal.warning_soft, pal.warning),
+                    (None, false) => (pal.sunken, fg),
+                };
                 let galley = painter.layout_no_wrap(n.to_owned(), fonts::mono_id(9.5), c);
                 let size = Vec2::new((galley.size().x + 7.0).max(13.0), 13.0);
                 let right = (icon.right() - 4.0 + size.x).min(slot.right() - 2.0);
                 let pill = Rect::from_min_size(Pos2::new(right - size.x, slot.top() + 2.0), size);
-                let behind = if e.current { pal.hover } else { pal.raised.lerp_to_gamma(pal.hover, 0.6 * hover) };
+                let behind = match &glass {
+                    Some(m) => m.glass[0],
+                    None if e.current => pal.hover,
+                    None => pal.raised.lerp_to_gamma(pal.hover, 0.6 * hover),
+                };
                 let round = CornerRadius::same(7);
                 painter.rect_filled(pill.expand(1.5), round, behind);
                 painter.rect_filled(pill, round, tint);
@@ -295,7 +312,7 @@ fn entry(ui: &mut Ui, pal: &Palette, e: &Entry, rail: bool) -> bool {
             let font = if e.current { fonts::semibold_id(13.5) } else { FontId::proportional(13.5) };
             painter.text(Pos2::new(slot.left() + 38.0, slot.center().y), Align2::LEFT_CENTER, e.label, font, fg);
             if let Some(n) = e.count.as_ref().filter(|n| n.as_str() != "0") {
-                let c = if e.count_warn { pal.warning } else if e.current { pal.text } else { pal.muted };
+                let c = if e.count_warn { warn } else if e.current { fg } else { pal.muted };
                 painter.text(Pos2::new(slot.right() - 12.0, slot.center().y), Align2::RIGHT_CENTER, n, fonts::mono_id(12.0), c);
             }
         }

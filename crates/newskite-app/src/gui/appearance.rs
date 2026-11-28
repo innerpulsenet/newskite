@@ -4,7 +4,8 @@
 //! `Settings` belongs to `newskite-types` and is shared with the headless CLI, so the
 //! choice is a GUI preference stored on its own: a small JSON document,
 //! `<data dir>/appearance.json`, next to the database (`{"theme": "innerpulse-ink"}`,
-//! `"innerpulse-warm"`, `"innerpulse-paper"` or `"follow-desktop"`). A missing or
+//! `"innerpulse-aluminum"`, `"innerpulse-warm"`, `"innerpulse-paper"` or
+//! `"follow-desktop"`). A missing or
 //! unreadable file means nothing was chosen: carbon, on Linux and Windows alike.
 
 use std::path::Path;
@@ -22,9 +23,12 @@ pub enum Appearance {
     /// The desktop color scheme (kdeglobals / portal / fallback), live.
     #[default]
     FollowDesktop,
-    /// innerpulse carbon (the kit's ink): the brushed plate on cool blacks, steel text
-    /// and the violet accent. Stored as `innerpulse-ink`.
+    /// Brushed steel, the dark ground (the kit's ink, carbon): the brushed plate on cool
+    /// blacks, steel text and the violet accent. Stored as `innerpulse-ink`.
     Ink,
+    /// Bare aluminum, the light ground of the same panel: a pale brushed plate, pale
+    /// wells and caps written in ink, with the same dark screens, lamps and lit keys.
+    Aluminum,
     /// The kit's optional warm ink: the same materials on the brown-black ground.
     Warm,
     /// innerpulse paper: the warm off-white ground with the deep violet.
@@ -33,8 +37,9 @@ pub enum Appearance {
 
 impl Appearance {
     /// Every choice, in menu order.
-    pub const ALL: [Appearance; 4] = [
+    pub const ALL: [Appearance; 5] = [
         Appearance::Ink,
+        Appearance::Aluminum,
         Appearance::Warm,
         Appearance::Paper,
         Appearance::FollowDesktop,
@@ -47,7 +52,8 @@ impl Appearance {
     pub fn label(self) -> &'static str {
         match self {
             Appearance::FollowDesktop => "Follow desktop",
-            Appearance::Ink => "Carbon",
+            Appearance::Ink => "Steel",
+            Appearance::Aluminum => "Aluminum",
             Appearance::Warm => "Warm ink",
             Appearance::Paper => "Paper",
         }
@@ -58,6 +64,7 @@ impl Appearance {
         match self {
             Appearance::FollowDesktop => "follow-desktop",
             Appearance::Ink => "innerpulse-ink",
+            Appearance::Aluminum => "innerpulse-aluminum",
             Appearance::Warm => "innerpulse-warm",
             Appearance::Paper => "innerpulse-paper",
         }
@@ -73,6 +80,7 @@ impl Appearance {
         match self {
             Appearance::FollowDesktop => desktop.clone(),
             Appearance::Ink => brand_tokens::ink(),
+            Appearance::Aluminum => brand_tokens::aluminum(),
             Appearance::Warm => brand_tokens::warm(),
             Appearance::Paper => brand_tokens::paper(),
         }
