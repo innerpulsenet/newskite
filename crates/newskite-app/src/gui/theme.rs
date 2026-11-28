@@ -690,6 +690,30 @@ mod tests {
         }
     }
 
+    /// On aluminum a key at rest is written in ink on its pale cap, and a latched one in
+    /// its light on smoked glass: both read, under the pointer and held down too.
+    #[test]
+    fn key_legends_read_on_both_caps() {
+        let rgb = |c: Color32| Rgb::new(c.r(), c.g(), c.b());
+        for theme in [super::super::brand_tokens::ink(), super::super::brand_tokens::aluminum()] {
+            let p = Palette::from_theme(&theme);
+            let m = p.metal.expect("a plate");
+            for cap in m.key {
+                let c = rgb(m.key_ink).contrast(rgb(cap));
+                assert!(c >= TEXT_CONTRAST, "{:?}: key ink on its cap is {c:.2}:1", theme.scheme_name);
+            }
+            for written in [p.accent, p.positive, p.warning, p.negative] {
+                let lit = Metal::lerp(m.glow(written), Metal::white(), 0.6);
+                for glass in m.glass {
+                    let c = rgb(lit).contrast(rgb(glass));
+                    assert!(c >= TEXT_CONTRAST, "{:?}: a lit legend on glass is {c:.2}:1", theme.scheme_name);
+                }
+                // What glows is never the dark ink a light ground writes in.
+                assert!(rgb(m.glow(written)).contrast(rgb(m.lcd_glass)) >= TEXT_CONTRAST);
+            }
+        }
+    }
+
     #[test]
     fn apply_sets_both_slots_and_preference() {
         let ctx = egui::Context::default();

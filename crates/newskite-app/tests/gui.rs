@@ -1455,6 +1455,36 @@ fn about_dialog_opens_from_the_masthead_and_closes() {
     assert!(!app(&h).view.about_open);
 }
 
+/// What floats over aluminum (the drop card, a sheet) and the narrow rail, whose current
+/// key is lit glass on the pale plate.
+#[test]
+fn aluminum_floats_and_rail_render() {
+    let fx = Fixture::new(seed_populated);
+    let mut h = fx.harness_themed(brand_tokens::aluminum(), SIZE, true, None, true, 0.25);
+    h.run_steps(2);
+    let one = write_nzb(fx.dir.path(), "one.nzb", VALID_NZB);
+    h.input_mut().hovered_files.push(egui::HoveredFile { path: Some(one), ..Default::default() });
+    h.run_steps(2);
+    h.get_by_label("Drop to add 1 NZB");
+    snapshot(&mut h, "drop-overlay-aluminum");
+    h.input_mut().hovered_files.clear();
+    h.run_steps(2);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Comma);
+    h.run_steps(2);
+    for _ in 0..8 {
+        h.get_by_label("Paper").scroll_down();
+        h.run_steps(1);
+    }
+    h.run_steps(6);
+    snapshot(&mut h, "settings-aluminum");
+    drop(h);
+
+    let mut h = fx.harness_themed(brand_tokens::aluminum(), egui::vec2(960.0, 600.0), true, None, true, 0.25);
+    h.run_steps(3);
+    assert_no_bad_numbers(&h);
+    snapshot(&mut h, "populated-aluminum-minimum");
+}
+
 #[test]
 fn masthead_mark_draws_in_then_beats_only_while_working() {
     let fx = Fixture::new(seed_populated);

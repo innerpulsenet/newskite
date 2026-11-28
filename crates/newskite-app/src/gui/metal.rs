@@ -85,7 +85,6 @@ fn brushed(ctx: &egui::Context, ink: bool) -> egui::TextureHandle {
 /// throws more of the light back: the fall from the top is brighter and the shade at the
 /// foot shallower.
 pub fn plate(painter: &Painter, m: &Metal, r: Rect) {
-    let (fall, lit, rise, shade) = if m.light { (0.24, 128, 0.30, 26) } else { (0.22, 13, 0.28, 56) };
     painter.rect_filled(r, CornerRadius::ZERO, m.plate);
     if m.brushed {
         let t = brushed(painter.ctx(), m.light);
@@ -93,6 +92,13 @@ pub fn plate(painter: &Painter, m: &Metal, r: Rect) {
         let uv = Rect::from_min_max(pos2(r.left() / w, r.top() / h), pos2(r.right() / w, r.bottom() / h));
         painter.image(t.id(), r, uv, Metal::white());
     }
+    plate_light(painter, m, r);
+}
+
+/// The light on a plate over `r`, without its fill or grain: falling from the top and
+/// gone by the foot.
+pub fn plate_light(painter: &Painter, m: &Metal, r: Rect) {
+    let (fall, lit, rise, shade) = if m.light { (0.24, 128, 0.30, 26) } else { (0.22, 13, 0.28, 56) };
     let top = Rect::from_min_max(r.min, pos2(r.right(), r.top() + r.height() * fall));
     painter.add(vgrad(top, Metal::light(lit), Metal::light(0)));
     let foot = Rect::from_min_max(pos2(r.left(), r.bottom() - r.height() * rise), r.max);
@@ -395,8 +401,8 @@ pub fn lamp(painter: &Painter, m: &Metal, center: Pos2, r: f32, color: Color32, 
     let lit = lit.clamp(0.0, 1.0);
     let color = m.glow(color);
     if m.light {
-        painter.circle_filled(center, r + 2.4, m.bulb[1]);
-        painter.circle_stroke(center, r + 2.9, Stroke::new(1.0, m.lip_soft()));
+        painter.circle_filled(center, r + 1.9, m.bulb[1]);
+        painter.circle_stroke(center, r + 2.4, Stroke::new(1.0, m.lip_soft()));
     }
     if lit > 0.01 {
         let halo = lamp_outline(LampShape::Round, center, r * 2.7);

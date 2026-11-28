@@ -984,7 +984,21 @@ fn mini_window(painter: &egui::Painter, p: &Palette, r: egui::Rect) {
     use egui::{pos2, vec2, CornerRadius, Rect};
     painter.rect_filled(r, CornerRadius::same(10), p.surface);
     let bar = Rect::from_min_size(r.min, vec2(r.width(), 18.0));
-    painter.rect_filled(bar, CornerRadius { nw: 10, ne: 10, sw: 0, se: 0 }, p.raised);
+    match &p.metal {
+        // A plate: light falling from its top, a groove under the bar and the rows in a
+        // well let into it, as the window itself is cut.
+        Some(m) => {
+            let clip = painter.with_clip_rect(r.shrink(1.0).intersect(painter.clip_rect()));
+            super::metal::plate_light(&clip, m, r);
+            super::metal::groove_h(&clip, m, r.left(), r.right(), bar.bottom() - 1.0);
+            let well = Rect::from_min_max(pos2(r.left() + 5.0, bar.bottom() + 6.0), pos2(r.right() - 5.0, r.bottom() - 6.0));
+            clip.rect_filled(well, CornerRadius::same(3), p.raised);
+            clip.add(super::metal::well(m, well, 3));
+        }
+        None => {
+            painter.rect_filled(bar, CornerRadius { nw: 10, ne: 10, sw: 0, se: 0 }, p.raised);
+        }
+    }
     for (i, h) in [6.0f32, 10.0, 8.0].iter().enumerate() {
         let x = r.left() + 10.0 + i as f32 * 3.0;
         painter.rect_filled(Rect::from_center_size(pos2(x, bar.center().y), vec2(1.6, *h)), CornerRadius::ZERO, p.mark);

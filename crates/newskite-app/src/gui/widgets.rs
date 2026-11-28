@@ -1220,6 +1220,21 @@ pub fn section_title(ui: &mut Ui, pal: &Palette, text: &str) {
     ui.add(egui::Label::new(job).selectable(false));
 }
 
+/// The name of the view, at the head of the window (24 px, 600). With materials it is
+/// stamped into the plate like the legends under it, in the text color.
+pub fn view_title(ui: &mut Ui, pal: &Palette, text: &str) {
+    let Some(m) = pal.metal else {
+        ui.label(egui::RichText::new(text).font(fonts::semibold_id(24.0)).color(pal.text));
+        return;
+    };
+    let galley = ui.painter().layout_no_wrap(text.to_owned(), fonts::semibold_id(24.0), pal.text);
+    let (rect, resp) = ui.allocate_exact_size(galley.size(), Sense::hover());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, text));
+    if ui.is_rect_visible(rect) {
+        metal::engraved(ui.painter(), &m, rect.min, galley, pal.text);
+    }
+}
+
 /// Centered, readable empty-state text.
 pub fn empty_state(ui: &mut Ui, pal: &Palette, text: &str) {
     ui.add_space(8.0);

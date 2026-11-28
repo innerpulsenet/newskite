@@ -291,7 +291,7 @@ fn entry(ui: &mut Ui, pal: &Palette, e: &Entry, rail: bool) -> bool {
                     (Some(m), true) => (m.glass[1], warn),
                     (Some(m), false) => (m.glass[1], fg),
                     (None, true) => (pal.warning_soft, pal.warning),
-                    (None, false) => (pal.sunken, fg),
+                    (None, false) => (pal.metal.filter(|m| m.light).map_or(pal.sunken, |m| m.rail), fg),
                 };
                 let galley = painter.layout_no_wrap(n.to_owned(), fonts::mono_id(9.5), c);
                 let size = Vec2::new((galley.size().x + 7.0).max(13.0), 13.0);
@@ -300,7 +300,12 @@ fn entry(ui: &mut Ui, pal: &Palette, e: &Entry, rail: bool) -> bool {
                 let behind = match &glass {
                     Some(m) => m.glass[0],
                     None if e.current => pal.hover,
-                    None => pal.raised.lerp_to_gamma(pal.hover, 0.6 * hover),
+                    // With materials the rail is the plate itself, and a key rises under
+                    // the pointer.
+                    None => match &pal.metal {
+                        Some(m) => pal.surface.lerp_to_gamma(m.key[0], hover),
+                        None => pal.raised.lerp_to_gamma(pal.hover, 0.6 * hover),
+                    },
                 };
                 let round = CornerRadius::same(7);
                 painter.rect_filled(pill.expand(1.5), round, behind);
