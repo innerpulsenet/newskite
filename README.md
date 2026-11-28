@@ -17,10 +17,11 @@ yEnc payloads, writes the original files to disk byte for byte, then verifies, r
 extracts them without any external program. It keeps a resumable, reorderable queue
 where every job can be started, paused or moved on its own (drag a row to reorder), a download history, per-file
 progress, a live map of every article (downloaded, missing, waiting) with a strip of it under each job, a filterable log and a
-throughput graph in the status bar. It wears the innerpulse carbon look on Linux and Windows
+throughput graph in the status bar. It wears the innerpulse steel look on Linux and Windows
 alike (a brushed plate, keys of smoked glass, frosted sheets and a seven-segment throughput
-display), with a warm ink, a paper theme and "follow the desktop's light or dark color
-scheme" (KDE Plasma first) in Settings › Appearance.
+display), which comes on a dark ground, brushed steel, and a light one, bare aluminum. A
+warm ink, a paper theme and "follow the desktop's light or dark color scheme" (KDE Plasma
+first) are in Settings › Appearance too.
 
 Drop `.nzb` files (or a folder of them) onto the window, or copy them in the file manager
 and press Ctrl+V. On Wayland the window runs through XWayland, because the windowing
@@ -40,9 +41,15 @@ These are the app's GUI snapshot tests (`crates/newskite-app/tests/snapshots/`),
 with sample jobs and the placeholder server `news.example.net`, so the names and figures are
 test data, not a real download.
 
-A download under way in the carbon look, which a new install wears:
+A download under way on brushed steel, which a new install wears:
 
 <img alt="The Newskite queue on a brushed dark plate: one job downloading, one held, one failed and one finished, a seven-segment display reading 24.4 MB/s in the sidebar and a frosted toast for a finished download" src="crates/newskite-app/tests/snapshots/live-carbon.png" width="800">
+
+The same window in bare aluminum, the light ground of the same panel. The plate, the lists
+and the keys at rest are pale and written in ink; the display, the lamps and a lit key are
+the same on both:
+
+<img alt="The Newskite queue on a pale brushed aluminum plate: the same four jobs in pale wells, the current view's key and the seven-segment display still dark and lit in violet" src="crates/newskite-app/tests/snapshots/live-aluminum.png" width="800">
 
 The same queue following the desktop's dark or light color scheme (Settings › Appearance):
 
@@ -274,7 +281,7 @@ and manual runs (Actions → Packages → Run workflow) attach the packages to t
 artifacts; pushing a tag that matches the workspace version publishes a GitHub Release:
 
 ```sh
-git tag v1.6.1 && git push origin v1.6.1
+git tag v1.7.0 && git push origin v1.7.0
 ```
 
 ### Windows
