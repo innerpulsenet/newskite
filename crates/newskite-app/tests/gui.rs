@@ -382,12 +382,13 @@ fn assert_no_bad_numbers(h: &Harness<'_, Option<NewskiteApp>>) {
 }
 
 /// The looks every window is checked in: desktop dark and light (Breeze fixtures) and
-/// the innerpulse themes (carbon, the warm ink and paper).
-fn looks() -> [(Theme, &'static str); 5] {
+/// the innerpulse themes (steel, aluminum, the warm ink and paper).
+fn looks() -> [(Theme, &'static str); 6] {
     [
         (theme(true), "dark"),
         (theme(false), "light"),
         (brand_tokens::ink(), "ink"),
+        (brand_tokens::aluminum(), "aluminum"),
         (brand_tokens::warm(), "warm"),
         (brand_tokens::paper(), "paper"),
     ]
@@ -1273,7 +1274,8 @@ fn appearance_switches_on_save_and_persists() {
 
     h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Comma);
     h.run_steps(2);
-    h.get_by_label("Carbon");
+    h.get_by_label("Steel");
+    h.get_by_label("Aluminum");
     h.get_by_label("Warm ink");
     h.get_by_label("Follow desktop");
     // Choosing in the sheet changes nothing until Save.
@@ -1318,15 +1320,25 @@ fn appearance_switches_on_save_and_persists() {
     assert!(!app(&h).theme.dark, "follows the (light) desktop theme");
 }
 
-/// Carbon is what a window wears until its user chooses, so every view is rendered in
+/// Steel is what a window wears until its user chooses, so every view is rendered in
 /// it: the detail pane, History, the Log and the top of Settings.
 #[test]
 fn carbon_wears_every_view() {
+    wears_every_view(brand_tokens::ink(), "carbon");
+}
+
+/// Aluminum is the same panel on its light ground, so it is checked in the same views.
+#[test]
+fn aluminum_wears_every_view() {
+    wears_every_view(brand_tokens::aluminum(), "aluminum");
+}
+
+fn wears_every_view(look: Theme, name: &str) {
     let fx = Fixture::new(seed_populated);
     fx.service.log(LogLevel::Info, "first line");
     fx.service.log(LogLevel::Warn, "Open.Movie.Project.2160p: par2 repaired 3 blocks, extract ok");
     fx.service.log(LogLevel::Error, "second line");
-    let mut h = fx.harness_themed(brand_tokens::ink(), SIZE, false, None, true, 0.25);
+    let mut h = fx.harness_themed(look, SIZE, false, None, true, 0.25);
     h.run_steps(3);
     assert!(app(&h).palette.metal.is_some());
     let movie = app(&h).data.jobs.iter().find(|j| j.name == "Open.Movie.Project.2160p").map(|j| j.id);
@@ -1355,7 +1367,7 @@ fn carbon_wears_every_view() {
     h.get_by_label("Throughput display: 24.4 MB/s, 2.49 GB to go");
     h.get_by_label("Download complete");
     assert_no_bad_numbers(&h);
-    snapshot(&mut h, "live-carbon");
+    snapshot(&mut h, &format!("live-{name}"));
     h.state_mut().as_mut().expect("app").data.toasts.clear();
     h.state_mut().as_mut().expect("app").reload_jobs();
     h.run_steps(2);
@@ -1364,23 +1376,23 @@ fn carbon_wears_every_view() {
     h.get_by_label("LIFECYCLE");
     h.get_by_label("ARTICLE MAP");
     assert_no_bad_numbers(&h);
-    snapshot(&mut h, "details-carbon");
+    snapshot(&mut h, &format!("details-{name}"));
     h.state_mut().as_mut().expect("app").push_action(Action::Select(None));
     h.state_mut().as_mut().expect("app").push_action(Action::SetTab(Tab::History));
     h.run_steps(6);
     h.get_by_label("Clear history");
-    snapshot(&mut h, "history-carbon");
+    snapshot(&mut h, &format!("history-{name}"));
     h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Comma);
     h.run_steps(3);
     h.get_by_label("Save");
-    snapshot(&mut h, "settings-servers-carbon");
+    snapshot(&mut h, &format!("settings-servers-{name}"));
     h.get_by_label("Cancel").click();
     h.run_steps(3);
     assert!(app(&h).view.settings.is_none());
     h.state_mut().as_mut().expect("app").push_action(Action::SetTab(Tab::Log));
     h.run_steps(4);
     h.get_by_label("second line");
-    snapshot(&mut h, "log-carbon");
+    snapshot(&mut h, &format!("log-{name}"));
 }
 
 #[test]
@@ -1441,6 +1453,36 @@ fn about_dialog_opens_from_the_masthead_and_closes() {
     h.key_press(egui::Key::Escape);
     h.run_steps(2);
     assert!(!app(&h).view.about_open);
+}
+
+/// What floats over aluminum (the drop card, a sheet) and the narrow rail, whose current
+/// key is lit glass on the pale plate.
+#[test]
+fn aluminum_floats_and_rail_render() {
+    let fx = Fixture::new(seed_populated);
+    let mut h = fx.harness_themed(brand_tokens::aluminum(), SIZE, true, None, true, 0.25);
+    h.run_steps(2);
+    let one = write_nzb(fx.dir.path(), "one.nzb", VALID_NZB);
+    h.input_mut().hovered_files.push(egui::HoveredFile { path: Some(one), ..Default::default() });
+    h.run_steps(2);
+    h.get_by_label("Drop to add 1 NZB");
+    snapshot(&mut h, "drop-overlay-aluminum");
+    h.input_mut().hovered_files.clear();
+    h.run_steps(2);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Comma);
+    h.run_steps(2);
+    for _ in 0..8 {
+        h.get_by_label("Paper").scroll_down();
+        h.run_steps(1);
+    }
+    h.run_steps(6);
+    snapshot(&mut h, "settings-aluminum");
+    drop(h);
+
+    let mut h = fx.harness_themed(brand_tokens::aluminum(), egui::vec2(960.0, 600.0), true, None, true, 0.25);
+    h.run_steps(3);
+    assert_no_bad_numbers(&h);
+    snapshot(&mut h, "populated-aluminum-minimum");
 }
 
 #[test]

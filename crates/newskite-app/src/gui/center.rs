@@ -164,7 +164,7 @@ fn header(ui: &mut Ui, pal: &Palette, data: &Data, view: &mut ViewState, actions
     let titles = |ui: &mut Ui| {
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 3.0;
-            ui.label(RichText::new(title).font(fonts::semibold_id(24.0)).color(pal.text));
+            super::widgets::view_title(ui, pal, title);
             ui.add(egui::Label::new(RichText::new(summary.clone()).font(fonts::mono_id(12.5)).color(pal.muted)).truncate());
         });
     };

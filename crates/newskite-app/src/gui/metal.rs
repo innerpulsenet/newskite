@@ -1,11 +1,17 @@
-//! The materials of the innerpulse ink grounds, shared with the studio's other desktop
-//! apps: one plate the whole window is cut from (brushed on carbon), grooves cut into it,
-//! wells sunk into it, keys of smoked glass set in dark collars, lamps, engraved labels
-//! and the steel of the wordmark. Everything is lit from above: top edges catch a lip of
-//! light, feet fall into shade.
+//! The materials of the innerpulse grounds, shared with the studio's other desktop apps:
+//! one plate the whole window is cut from (brushed on carbon and aluminum), grooves cut
+//! into it, wells sunk into it, keys set in collars, lamps, engraved labels and the steel
+//! of the wordmark. Everything is lit from above: top edges catch a lip of light, feet
+//! fall into shade.
 //!
-//! Only the brand ink themes carry materials ([`Palette::metal`]); desktop themes and
-//! paper stay flat, and callers branch on that. Colors come from the [`Palette`], its
+//! The steel is one material on two grounds: brushed steel on the dark one, the same
+//! panel in bare aluminum on the light one ([`Metal::light`]). On aluminum the plate, its
+//! wells and its resting keys are pale and written in ink. What is lit or behind glass (a
+//! display, a lamp, a latched key) is the same on both, since light is emitted, not
+//! reflected.
+//!
+//! Only the brand themes with a plate carry materials ([`Palette::metal`]); desktop themes
+//! and paper stay flat, and callers branch on that. Colors come from the [`Palette`], its
 //! [`Metal`] and the light and shade [`Metal`] hands out; this module holds none itself.
 
 use eframe::egui::{
@@ -31,9 +37,10 @@ const TILE: (usize, usize) = (512, 64);
 
 /// Brushed metal: fine horizontal grain, each line its own shade and drifting slowly
 /// along its length, as a brushed plate catches the light. One tile, repeated; the same
-/// plate every run (a fixed seed).
-fn brushed(ctx: &egui::Context) -> egui::TextureHandle {
-    let id = egui::Id::new("brushed-metal");
+/// plate every run (a fixed seed). The grain is white on steel and ink on aluminum.
+fn brushed(ctx: &egui::Context, ink: bool) -> egui::TextureHandle {
+    let name = if ink { "brushed-metal-ink" } else { "brushed-metal" };
+    let id = egui::Id::new(name);
     if let Some(t) = ctx.data(|d| d.get_temp::<egui::TextureHandle>(id)) {
         return t;
     }
@@ -58,11 +65,11 @@ fn brushed(ctx: &egui::Context) -> egui::TextureHandle {
             let drift = knots[k] + (knots[(k + 1) % 16] - knots[k]) * t;
             let grain = rnd();
             let v = 0.45 * line + 0.35 * drift + 0.20 * grain;
-            px[y * w + x] = Metal::light((v * 30.0) as u8);
+            px[y * w + x] = if ink { Metal::shade((v * 26.0) as u8) } else { Metal::light((v * 30.0) as u8) };
         }
     }
     let tex = ctx.load_texture(
-        "brushed-metal",
+        name,
         egui::ColorImage::new([w, h], px),
         egui::TextureOptions {
             wrap_mode: egui::TextureWrapMode::Repeat,
@@ -74,47 +81,58 @@ fn brushed(ctx: &egui::Context) -> egui::TextureHandle {
 }
 
 /// The window's one plate over `r`: its fill, the grain tied to the screen so no panel
-/// edge shows a seam, light falling from the top and gone by the foot.
+/// edge shows a seam, light falling from the top and gone by the foot. Bare aluminum
+/// throws more of the light back: the fall from the top is brighter and the shade at the
+/// foot shallower.
 pub fn plate(painter: &Painter, m: &Metal, r: Rect) {
     painter.rect_filled(r, CornerRadius::ZERO, m.plate);
     if m.brushed {
-        let t = brushed(painter.ctx());
+        let t = brushed(painter.ctx(), m.light);
         let (w, h) = (TILE.0 as f32, TILE.1 as f32);
         let uv = Rect::from_min_max(pos2(r.left() / w, r.top() / h), pos2(r.right() / w, r.bottom() / h));
         painter.image(t.id(), r, uv, Metal::white());
     }
-    let top = Rect::from_min_max(r.min, pos2(r.right(), r.top() + r.height() * 0.22));
-    painter.add(vgrad(top, Metal::light(13), Metal::light(0)));
-    let foot = Rect::from_min_max(pos2(r.left(), r.bottom() - r.height() * 0.28), r.max);
-    painter.add(vgrad(foot, Metal::shade(0), Metal::shade(56)));
+    plate_light(painter, m, r);
+}
+
+/// The light on a plate over `r`, without its fill or grain: falling from the top and
+/// gone by the foot.
+pub fn plate_light(painter: &Painter, m: &Metal, r: Rect) {
+    let (fall, lit, rise, shade) = if m.light { (0.24, 128, 0.30, 26) } else { (0.22, 13, 0.28, 56) };
+    let top = Rect::from_min_max(r.min, pos2(r.right(), r.top() + r.height() * fall));
+    painter.add(vgrad(top, Metal::light(lit), Metal::light(0)));
+    let foot = Rect::from_min_max(pos2(r.left(), r.bottom() - r.height() * rise), r.max);
+    painter.add(vgrad(foot, Metal::shade(0), Metal::shade(shade)));
 }
 
 /// A groove cut across the plate at `y`: a dark line and the lit lip under it.
-pub fn groove_h(painter: &Painter, x0: f32, x1: f32, y: f32) {
+pub fn groove_h(painter: &Painter, m: &Metal, x0: f32, x1: f32, y: f32) {
     let y = y.round();
-    painter.line_segment([pos2(x0, y + 0.5), pos2(x1, y + 0.5)], Stroke::new(1.0, Metal::shade(158)));
-    painter.line_segment([pos2(x0, y + 1.5), pos2(x1, y + 1.5)], Stroke::new(1.0, Metal::light(Metal::LIP)));
+    painter.line_segment([pos2(x0, y + 0.5), pos2(x1, y + 0.5)], Stroke::new(1.0, m.cut()));
+    painter.line_segment([pos2(x0, y + 1.5), pos2(x1, y + 1.5)], Stroke::new(1.0, m.groove_lip()));
 }
 
 /// A groove cut down the plate at `x`.
-pub fn groove_v(painter: &Painter, x: f32, y0: f32, y1: f32) {
+pub fn groove_v(painter: &Painter, m: &Metal, x: f32, y0: f32, y1: f32) {
     let x = x.round();
-    painter.line_segment([pos2(x + 0.5, y0), pos2(x + 0.5, y1)], Stroke::new(1.0, Metal::shade(158)));
-    painter.line_segment([pos2(x + 1.5, y0), pos2(x + 1.5, y1)], Stroke::new(1.0, Metal::light(Metal::LIP)));
+    painter.line_segment([pos2(x + 0.5, y0), pos2(x + 0.5, y1)], Stroke::new(1.0, m.cut()));
+    painter.line_segment([pos2(x + 1.5, y0), pos2(x + 1.5, y1)], Stroke::new(1.0, m.groove_lip()));
 }
 
 /// The relief of a well sunk into the plate, drawn over its fill and under its contents:
 /// a dark collar, the shadow its top wall casts inside it and the lit lip under its foot.
-pub fn well(r: Rect, radius: u8) -> Shape {
+/// A pale well on aluminum takes a thinner rim and a fainter shadow.
+pub fn well(m: &Metal, r: Rect, radius: u8) -> Shape {
     let cr = CornerRadius::same(radius);
     let rr = f32::from(radius);
-    let shade = Rect::from_min_size(r.min, vec2(r.width(), (r.height() * 0.4).min(8.0)));
+    let (deep, cast) = if m.light { (7.0, 35) } else { (8.0, 90) };
+    let shade = Rect::from_min_size(r.min, vec2(r.width(), (r.height() * 0.4).min(deep)));
     Shape::Vec(vec![
-        vgrad(shade.shrink2(vec2(rr * 0.4, 0.0)), Metal::shade(90), Metal::shade(0)),
-        Shape::rect_stroke(r, cr, Stroke::new(1.0, Metal::shade(190)), StrokeKind::Outside),
+        vgrad(shade.shrink2(vec2(rr * 0.4, 0.0)), Metal::shade(cast), Metal::shade(0)),
+        Shape::rect_stroke(r, cr, Stroke::new(1.0, m.rim()), StrokeKind::Outside),
         Shape::line_segment(
             [r.left_bottom() + vec2(rr, 1.5), r.right_bottom() + vec2(-rr, 1.5)],
-            Stroke::new(1.0, Metal::light(Metal::LIP)),
+            Stroke::new(1.0, m.lip()),
         ),
     ])
 }
@@ -161,8 +179,58 @@ fn radial_fan(painter: &Painter, center: Pos2, outline: &[Pos2], inner: Color32,
 /// A key: a cap of smoked glass set in a dark collar, lit from behind when `on`. A held
 /// key goes darker; a lit one takes the backlight's color through the glass, brightest at
 /// its middle.
+///
+/// On aluminum a key at rest is a pale cap in a thin dark rim, standing a little proud of
+/// the plate, which shades when held. Latched (`on` 1), it is the same smoked glass with
+/// the light behind it as on steel. A key that only leans toward its color (`on` under 1:
+/// the control that leads, a destructive one under the pointer) keeps its pale cap and
+/// takes a wash and a rim of the color as it is written.
 pub fn key_body(painter: &Painter, m: &Metal, r: Rect, radius: u8, k: KeyState) {
-    let [rest_top, rest_foot, held_top, held_foot] = m.key;
+    if !m.light {
+        key_glass(painter, m, r, radius, k);
+        return;
+    }
+    let on = k.on.clamp(0.0, 1.0);
+    if on >= 1.0 {
+        key_glass(painter, m, r, radius, KeyState { color: m.glow(k.color), ..k });
+        return;
+    }
+    let press = k.press.clamp(0.0, 1.0);
+    let cr = CornerRadius::same(radius);
+    let inset = f32::from(radius).max(2.0);
+    // The stylesheet's filters: brightness(1.16) under the pointer, brightness(.9) held.
+    let f = (1.0 + 0.16 * k.hover.clamp(0.0, 1.0)) * (1.0 - press) + 0.9 * press;
+    let (top, foot) = (Metal::brighten(m.key[0], f), Metal::brighten(m.key[1], f));
+    let stand = r.translate(vec2(0.0, 1.5)).expand2(vec2(0.0, 0.5));
+    painter.rect_filled(stand, cr, Metal::shade((34.0 * (1.0 - press)) as u8));
+    painter.rect(r, cr, Metal::lerp(top, foot, 0.5), Stroke::new(1.0, m.key_rim()), StrokeKind::Outside);
+    let face = r.shrink(1.0);
+    let mut mesh = Mesh::default();
+    for (y, c) in [(face.top(), top), (face.top() + face.height() * 0.48, Metal::lerp(top, foot, 0.55)), (face.bottom(), foot)] {
+        mesh.colored_vertex(pos2(face.left(), y), c);
+        mesh.colored_vertex(pos2(face.right(), y), c);
+    }
+    for i in [0, 2] {
+        mesh.add_triangle(i, i + 1, i + 2);
+        mesh.add_triangle(i + 2, i + 1, i + 3);
+    }
+    painter.add(Shape::mesh(mesh));
+    if press > 0.0 {
+        let shade = Rect::from_min_size(face.min, vec2(face.width(), face.height().min(5.0)));
+        painter.add(vgrad(shade, Metal::shade((98.0 * press) as u8), Metal::shade(0)));
+    }
+    if on > 0.0 {
+        painter.rect(r, cr, Metal::alpha(k.color, 0.14 * on), Stroke::new(1.0, Metal::alpha(k.color, 0.9 * on)), StrokeKind::Inside);
+    }
+    painter.line_segment(
+        [r.left_bottom() + vec2(inset, 1.5), r.right_bottom() + vec2(-inset, 1.5)],
+        Stroke::new(1.0, m.lip_soft()),
+    );
+}
+
+/// The key as smoked glass: every key on the dark grounds, a latched one on aluminum.
+fn key_glass(painter: &Painter, m: &Metal, r: Rect, radius: u8, k: KeyState) {
+    let [rest_top, rest_foot, held_top, held_foot] = m.glass;
     let on = k.on.clamp(0.0, 1.0);
     let press = k.press.clamp(0.0, 1.0);
     let white = Metal::white();
@@ -183,7 +251,7 @@ pub fn key_body(painter: &Painter, m: &Metal, r: Rect, radius: u8, k: KeyState) 
     painter.rect(r, cr, Metal::lerp(top, foot, 0.5), Stroke::new(1.0, Metal::shade(215)), StrokeKind::Outside);
     painter.line_segment(
         [r.left_bottom() + vec2(inset, 1.5), r.right_bottom() + vec2(-inset, 1.5)],
-        Stroke::new(1.0, Metal::light(Metal::LIP)),
+        Stroke::new(1.0, m.groove_lip()),
     );
     // The glass in one mesh, a sheen across its upper half.
     let glass = r.shrink(1.0);
@@ -223,13 +291,21 @@ pub fn key_body(painter: &Painter, m: &Metal, r: Rect, radius: u8, k: KeyState) 
     );
 }
 
-/// A key's label color, in step with its [`KeyState`].
-pub fn key_text(pal: &Palette, k: KeyState, enabled: bool) -> Color32 {
+/// A key's label color, in step with its [`KeyState`]. A latched key's legend is its
+/// light, a little toward white, on either ground; at rest it is the key's own ink.
+pub fn key_text(pal: &Palette, m: &Metal, k: KeyState, enabled: bool) -> Color32 {
     if !enabled {
         return pal.faint;
     }
-    let off = Metal::lerp(pal.muted, pal.text, k.hover);
-    Metal::lerp(off, Metal::lerp(k.color, Metal::white(), 0.6), k.on)
+    let lit = Metal::lerp(m.glow(k.color), Metal::white(), 0.6);
+    if m.light {
+        // Pale cap or smoked glass, never between: the legend follows the cap.
+        if k.on >= 1.0 {
+            return lit;
+        }
+        return Metal::lerp(Metal::lerp(m.key_ink, pal.text, k.hover), k.color, k.on);
+    }
+    Metal::lerp(Metal::lerp(m.key_ink, pal.text, k.hover), lit, k.on)
 }
 
 /// The relief of a filled key over its face, `press` 0 up to 1 down. Up, it stands proud
@@ -256,13 +332,17 @@ pub fn key_face(painter: &Painter, r: Rect, radius: u8, press: f32) {
 
 /// Paints the registered SVG `uri` (a wordmark) into `rect` in brushed steel: bright
 /// above the crease, dark through it and a lighter band below, in five cuts, over a
-/// one-pixel drop shadow. Without steel (the warm ground) it is the text color.
+/// one-pixel drop shadow. On aluminum the same bands are gunmetal. Without steel (the
+/// warm ground) it is the text color.
 pub fn steel_svg(painter: &Painter, pal: &Palette, m: &Metal, uri: &'static str, rect: Rect) {
     let Some(steel) = m.steel else {
         super::icons::paint_svg(painter, uri, rect, pal.text);
         return;
     };
-    super::icons::paint_svg(painter, uri, rect.translate(vec2(0.0, 1.0)), Metal::shade(200));
+    // Under the letters: a drop shadow on steel, the lip the plate's light catches on
+    // aluminum, as under a legend.
+    let under = if m.light { m.legend_lip() } else { Metal::shade(200) };
+    super::icons::paint_svg(painter, uri, rect.translate(vec2(0.0, 1.0)), under);
     let cuts = [(0.0, 0.38), (0.38, 0.54), (0.54, 0.62), (0.62, 0.84), (0.84, 1.0)];
     let clip = painter.clip_rect();
     for ((a, b), color) in cuts.into_iter().zip(steel) {
@@ -275,11 +355,13 @@ pub fn steel_svg(painter: &Painter, pal: &Palette, m: &Metal, uri: &'static str,
 }
 
 /// Text stamped into the plate, as if lit from above: the letters' upper walls cast a
-/// hairline of shadow and their lower lips catch the light.
+/// hairline of shadow and their lower lips catch the light. On aluminum only the lip
+/// shows.
 pub fn engraved(painter: &Painter, m: &Metal, pos: Pos2, galley: std::sync::Arc<egui::Galley>, color: Color32) {
-    let lip = if m.brushed { 30 } else { 20 };
-    painter.galley_with_override_text_color(pos + vec2(0.0, 1.0), galley.clone(), Metal::light(lip));
-    painter.galley_with_override_text_color(pos + vec2(0.0, -0.7), galley.clone(), Metal::shade(150));
+    painter.galley_with_override_text_color(pos + vec2(0.0, 1.0), galley.clone(), m.legend_lip());
+    if !m.light {
+        painter.galley_with_override_text_color(pos + vec2(0.0, -0.7), galley.clone(), Metal::shade(150));
+    }
     painter.galley_with_override_text_color(pos, galley, color);
 }
 
@@ -312,16 +394,23 @@ fn lamp_outline(shape: LampShape, c: Pos2, r: f32) -> Vec<Pos2> {
 
 /// An indicator lamp of radius `r`: lit (`lit` 1), a glass bulb glowing in `color` with a
 /// halo and a hot core; dark (0), the same bulb unlit, smoked glass with only its
-/// specular highlight, so an off state still reads as a lamp that is off.
-pub fn lamp(painter: &Painter, pal: &Palette, center: Pos2, r: f32, color: Color32, lit: f32, shape: LampShape) {
+/// specular highlight, so an off state still reads as a lamp that is off. `color` is the
+/// state's color as it is written; the lamp glows in its light. On aluminum the bulb
+/// sits in a dark seat, or a lit one would be pale light on pale metal.
+pub fn lamp(painter: &Painter, m: &Metal, center: Pos2, r: f32, color: Color32, lit: f32, shape: LampShape) {
     let lit = lit.clamp(0.0, 1.0);
+    let color = m.glow(color);
+    if m.light {
+        painter.circle_filled(center, r + 1.9, m.bulb[1]);
+        painter.circle_stroke(center, r + 2.4, Stroke::new(1.0, m.lip_soft()));
+    }
     if lit > 0.01 {
         let halo = lamp_outline(LampShape::Round, center, r * 2.7);
         radial_fan(painter, center, &halo, Metal::alpha(color, 0.32 * lit), Metal::alpha(color, 0.0));
     }
     let outline = lamp_outline(shape, center, r);
-    let dark_core = Metal::lerp(pal.hover, color, 0.22);
-    let dark_edge = Metal::lerp(pal.sunken, color, 0.10);
+    let dark_core = Metal::lerp(m.bulb[0], color, 0.22);
+    let dark_edge = Metal::lerp(m.bulb[1], color, 0.10);
     let core = Metal::lerp(dark_core, Metal::lerp(color, Metal::white(), 0.6), lit);
     let edge = Metal::lerp(dark_edge, color, lit);
     // The hot center sits a little above middle, where the light falls.
@@ -371,8 +460,9 @@ pub fn edge_light(painter: &Painter, r: Rect, color: Color32, travel: f32, level
 /// The finish of frosted glass over its fill and under its contents: light caught in its
 /// upper part, a slanted sheen across its left, and a lit rim all around.
 pub fn frost(m: &Metal, r: Rect, radius: u8) -> Shape {
-    let strength = if m.brushed { 1.0 } else { 0.7 };
-    let a = |v: f32| Metal::light((v * strength) as u8);
+    // A pale sheet needs far more light on it before any of it shows.
+    let strength = if m.light { 5.0 } else if m.brushed { 1.0 } else { 0.7 };
+    let a = |v: f32| Metal::light((v * strength).min(255.0) as u8);
     let rr = f32::from(radius);
     let inner = r.shrink(1.0);
     let haze = Rect::from_min_max(inner.min + vec2(rr * 0.4, 0.0), pos2(inner.right() - rr * 0.4, inner.top() + (inner.height() * 0.5).min(64.0)));
@@ -403,7 +493,7 @@ pub fn lcd_back(painter: &Painter, m: &Metal, r: Rect, level: f32) {
     painter.rect_filled(bezel, CornerRadius::same(LCD_R + 2), Metal::shade(150));
     painter.line_segment(
         [bezel.left_bottom() + vec2(6.0, 0.5), bezel.right_bottom() + vec2(-6.0, 0.5)],
-        Stroke::new(1.0, Metal::light(Metal::LIP_SOFT)),
+        Stroke::new(1.0, m.lip_soft()),
     );
     painter.rect_filled(r, CornerRadius::same(LCD_R), m.lcd_glass);
     let mut mesh = Mesh::default();
@@ -524,8 +614,17 @@ pub fn lcd_tag(painter: &Painter, m: &Metal, r: Rect, galley: std::sync::Arc<egu
 }
 
 /// A turned steel cap of radius `r` at `c` (a switch's knob): the steel ramp across it,
-/// in a dark collar. `lit` (0…1) brightens it.
+/// in a dark collar. `lit` (0…1) brightens it. On aluminum it is a key's pale cap in its
+/// thin rim, bright whichever way the switch is thrown.
 pub fn cap(painter: &Painter, pal: &Palette, m: &Metal, c: Pos2, r: f32, lit: f32) {
+    if m.light {
+        let outline = lamp_outline(LampShape::Round, c, r);
+        painter.circle_filled(c + vec2(0.0, 1.0), r + 1.0, Metal::shade(46));
+        painter.circle_filled(c, r + 1.0, m.key_rim());
+        let f = 1.0 + 0.04 * lit.clamp(0.0, 1.0);
+        radial_fan(painter, c + vec2(0.0, -r * 0.35), &outline, Metal::brighten(m.key[0], f), Metal::brighten(m.key[1], f));
+        return;
+    }
     let (hi, lo) = match m.steel {
         Some(s) => (s[0], s[2]),
         None => (pal.text, pal.faint),
@@ -549,10 +648,11 @@ mod tests {
     #[test]
     fn brushed_tile_is_faint_light() {
         let ctx = egui::Context::default();
-        let a = brushed(&ctx);
-        let b = brushed(&ctx);
+        let a = brushed(&ctx, false);
+        let b = brushed(&ctx, false);
         assert_eq!(a.id(), b.id(), "made once");
         assert_eq!(a.size(), [TILE.0, TILE.1]);
+        assert_ne!(brushed(&ctx, true).id(), a.id(), "aluminum has its own grain");
     }
 
     #[test]

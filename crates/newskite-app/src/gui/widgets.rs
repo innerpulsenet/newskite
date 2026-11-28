@@ -131,7 +131,7 @@ fn tool_key(ui: &mut Ui, pal: &Palette, m: &Metal, icon: Icon, label: &str, show
         }
         let fg = match state {
             ToolState::Accent => pal.accent_fg,
-            _ => metal::key_text(pal, k, live),
+            _ => metal::key_text(pal, m, k, live),
         };
         let drop = Vec2::new(0.0, k.press);
         let icon_center = match &galley {
@@ -426,10 +426,10 @@ fn kit_button_sized(
         let painter = ui.painter();
         let mut drop = 0.0;
         match (key, kind) {
-            (Some(_), ButtonKind::Primary) => {
+            (Some(m), ButtonKind::Primary) => {
                 // The one filled key: ember, standing proud of the plate until pressed.
                 let press = if pressed { 1.0 } else { 0.0 };
-                painter.rect(rect, radius, fill, Stroke::new(1.0, Metal::shade(215)), StrokeKind::Outside);
+                painter.rect(rect, radius, fill, Stroke::new(1.0, m.key_rim()), StrokeKind::Outside);
                 metal::key_face(painter, rect, pal.radius(6), press);
                 drop = press;
             }
@@ -440,7 +440,7 @@ fn kit_button_sized(
                 let k = KeyState { on: if danger { 0.5 * k.hover } else { 0.0 }, ..k };
                 metal::key_body(painter, &m, rect, pal.radius(6), k);
                 if !danger {
-                    fg = metal::key_text(pal, k, enabled);
+                    fg = metal::key_text(pal, &m, k, enabled);
                 }
                 drop = k.press;
             }
@@ -580,10 +580,10 @@ pub fn status_chip_live(
             Pos2::new(rect.left() + 10.0 + 5.5, rect.center().y),
             Vec2::splat(11.0),
         );
-        match status.glyph() {
+        match (&pal.metal, status.glyph()) {
             // With materials the state is a lamp: its shape carries it as the glyph did,
             // and the live lamp breathes.
-            _ if pal.metal.is_some() => {
+            (Some(m), _) => {
                 let (shape, lit) = match status {
                     Status::Ok => (LampShape::Round, 1.0),
                     Status::Warn => (LampShape::Triangle, 1.0),
@@ -591,10 +591,10 @@ pub fn status_chip_live(
                     Status::Idle => (LampShape::Round, 0.0),
                     Status::Live => (LampShape::Round, breath.map_or(1.0, |b| 0.55 + 0.45 * b.clamp(0.0, 1.0))),
                 };
-                metal::lamp(painter, pal, glyph_rect.center(), 3.6, color, lit, shape);
+                metal::lamp(painter, m, glyph_rect.center(), 3.6, color, lit, shape);
             }
-            Some(g) => paint_icon(painter, glyph_rect, g, color),
-            None => {
+            (None, Some(g)) => paint_icon(painter, glyph_rect, g, color),
+            (None, None) => {
                 let c = glyph_rect.center();
                 match breath {
                     Some(b) => {
@@ -946,9 +946,9 @@ pub fn card(pal: &Palette) -> egui::Frame {
 /// plate: its collar, the shadow under its top wall and the lit lip below its foot are
 /// drawn over its fill and under its contents. On the flat look it is the frame alone.
 pub fn sunk<R>(ui: &mut Ui, pal: &Palette, frame: egui::Frame, add: impl FnOnce(&mut Ui) -> R) -> egui::InnerResponse<R> {
-    if pal.metal.is_none() {
+    let Some(m) = pal.metal else {
         return frame.show(ui, add);
-    }
+    };
     let radius = frame.corner_radius.nw;
     let mut relief = None;
     let shown = frame.show(ui, |ui| {
@@ -956,7 +956,7 @@ pub fn sunk<R>(ui: &mut Ui, pal: &Palette, frame: egui::Frame, add: impl FnOnce(
         add(ui)
     });
     if let Some(idx) = relief {
-        ui.painter().set(idx, metal::well(shown.response.rect, radius));
+        ui.painter().set(idx, metal::well(&m, shown.response.rect, radius));
     }
     shown
 }
@@ -969,7 +969,7 @@ pub fn frosted<R>(ui: &mut Ui, pal: &Palette, frame: egui::Frame, add: impl FnOn
         return frame.show(ui, add);
     };
     let radius = pal.radius(frame.corner_radius.nw);
-    let frame = frame.fill(m.frost).stroke(Stroke::new(1.0, Metal::shade(200))).corner_radius(CornerRadius::same(radius));
+    let frame = frame.fill(m.frost).stroke(Stroke::new(1.0, m.float_rim())).corner_radius(CornerRadius::same(radius));
     let mut finish = None;
     let shown = frame.show(ui, |ui| {
         finish = Some(ui.painter().add(egui::Shape::Noop));
@@ -1051,9 +1051,11 @@ pub fn toggle(ui: &mut Ui, pal: &Palette, on: &mut bool, label: &str) -> Respons
         let x = egui::lerp((tr.left() + 9.0)..=(tr.right() - 9.0), t);
         let knob = Pos2::new(x, tr.center().y);
         if let Some(m) = pal.metal {
-            // A slot cut into the plate, backlit in the accent when on, with a steel cap.
-            painter.rect_filled(tr, CornerRadius::same(9), pal.sunken.lerp_to_gamma(pal.accent, 0.45 * t));
-            painter.add(metal::well(tr, 9));
+            // A slot cut into the plate, backlit in the accent when on, with a steel cap. On
+            // aluminum the slot is the rail while off and fills with the accent as written.
+            let (off, full) = if m.light { (m.rail, 1.0) } else { (pal.sunken, 0.45) };
+            painter.rect_filled(tr, CornerRadius::same(9), off.lerp_to_gamma(pal.accent, full * t));
+            painter.add(metal::well(&m, tr, 9));
             painter.rect_stroke(tr, CornerRadius::same(9), Stroke::new(1.0, Palette::fade(pal.accent, 0.55 * t)), StrokeKind::Inside);
             metal::cap(painter, pal, &m, knob, 6.5, t.max(hover * 0.5));
         } else {
@@ -1106,8 +1108,8 @@ pub fn segmented<T: Copy + PartialEq>(
         return None;
     }
     ui.painter().rect_filled(rect, CornerRadius::same(pal.radius(7)), pal.sunken);
-    if pal.metal.is_some() {
-        ui.painter().add(metal::well(rect, pal.radius(7)));
+    if let Some(m) = &pal.metal {
+        ui.painter().add(metal::well(m, rect, pal.radius(7)));
     }
     let mut x = rect.left() + 2.0;
     let mut slots = Vec::with_capacity(options.len());
@@ -1134,14 +1136,18 @@ pub fn segmented<T: Copy + PartialEq>(
         let slot = slots[i];
         let on = *value == current;
         let resp = ui.interact(slot, id.with(i), Sense::click());
-        let fg = if on {
+        let fg = if let (true, Some(m)) = (on, &pal.metal) {
+            // The chosen key is lit glass on either ground: its legend is its light.
+            metal::key_text(pal, m, KeyState { hover: 0.0, on: 1.0, press: 0.0, color: pal.accent }, true)
+        } else if on {
             pal.text
         } else if resp.hovered() {
             pal.muted
         } else {
             pal.faint
         };
-        ui.painter().galley(slot.center() - galley.size() / 2.0, galley, fg);
+        // The galley was laid out in the text color; each state overrides it.
+        ui.painter().galley_with_override_text_color(slot.center() - galley.size() / 2.0, galley, fg);
         if resp.has_focus() {
             focus_ring(ui, pal, slot, 5);
         }
@@ -1212,6 +1218,21 @@ pub fn section_title(ui: &mut Ui, pal: &Palette, text: &str) {
         EYEBROW_TRACKING,
     );
     ui.add(egui::Label::new(job).selectable(false));
+}
+
+/// The name of the view, at the head of the window (24 px, 600). With materials it is
+/// stamped into the plate like the legends under it, in the text color.
+pub fn view_title(ui: &mut Ui, pal: &Palette, text: &str) {
+    let Some(m) = pal.metal else {
+        ui.label(egui::RichText::new(text).font(fonts::semibold_id(24.0)).color(pal.text));
+        return;
+    };
+    let galley = ui.painter().layout_no_wrap(text.to_owned(), fonts::semibold_id(24.0), pal.text);
+    let (rect, resp) = ui.allocate_exact_size(galley.size(), Sense::hover());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, text));
+    if ui.is_rect_visible(rect) {
+        metal::engraved(ui.painter(), &m, rect.min, galley, pal.text);
+    }
 }
 
 /// Centered, readable empty-state text.

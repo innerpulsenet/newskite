@@ -22,7 +22,7 @@
       <li>Built-in PAR2 verify and repair plus RAR, 7z and ZIP extraction, including split and spanned volumes and passwords</li>
       <li>Watch folder, speed limit, scheduler window and optional shutdown when done</li>
       <li>Live throughput graph, activity log and bookmarks</li>
-      <li>The innerpulse carbon look, a warm ink and a paper theme, or the desktop light or dark color scheme</li>
+      <li>The innerpulse steel look on a dark ground (brushed steel) or a light one (bare aluminum), a warm ink and a paper theme, or the desktop light or dark color scheme</li>
       <li>Headless command-line mode that drives the same queue engine</li>
     </ul>
     <p>
@@ -57,6 +57,11 @@
   </requires>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.7.0" date="2026-11-28">
+      <description>
+        <p>A light ground for the steel look: bare aluminum. The window is the same brushed panel with pale wells and pale keys written in ink, while the throughput display, the lamps and a lit key stay as they are on steel. Carbon is now named Steel in Settings, where the two sit side by side. The view's name is stamped into the plate, the filter's unchosen options step back, and the theme previews show each plate as it is cut.</p>
+      </description>
+    </release>
     <release version="1.6.1" date="2026-11-24">
       <description>
         <p>When a download stops early because it cannot be repaired, the message counts the missing articles correctly; it no longer says 0 missing articles, and damage from corrupt articles alone is named as such.</p>
